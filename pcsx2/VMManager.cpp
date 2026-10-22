@@ -2989,10 +2989,12 @@ void VMManager::Internal::Throttle(bool vsync_start)
 	const s64 sDeltaTime = iEnd - uExpectedEnd; // The diff between when we stopped and when we expected to.
 
 	// If frame ran too long...
-	if (sDeltaTime >= s_limiter_ticks_per_frame)
+	static constexpr s64 MAX_CATCH_UP_FRAMES = 4;
+	if (sDeltaTime >= s_limiter_ticks_per_frame * MAX_CATCH_UP_FRAMES)
 	{
 		// ... Fudge the next frame start over a bit. Prevents fast forward zoomies.
-		s_limiter_frame_start += (sDeltaTime / s_limiter_ticks_per_frame) * s_limiter_ticks_per_frame;
+		s_limiter_frame_start +=
+			((sDeltaTime / s_limiter_ticks_per_frame) - (MAX_CATCH_UP_FRAMES - 1)) * s_limiter_ticks_per_frame;
 		return;
 	}
 
