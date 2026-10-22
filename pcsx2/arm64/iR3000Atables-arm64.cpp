@@ -615,7 +615,7 @@ static void rpsxMTLO()
 ////////////////////////////////////////////////////////////////////
 // Load/Store
 //
-// Loads:  compute address in w0, flush, call iopMemReadN, sign/zero extend, store result
+// Loads:  compute address in w0, flush, call g_iopLoadStub or iopMemReadN, sign/zero extend, store result
 // Stores: compute address in w0, value in w1, flush, call iopMemWriteN
 
 static void rpsxLoadGeneric(int size, bool sign)
@@ -644,12 +644,20 @@ static void rpsxLoadGeneric(int size, bool sign)
 			armAsm->Add(RWARG1, RWARG1, static_cast<s64>(static_cast<s32>(_Imm_)));
 	}
 
-	// Call iopMemRead — address in w0, result returned in w0
-	switch (size)
+	// Address in w0, result in w0. Compile-time-known hw targets call C
+	// directly.
+	if (rs_const && ((rs_val + _Imm_) & 0x1f800000) != 0)
 	{
-		case 8:  armEmitCall((void*)iopMemRead8);  break;
-		case 16: armEmitCall((void*)iopMemRead16); break;
-		case 32: armEmitCall((void*)iopMemRead32); break;
+		switch (size)
+		{
+			case 8:  armEmitCall((void*)iopMemRead8);  break;
+			case 16: armEmitCall((void*)iopMemRead16); break;
+			case 32: armEmitCall((void*)iopMemRead32); break;
+		}
+	}
+	else
+	{
+		armEmitCall(g_iopLoadStub[size == 8 ? 0 : (size == 16 ? 1 : 2)]);
 	}
 
 	if (!_Rt_)
@@ -798,7 +806,7 @@ static void rpsxLWL()
 	armAsm->Sub(a64::sp, a64::sp, 16);
 	armAsm->Str(RWSCRATCH, a64::MemOperand(a64::sp));
 
-	armEmitCall((void*)iopMemRead32);              // w0 = mem (aligned word)
+	armEmitCall(g_iopLoadStub[2]);                 // w0 = mem (aligned word)
 
 	armAsm->Ldr(a64::w1, a64::MemOperand(a64::sp));
 	armAsm->Add(a64::sp, a64::sp, 16);
@@ -835,7 +843,7 @@ static void rpsxLWR()
 	armAsm->Sub(a64::sp, a64::sp, 16);
 	armAsm->Str(RWSCRATCH, a64::MemOperand(a64::sp));
 
-	armEmitCall((void*)iopMemRead32);              // w0 = mem
+	armEmitCall(g_iopLoadStub[2]);                 // w0 = mem
 
 	armAsm->Ldr(a64::w1, a64::MemOperand(a64::sp));
 	armAsm->Add(a64::sp, a64::sp, 16);
@@ -874,7 +882,7 @@ static void rpsxSWL()
 	armAsm->Str(RWARG1, a64::MemOperand(a64::sp, 0));
 	armAsm->Str(RWSCRATCH, a64::MemOperand(a64::sp, 4));
 
-	armEmitCall((void*)iopMemRead32);              // w0 = mem
+	armEmitCall(g_iopLoadStub[2]);                 // w0 = mem
 
 	// Reload shift_input and aligned addr; mem stays in w0.
 	armAsm->Ldr(a64::w1, a64::MemOperand(a64::sp, 4));  // w1 = shift_input
@@ -918,7 +926,7 @@ static void rpsxSWR()
 	armAsm->Str(RWARG1, a64::MemOperand(a64::sp, 0));
 	armAsm->Str(RWSCRATCH, a64::MemOperand(a64::sp, 4));
 
-	armEmitCall((void*)iopMemRead32);              // w0 = mem
+	armEmitCall(g_iopLoadStub[2]);                 // w0 = mem
 
 	armAsm->Ldr(a64::w1, a64::MemOperand(a64::sp, 4));
 	armAsm->Lsl(a64::w1, a64::w1, 3);              // w1 = shift

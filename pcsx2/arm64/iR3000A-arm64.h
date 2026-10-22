@@ -77,6 +77,9 @@ void iopStoreClearHit(u32 addr);
 // call them with a single BL so the fast path adds no per-site icache cost.
 extern const void* g_iopStoreStub[3];
 
+// RAM-load counterparts to ^
+extern const void* g_iopLoadStub[3];
+
 void _psxFlushConstReg(int reg);
 void _psxFlushConstRegs();
 

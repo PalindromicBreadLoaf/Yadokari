@@ -149,7 +149,12 @@ public:
 	{
 	}
 
-	void Update();
+	void Update()
+	{
+		if (Enable)
+			UpdateSlide();
+	}
+	void UpdateSlide();
 	void RegSet(u16 src); // used to set the volume from a register source
 
 #ifdef PCSX2_DEVBUILD

@@ -3,6 +3,7 @@ add_pcsx2_test(common_test
 	filesystem_tests.cpp
 	path_tests.cpp
 	pmu_counters_tests.cpp
+	worksema_tests.cpp
 	small_string_tests.cpp
 	string_util_tests.cpp
 )

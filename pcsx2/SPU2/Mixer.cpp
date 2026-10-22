@@ -76,6 +76,8 @@ static void __forceinline XA_decode_block(s16* buffer, const s16* block, s32& pr
 	}
 }
 
+static u32 s_voiceIrqA[2];
+
 static void __forceinline IncrementNextA(V_Core& thiscore, uint voiceidx)
 {
 	V_Voice& vc(thiscore.Voices[voiceidx]);
@@ -85,7 +87,7 @@ static void __forceinline IncrementNextA(V_Core& thiscore, uint voiceidx)
 
 	for (int i = 0; i < 2; i++)
 	{
-		if (Cores[i].IRQEnable && (vc.NextA == Cores[i].IRQA))
+		if (vc.NextA == s_voiceIrqA[i])
 		{
 			//if( IsDevBuild )
 			//	ConLog(" * SPU2 Core %d: IRQ Requested (IRQA (%05X) passed; voice %d).\n", i, Cores[i].IRQA, thiscore.Index * 24 + voiceidx);
@@ -213,7 +215,7 @@ static __forceinline void UpdateBlockHeader(V_Core& thiscore, uint voiceidx)
 	V_Voice& vc(thiscore.Voices[voiceidx]);
 
 	for (int i = 0; i < 2; i++)
-		if (Cores[i].IRQEnable && Cores[i].IRQA == (vc.NextA & 0xFFFF8))
+		if ((vc.NextA & 0xFFFF8) == s_voiceIrqA[i])
 			SetIrqCall(i);
 
 	s16* memptr = GetMemPtr(vc.NextA & 0xFFFF8);
@@ -616,6 +618,9 @@ void spu2Mix()
 
 	// Todo: Replace me with memzero initializer!
 	VoiceMixSet VoiceData[2] = {{StereoOut32(), StereoOut32()}, {StereoOut32(), StereoOut32()}}; // mixed voice data for each core.
+
+	for (int i = 0; i < 2; i++)
+		s_voiceIrqA[i] = Cores[i].IRQEnable ? Cores[i].IRQA : ~0u;
 
 	MixCoreVoices(VoiceData[0], 0);
 	MixCoreVoices(VoiceData[1], 1);

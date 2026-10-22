@@ -286,6 +286,40 @@ static const void* _DynGen_StoreStub(int size)
 	return retval;
 }
 
+// Out-of-line RAM-load fast path, routed exactly like _DynGen_StoreStub.
+const void* g_iopLoadStub[3] = {};
+
+static const void* _DynGen_LoadStub(int size)
+{
+	u8* retval = armGetCurrentCodePointer();
+
+	const u32 ram_mask = Ps2MemSize::ExposedIopRam - 1;
+	a64::Label slowPath;
+
+	armAsm->Tst(a64::w0, 0x1f800000);
+	armAsm->B(&slowPath, a64::ne);
+
+	armMoveAddressToReg(a64::x4, iopMem->Main);
+	armAsm->And(a64::w2, a64::w0, ram_mask);
+	switch (size)
+	{
+		case 8:  armAsm->Ldrb(a64::w0, a64::MemOperand(a64::x4, a64::x2)); break;
+		case 16: armAsm->Ldrh(a64::w0, a64::MemOperand(a64::x4, a64::x2)); break;
+		case 32: armAsm->Ldr(a64::w0, a64::MemOperand(a64::x4, a64::x2));  break;
+	}
+	armAsm->Ret();
+
+	armAsm->Bind(&slowPath);
+	switch (size)
+	{
+		case 8:  armEmitJmp((void*)iopMemRead8);  break;
+		case 16: armEmitJmp((void*)iopMemRead16); break;
+		case 32: armEmitJmp((void*)iopMemRead32); break;
+	}
+
+	return retval;
+}
+
 // Error handler for jumps to unmapped memory
 static const void* _DynGen_UnmappedRecLUTPage()
 {
@@ -314,6 +348,9 @@ static void _DynGen_Dispatchers()
 	g_iopStoreStub[0] = _DynGen_StoreStub(8);
 	g_iopStoreStub[1] = _DynGen_StoreStub(16);
 	g_iopStoreStub[2] = _DynGen_StoreStub(32);
+	g_iopLoadStub[0] = _DynGen_LoadStub(8);
+	g_iopLoadStub[1] = _DynGen_LoadStub(16);
+	g_iopLoadStub[2] = _DynGen_LoadStub(32);
 
 	// Block linker: stale / not-yet-compiled link sites divert to
 	// iopDispatcherReg — re-dispatch from the pc the site's tail already
