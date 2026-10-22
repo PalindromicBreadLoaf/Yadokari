@@ -180,7 +180,9 @@
 //  42 — the overflow clamp's lower bound is an integer UMIN and not FMAXNM.
 //  43 — VU1 addresses Ubfiz straight from a cached VI register, and the
 //       JR/JALR jump-cache probe loads prog and hostEntry with one Ldp.
-static constexpr u32 kMvuCompilerAbiVersion = 43;
+//  44 — the extra clamp mode's result clamp takes its upper bound with an
+//       integer SMIN and not FMINNM.
+static constexpr u32 kMvuCompilerAbiVersion = 44;
 
 // Hash/equality functors for XXH128_hash_t — let std::unordered_map<XXH128_hash_t, …>
 // work without a wrapping struct. low64 already carries the well-mixed half of

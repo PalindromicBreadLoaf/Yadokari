@@ -49,7 +49,7 @@ static constexpr int mVUcloneTakeHere = -2;
 // and propagate NaN — using them here lets NaN flow through matrix-multiply
 // chains and corrupts vertex output.
 void mVUclamp1(microVU& mVU, const a64::VRegister& reg, const a64::VRegister& regT1, int xyzw,
-	bool bClampE = false, int cloned = mVUcloneTakeHere)
+	bool bClampE = false, int cloned = mVUcloneTakeHere, bool result = false)
 {
 	if (mVUclamp1Emits(mVU, bClampE) && mVU.regAlloc->checkVFClamp(reg.GetCode()))
 	{
@@ -79,8 +79,15 @@ void mVUclamp1(microVU& mVU, const a64::VRegister& reg, const a64::VRegister& re
 				// one there and reading it back is a round trip through a lane
 				// nothing else can see.
 				pxAssert(cloned < 0);
-				const a64::VRegister t(RQSCRATCH3.GetCode(), 32);
-				armAsm->Fminnm(t, a64::VRegister(reg.GetCode(), 32), a64::VRegister(qmmClampMax.GetCode(), 32));
+				if (result)
+				{
+					armAsm->Smin(RQSCRATCH3.V4S(), reg.V4S(), qmmClampMax.V4S());
+				}
+				else
+				{
+					const a64::VRegister t(RQSCRATCH3.GetCode(), 32);
+					armAsm->Fminnm(t, a64::VRegister(reg.GetCode(), 32), a64::VRegister(qmmClampMax.GetCode(), 32));
+				}
 				armAsm->Umin(RQSCRATCH3.V4S(), RQSCRATCH3.V4S(), qmmClampMin.V4S());
 				armAsm->Ins(reg.V4S(), 0, RQSCRATCH3.V4S(), 0);
 				break;
@@ -92,7 +99,10 @@ void mVUclamp1(microVU& mVU, const a64::VRegister& reg, const a64::VRegister& re
 				if (cloned == mVUcloneTakeHere)
 					cloned = mVU.regAlloc->takeCloneSource(reg.GetCode());
 				const a64::VRegister src = (cloned >= 0) ? a64::VRegister(cloned, 128) : reg;
-				armAsm->Fminnm(reg.V4S(), src.V4S(), qmmClampMax.V4S());
+				if (result)
+					armAsm->Smin(reg.V4S(), src.V4S(), qmmClampMax.V4S());
+				else
+					armAsm->Fminnm(reg.V4S(), src.V4S(), qmmClampMax.V4S());
 				armAsm->Umin(reg.V4S(), reg.V4S(), qmmClampMin.V4S());
 				break;
 			}
@@ -223,5 +233,5 @@ void mVUclamp3(microVU& mVU, const a64::VRegister& reg, const a64::VRegister& re
 void mVUclamp4(microVU& mVU, const a64::VRegister& reg, const a64::VRegister& regT1, int xyzw)
 {
 	if (clampE && !CHECK_VU_SIGN_OVERFLOW(mVU.index) && mVU.regAlloc->checkVFClamp(reg.GetCode()))
-		mVUclamp1(mVU, reg, regT1, xyzw, true);
+		mVUclamp1(mVU, reg, regT1, xyzw, true, mVUcloneTakeHere, true);
 }
