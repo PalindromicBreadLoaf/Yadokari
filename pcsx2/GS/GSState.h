@@ -181,6 +181,8 @@ private:
 	std::atomic<bool> m_async_readback_ready{false};
 	std::array<u64, GS_MAX_PAGES> m_async_readback_page_generations = {};
 	u64 m_async_readback_generation = 0;
+	std::array<u64, GS_MAX_PAGES> m_async_readback_page_vsync = {};
+	std::atomic<u64> m_async_readback_vsync{0};
 
 	/// Bumps the generation of every page in `rect`. Caller must hold m_async_readback_mutex.
 	void MarkAsyncReadbackPagesWritten(const GSOffset& offset, const GSVector4i& rect);
@@ -971,7 +973,9 @@ public:
 	void CheckWriteOverlap(bool req_write, bool req_read);
 	void Write(const u8* mem, int len);
 	void Read(u8* mem, int len);
-	void InitReadFIFO(u8* mem, int len);
+	void InitReadFIFO(u8* mem, int len, bool force_synchronous = false);
+	bool IsAsyncReadbackRegionStale(GIFRegBITBLTBUF BITBLTBUF, GIFRegTRXPOS TRXPOS, GIFRegTRXREG TRXREG, u64 max_age);
+	void NoteAsyncReadbackVsync() { m_mem_target->m_async_readback_vsync.fetch_add(1, std::memory_order_relaxed); }
 
 	void SoftReset(u32 mask);
 	void WriteCSR(u32 csr) { m_regs->CSR.U32[1] = csr; }
@@ -996,6 +1000,8 @@ public:
 	void MarkAsyncReadbackPagesWrittenLocked(const GIFRegTEX0& TEX0, const GSVector4i& rect);
 	/// Re-seeds the whole shadow from live local memory (boot, savestate load, mode enable).
 	void SyncAsyncReadbackMemory();
+	void RefreshAsyncReadbackPages(const GSOffset& offset, const GSVector4i& rect);
+	virtual void SetForceSynchronousLocalReadback(bool force) {}
 
 	template<int index> void Transfer(const u8* mem, u32 size);
 	int Freeze(freezeData* fd, bool sizeonly);

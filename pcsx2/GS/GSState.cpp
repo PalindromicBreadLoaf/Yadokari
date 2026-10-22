@@ -4663,7 +4663,7 @@ void GSState::Write(const u8* mem, int len)
 		FlushWrite();
 }
 
-void GSState::InitReadFIFO(u8* mem, int len)
+void GSState::InitReadFIFO(u8* mem, int len, bool force_synchronous)
 {
 	DrainBackQueue();
 
@@ -4693,7 +4693,17 @@ void GSState::InitReadFIFO(u8* mem, int len)
 	DrainBackQueue();
 
 	if (m_tr.x == sx && m_tr.y == sy)
+	{
+		if (force_synchronous)
+			m_mem_target->SetForceSynchronousLocalReadback(true);
 		m_mem_target->InvalidateLocalMem(m_env.BITBLTBUF, r);
+		if (force_synchronous)
+		{
+			m_mem_target->SetForceSynchronousLocalReadback(false);
+			m_mem_target->RefreshAsyncReadbackPages(
+				m_mem.GetOffset(m_env.BITBLTBUF.SBP, m_env.BITBLTBUF.SBW, m_env.BITBLTBUF.SPSM), r);
+		}
+	}
 
 	// Read the image all in one go.
 	m_mem_target->m_mem.ReadImageX(m_tr.x, m_tr.y, m_tr.buff, m_tr.total, m_env.BITBLTBUF, m_env.TRXPOS, m_env.TRXREG);
@@ -5081,14 +5091,46 @@ void GSState::SyncAsyncReadbackMemory()
 	const std::lock_guard lock(m_async_readback_mutex);
 	std::memcpy(m_async_readback_mem->m_vm8, m_mem.m_vm8, m_mem.m_vmsize);
 	m_async_readback_page_generations.fill(++m_async_readback_generation);
+	m_async_readback_page_vsync.fill(m_async_readback_vsync.load(std::memory_order_relaxed));
 }
 
 void GSState::MarkAsyncReadbackPagesWritten(const GSOffset& offset, const GSVector4i& rect)
 {
 	const u64 generation = ++m_async_readback_generation;
-	offset.loopPages(rect, [this, generation](u32 page) {
+	const u64 vsync = m_async_readback_vsync.load(std::memory_order_relaxed);
+	offset.loopPages(rect, [this, generation, vsync](u32 page) {
 		m_async_readback_page_generations[page] = generation;
+		m_async_readback_page_vsync[page] = vsync;
 	});
+}
+
+void GSState::RefreshAsyncReadbackPages(const GSOffset& offset, const GSVector4i& rect)
+{
+	if (!m_async_readback_mem || GSConfig.HWDownloadMode != GSHardwareDownloadMode::Asynchronous)
+		return;
+
+	const std::lock_guard lock(m_async_readback_mutex);
+	offset.loopPages(rect, [this](u32 page) {
+		std::memcpy(m_async_readback_mem->m_vm8 + page * GS_PAGE_SIZE, m_mem.m_vm8 + page * GS_PAGE_SIZE, GS_PAGE_SIZE);
+	});
+	MarkAsyncReadbackPagesWritten(offset, rect);
+}
+
+bool GSState::IsAsyncReadbackRegionStale(GIFRegBITBLTBUF BITBLTBUF, GIFRegTRXPOS TRXPOS, GIFRegTRXREG TRXREG, u64 max_age)
+{
+	GSState* const target = m_mem_target;
+	if (!IsAsyncReadbackReady() || !target->m_async_readback_mem)
+		return true;
+
+	const GSVector4i r(TRXPOS.SSAX, TRXPOS.SSAY, TRXPOS.SSAX + TRXREG.RRW, TRXPOS.SSAY + TRXREG.RRH);
+	const std::lock_guard lock(target->m_async_readback_mutex);
+	const u64 now = target->m_async_readback_vsync.load(std::memory_order_relaxed);
+	bool stale = false;
+	target->m_async_readback_mem->GetOffset(BITBLTBUF.SBP, BITBLTBUF.SBW, BITBLTBUF.SPSM)
+		.loopPages(r, [target, now, max_age, &stale](u32 page) {
+			stale |= (now - target->m_async_readback_page_vsync[page]) > max_age;
+		});
+	return stale;
 }
 
 std::array<u64, GS_MAX_PAGES> GSState::CaptureAsyncReadbackPageGenerations()

@@ -487,6 +487,7 @@ public:
 	GSTexture* GetFeedbackOutput(float& scale) override;
 	void InvalidateVideoMem(const GIFRegBITBLTBUF& BITBLTBUF, const GSVector4i& r) override;
 	void InvalidateLocalMem(const GIFRegBITBLTBUF& BITBLTBUF, const GSVector4i& r, bool clut = false) override;
+	void SetForceSynchronousLocalReadback(bool force) override { m_force_synchronous_local_readback = force; }
 	void Move() override;
 	void Draw() override;
 

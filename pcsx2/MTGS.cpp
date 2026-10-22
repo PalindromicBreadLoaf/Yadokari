@@ -289,7 +289,8 @@ void MTGS::PostVsyncStart(bool registers_written)
 
 void MTGS::InitAndReadFIFO(u8* mem, u32 qwc)
 {
-	if (EmuConfig.GS.HWDownloadMode == GSHardwareDownloadMode::Asynchronous && GSIsHardwareRenderer())
+	if (EmuConfig.GS.HWDownloadMode == GSHardwareDownloadMode::Asynchronous && GSIsHardwareRenderer() &&
+		!GSShouldReadFIFOSynchronously(qwc, vif1.BITBLTBUF._u64, vif1.TRXPOS._u64, vif1.TRXREG._u64))
 	{
 		// Hand back the CPU-side shadow of GS memory immediately; the ordered GS-thread command
 		// below schedules the real GPU download, which refreshes that shadow a few frames later.
@@ -568,7 +569,7 @@ void MTGS::MainLoop()
 
 						case Command::InitAndReadFIFO:
 							MTGS_LOG("(MTGS Packet Read) ringtype=Fifo2, size=%d", tag.data[0]);
-							GSInitAndReadFIFO((u8*)tag.pointer, tag.data[0]);
+							GSInitAndReadFIFO((u8*)tag.pointer, tag.data[0], true);
 							break;
 
 						case Command::AsyncReadFIFO:

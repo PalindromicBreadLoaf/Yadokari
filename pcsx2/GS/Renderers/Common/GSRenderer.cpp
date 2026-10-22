@@ -972,6 +972,8 @@ void GSRenderer::UpdateVsyncNeedsMTGS()
 
 void GSRenderer::VSync(u32 field, bool registers_written, bool idle_frame)
 {
+	NoteAsyncReadbackVsync();
+
 	if (GSConfig.ShouldDump(s_n, g_perfmon.GetFrame()))
 	{
 		if (GSConfig.SaveInfo)

@@ -661,16 +661,40 @@ void GSwriteCSR(u32 csr)
 	GSParseTarget()->WriteCSR(csr);
 }
 
-void GSInitAndReadFIFO(u8* mem, u32 size)
+void GSInitAndReadFIFO(u8* mem, u32 size, bool force_synchronous)
 {
 	GL_PERF("Init and read FIFO %u qwc", size);
-	GSParseTarget()->InitReadFIFO(mem, size);
+	GSParseTarget()->InitReadFIFO(mem, size, force_synchronous);
 	GSParseTarget()->ReadFIFO(mem, size);
 }
 
 void GSReadLocalMemoryUnsync(u8* mem, u32 qwc, u64 BITBLITBUF, u64 TRXPOS, u64 TRXREG)
 {
 	GSParseTarget()->ReadLocalMemoryUnsync(mem, qwc, GIFRegBITBLTBUF{BITBLITBUF}, GIFRegTRXPOS{TRXPOS}, GIFRegTRXREG{TRXREG});
+}
+
+bool GSShouldReadFIFOSynchronously(u32 qwc, u64 BITBLITBUF, u64 TRXPOS, u64 TRXREG)
+{
+	static constexpr u64 MAX_SHADOW_AGE_VSYNCS = 8;
+
+	static u64 s_blit = 0, s_pos = 0, s_reg = 0;
+	static u32 s_left_qwc = 0;
+	static bool s_synchronous = false;
+
+	if (s_left_qwc == 0 || s_blit != BITBLITBUF || s_pos != TRXPOS || s_reg != TRXREG)
+	{
+		const GIFRegBITBLTBUF blit{BITBLITBUF};
+		const GIFRegTRXREG reg{TRXREG};
+		const u64 bits = static_cast<u64>(reg.RRW) * reg.RRH * GSLocalMemory::m_psm[blit.SPSM].trbpp;
+		s_blit = BITBLITBUF;
+		s_pos = TRXPOS;
+		s_reg = TRXREG;
+		s_left_qwc = static_cast<u32>((bits + 127) / 128);
+		s_synchronous = GSParseTarget()->IsAsyncReadbackRegionStale(blit, GIFRegTRXPOS{TRXPOS}, reg, MAX_SHADOW_AGE_VSYNCS);
+	}
+
+	s_left_qwc -= std::min(s_left_qwc, qwc);
+	return s_synchronous;
 }
 
 void GSgifTransfer(const u8* mem, u32 size)
