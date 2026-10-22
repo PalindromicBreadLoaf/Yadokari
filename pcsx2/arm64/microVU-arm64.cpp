@@ -513,6 +513,23 @@ static bool mvuNeedsFPCRUpdate(mV)
 	return EmuConfig.Cpu.FPUFPCR.bitmask != (isVU0 ? EmuConfig.Cpu.VU0FPCR.bitmask : EmuConfig.Cpu.VU1FPCR.bitmask);
 }
 
+static bool mvuKeepsFPCR(mV)
+{
+	return isVU1 && THREAD_VU1;
+}
+
+static void mVUemitEnsureFPCR(const u64* addr)
+{
+	a64::Label same;
+	armAsm->Ldr(a64::x8, reinterpret_cast<u64>(addr)); // literal-pool load
+	armAsm->Ldr(a64::x9, a64::MemOperand(a64::x8));
+	armAsm->Mrs(a64::x10, a64::FPCR);
+	armAsm->Cmp(a64::x9, a64::x10);
+	armAsm->B(&same, a64::eq);
+	armAsm->Msr(a64::FPCR, a64::x9);
+	armAsm->Bind(&same);
+}
+
 static void mVUdispatcherAB(mV)
 {
 	const auto emitCalleeSaveProlog = []() {
@@ -597,7 +614,9 @@ static void mVUdispatcherAB(mV)
 	// Load VU-specific FPCR (round-toward-zero + FZ/DaZ) — only when needed.
 	// PS2 VU float ops require this rounding mode; the gating skips the
 	// reload when EE and VU FPCR configs already match (the default).
-	if (mvuNeedsFPCRUpdate(mVU))
+	if (mvuKeepsFPCR(mVU))
+		mVUemitEnsureFPCR(&EmuConfig.Cpu.VU1FPCR.bitmask);
+	else if (mvuNeedsFPCRUpdate(mVU))
 		mVUemitLoadFPCR(isVU0 ? &EmuConfig.Cpu.VU0FPCR.bitmask : &EmuConfig.Cpu.VU1FPCR.bitmask);
 
 	// Load macro/clip flags from VU state into microVU shadow copies, and the
@@ -659,7 +678,7 @@ static void mVUdispatcherAB(mV)
 
 	// Restore EE FPCR before returning to C++ (mVUcleanUp + caller) — same
 	// gating as the entry path.
-	if (mvuNeedsFPCRUpdate(mVU))
+	if (mvuNeedsFPCRUpdate(mVU) && !mvuKeepsFPCR(mVU))
 		mVUemitLoadFPCR(&EmuConfig.Cpu.FPUFPCR.bitmask);
 
 	// VE-03: no status-flag re-save here. Every real block exit BLs
