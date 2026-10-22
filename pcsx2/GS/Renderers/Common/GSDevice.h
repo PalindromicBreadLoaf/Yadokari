@@ -725,7 +725,7 @@ struct alignas(16) GSHWDrawConfig
 
 		/// Returns true if the fixed index buffer should be used.
 		__fi bool UseFixedExpandIndexBuffer() const { return (expand == VSExpand::Point || expand == VSExpand::Sprite); }
-		
+
 		/// Return true if the index buffer should be bound as a vertex shader resource.
 		__fi bool UseVSExpandIndexBuffer() const { return (expand == VSExpand::TriangleAA1); }
 	};
@@ -849,7 +849,7 @@ struct alignas(16) GSHWDrawConfig
 
 				// Anisotropic filtering
 				u32 sw_aniso : 5;
-				
+
 				// ROVs
 				u32 rov_color : 1;
 				PS_ROV_DEPTH rov_depth : 2;
@@ -1427,7 +1427,7 @@ struct alignas(16) GSHWDrawConfig
 
 	VSConstantBuffer cb_vs;
 	PSConstantBuffer cb_ps;
-	
+
 	// These are here as they need to be preserved between draws, and the state clear only does up to the constant buffers.
 	ColClipMode colclip_mode;
 	GIFRegFRAME colclip_frame;
@@ -1442,7 +1442,7 @@ struct alignas(16) GSHWDrawConfig
 	{
 		return ps.IsFeedbackLoopDepth() || (tex_hazard == TEX_HAZARD_DEPTH);
 	}
-	
+
 	bool IsBlending()
 	{
 		return blend.enable || blend_multi_pass.enable || ps.IsSWBlending();
@@ -1603,6 +1603,7 @@ public:
 		bool sgsr                 : 1; ///< Supports Qualcomm Snapdragon Game Super Resolution 1 (one compute pass).
 		bool dual_source_blend    : 1; ///< Supports a second fragment output (SRC1) as a hardware blend factor.
 		bool broken_mad_deinterlace : 1; ///< Driver can't reliably preserve/read the two-bank FastMAD history target.
+		bool present_from_back_thread : 1; ///< The device may present from the GS back thread (GSRenderer::QueueVsync). Deko3D only.
 		bool broken_blend_constant : 1; ///< Driver applies a CONST_COLOR / INV_CONST_COLOR blend factor as if the constant were zero. A fixed (AFIX) factor rides the second fragment output instead -- see GSBlendConstantPolicy.h.
 		GSFeedbackCarry feedback_carry; ///< Which draws may keep the open pass's feedback-loop bits. Vulkan only; see GSDrawRoad.h.
 		FeatureSupport()
@@ -1869,7 +1870,7 @@ public:
 	const std::string& GetName() const { return m_name; }
 
 	GSTexture* GetColorClipTexture() const { return m_colclip_rt; }
-		
+
 	void SetColorClipTexture(GSTexture* tex) { m_colclip_rt = tex; }
 
 	bool IsDSInRTActive() const { return m_ds_as_rt; }
@@ -1971,7 +1972,7 @@ public:
 
 	__fi GSTexture* GetCurrent() const { return m_current; }
 	__fi GSTexture* GetMAD() const { return m_mad; }
-	
+
 	void Recycle(GSTexture* t);
 
 	/// Returns true if it's an OpenGL-based renderer.
@@ -2147,7 +2148,7 @@ public:
 	void StretchRect(GSTexture* sTex, const GSVector4& sRect, GSTexture* dTex, const GSVector4& dRect, ShaderConvertSelector shader, Filter filter);
 	void StretchRect(GSTexture* sTex, GSTexture* dTex, const GSVector4& dRect, ShaderConvertSelector shader, Filter filter);
 	void StretchRect(GSTexture* sTex, GSTexture* dTex, ShaderConvertSelector shader, Filter filter);
-	
+
 	// StretchRect - infer shader based on formats
 	void StretchRectAuto(GSTexture* sTex, const GSVector4& sRect, GSTexture* dTex, const GSVector4& dRect, Filter filter,
 		u32 src_bpp = 32, u32 dst_bpp = 32);

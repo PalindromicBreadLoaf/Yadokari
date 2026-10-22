@@ -81,6 +81,7 @@ public:
 	bool Map(const GSVector4i& read_rc) override;
 	void Unmap() override;
 	void Flush() override;
+	bool Poll() override;
 
 #ifdef PCSX2_DEVBUILD
 	void SetDebugName(std::string_view name) override;
@@ -94,5 +95,6 @@ private:
 	DkMemBlock m_memblock = nullptr;
 	u32 m_block_size = 0;
 	u32 m_buffer_size = 0;
+	u64 m_copy_submission = 0;
 };
 #endif

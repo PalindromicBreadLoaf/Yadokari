@@ -396,6 +396,7 @@ bool GSDeviceDK::CreateDeviceObjects()
 
 	// Allow GSRendererHW to use software blending
 	m_features.texture_barrier = true;
+	m_features.present_from_back_thread = true;
 
 	Horizon::Breadcrumb("DK3D: LoadShaders");
 	LoadShaders();
@@ -509,6 +510,7 @@ void GSDeviceDK::BeginFrameIfNeeded()
 		PerformanceMetrics::AccumulateGSGpuWait(
 			static_cast<u64>(Common::Timer::ConvertValueToNanoseconds(Common::Timer::GetCurrentValue() - wait_start)));
 		ctx.fence_pending = false;
+		m_completed_serial = std::max(m_completed_serial, ctx.serial);
 		for (DkMemBlock block : ctx.extra_cmdbuf_memblocks)
 			dkMemBlockDestroy(block);
 		ctx.extra_cmdbuf_memblocks.clear();
@@ -1315,9 +1317,16 @@ void GSDeviceDK::SubmitFrame()
 	FrameContext& ctx = m_frames[m_frame_index];
 	if (ctx.timestamp_written)
 		WriteGPUTimestamp(m_frame_index, 1);
+	if (m_readback_pending)
+	{
+		IssueBarrier(DkBarrier_Primitives, DkInvalidateFlags_L2Cache);
+		g_perfmon.Put(GSPerfMon::Barriers, 1);
+		m_readback_pending = false;
+	}
 	dkQueueSubmitCommands(m_queue, dkCmdBufFinishList(m_cmdbuf));
 	dkQueueSignalFence(m_queue, &ctx.fence, false);
 	ctx.fence_pending = true;
+	ctx.serial = ++m_submitted_serial;
 	if (m_present_slot >= 0)
 		dkQueuePresentImage(m_queue, m_swapchain, m_present_slot);
 	else
@@ -1424,10 +1433,57 @@ void GSDeviceDK::FlushReadback()
 	dkQueueSubmitCommands(m_queue, dkCmdBufFinishList(m_cmdbuf));
 	dkQueueSignalFence(m_queue, &m_readback_fence, false);
 	dkQueueFlush(m_queue);
+	m_submitted_serial++;
 	const Common::Timer::Value wait_start = Common::Timer::GetCurrentValue();
 	dkFenceWait(&m_readback_fence, -1);
+	m_completed_serial = m_submitted_serial;
 	PerformanceMetrics::AccumulateGSGpuWait(
 		static_cast<u64>(Common::Timer::ConvertValueToNanoseconds(Common::Timer::GetCurrentValue() - wait_start)));
+}
+
+bool GSDeviceDK::IsSubmissionComplete(u64 serial)
+{
+	if (serial <= m_completed_serial)
+		return true;
+	if (serial > m_submitted_serial)
+		return false;
+
+	for (FrameContext& ctx : m_frames)
+	{
+		if (ctx.fence_pending && ctx.serial >= serial && dkFenceWait(&ctx.fence, 0) == DkResult_Success)
+		{
+			m_completed_serial = std::max(m_completed_serial, ctx.serial);
+			return true;
+		}
+	}
+	return false;
+}
+
+void GSDeviceDK::WaitForSubmission(u64 serial)
+{
+	if (IsSubmissionComplete(serial))
+		return;
+
+	if (serial > m_submitted_serial)
+	{
+		FlushReadback();
+		return;
+	}
+
+	FrameContext* oldest = nullptr;
+	for (FrameContext& ctx : m_frames)
+	{
+		if (ctx.fence_pending && ctx.serial >= serial && (!oldest || ctx.serial < oldest->serial))
+			oldest = &ctx;
+	}
+	if (!oldest)
+		return;
+
+	const Common::Timer::Value wait_start = Common::Timer::GetCurrentValue();
+	dkFenceWait(&oldest->fence, -1);
+	PerformanceMetrics::AccumulateGSGpuWait(
+		static_cast<u64>(Common::Timer::ConvertValueToNanoseconds(Common::Timer::GetCurrentValue() - wait_start)));
+	m_completed_serial = std::max(m_completed_serial, oldest->serial);
 }
 
 bool GSDeviceDK::UploadToImage(GSTextureDK* dst_tex, const DkImageView& view, const DkImageRect& rect, const void* data,
@@ -1749,7 +1805,10 @@ void GSDeviceDK::DoRenderHW(GSHWDrawConfig& config)
 			rt->GetImageView(&rt_view);
 		if (has_ds)
 			ds->GetImageView(&ds_view);
-		dkCmdBufBindRenderTarget(m_cmdbuf, rt ? &rt_view : nullptr, has_ds ? &ds_view : nullptr);
+		if (rt)
+			dkCmdBufBindRenderTarget(m_cmdbuf, &rt_view, has_ds ? &ds_view : nullptr);
+		else
+			dkCmdBufBindRenderTargets(m_cmdbuf, nullptr, 0, &ds_view);
 
 		const DkViewport viewport = {0.0f, 0.0f, static_cast<float>(rtsize.x), static_cast<float>(rtsize.y), 0.0f, 1.0f};
 		dkCmdBufSetViewports(m_cmdbuf, 0, &viewport, 1);

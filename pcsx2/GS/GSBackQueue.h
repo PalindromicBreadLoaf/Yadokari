@@ -231,6 +231,9 @@ namespace GSBackQueue
 		u32 field;
 		bool registers_written;
 		bool idle_frame;
+		bool queued;
+		u8 regs_slot;
+		u64 post_serial;
 	};
 
 	// The privileged-register fields a draw reads, as they stood when the draw was flushed. The
@@ -556,6 +559,8 @@ namespace GSBackQueue
 		// so record the owner at start and check it on every drain instead.
 		// Written before the consumer starts, read-only afterwards.
 		std::thread::id drain_thread;
+
+		std::thread::id consumer_thread;
 
 		// Draw-node pool: the producer acquires (free ring first, then arena
 		// growth up to the cap, then backpressure), the consumer releases after

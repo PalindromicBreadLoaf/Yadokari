@@ -419,6 +419,14 @@ bool GSFrontState::IsCoverageAlphaSupported()
 	return m_cov_answer;
 }
 
+u64 GSFrontState::AdvancePastQueuedVsync()
+{
+	// MirrorPostVsyncState for a vsync the back has not run yet.
+	if (m_scanmask_used)
+		m_scanmask_used--;
+	return ++s_n;
+}
+
 void GSFrontState::MirrorPostVsyncState()
 {
 	// The vsync executed on the (drained) back object on this thread; Merge
@@ -863,6 +871,7 @@ void GSState::StartBackThread()
 	prctl(PR_SET_TIMERSLACK, 1000UL, 0UL, 0UL, 0UL);
 #endif
 	m_back_thread = std::thread(&GSState::BackThreadLoop, this);
+	m_chan->consumer_thread = m_back_thread.get_id();
 	Console.WriteLn("GS: back thread started (pipelined).");
 }
 
@@ -884,6 +893,10 @@ void GSState::DrainBackQueue()
 	// Keyed on the channel, not this object's producer flag, so drains work
 	// from either side of the two-object split.
 	if (!m_chan->consumer_running)
+		return;
+
+	// A queued vsync runs present-path code that drains (screenshots, texture cache purges)
+	if (std::this_thread::get_id() == m_chan->consumer_thread)
 		return;
 
 	// Only the thread that started the consumer may wait for empty; a second

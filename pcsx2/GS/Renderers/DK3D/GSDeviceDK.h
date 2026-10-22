@@ -53,6 +53,10 @@ public:
 		u32 dst_offset, u32 dst_pitch);
 	// Submit the pending readback copy and wait only on it
 	void FlushReadback();
+	// The queue submission that will carry work recorded now
+	u64 GetRecordingSubmission() const { return m_submitted_serial + 1; }
+	bool IsSubmissionComplete(u64 serial);
+	void WaitForSubmission(u64 serial);
 	// Record a buffer to image copy into the current frame command buffer
 	bool UploadToImage(GSTextureDK* dst, const DkImageView& view, const DkImageRect& rect, const void* data,
 		u32 src_pitch, u32 upload_pitch, u32 num_rows);
@@ -184,6 +188,8 @@ private:
 		DkFence fence{};
 		bool fence_pending = false;
 		bool timestamp_written = false;
+		u64 serial = 0;
+
 	};
 	FrameContext m_frames[NUM_FRAMES_IN_FLIGHT] = {};
 	u32 m_frame_index = 0;
@@ -304,6 +310,10 @@ private:
 
 	DkFence m_readback_fence{};
 	bool m_readback_pending = false;
+
+	// Queue submissions made and known finished, counted together
+	u64 m_submitted_serial = 0;
+	u64 m_completed_serial = 0;
 
 	// GPU-busy %
 	DkMemBlock m_timestamp_memblock = nullptr;

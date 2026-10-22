@@ -908,12 +908,9 @@ void GSRenderer::EndPresentFrame()
 
 void GSRenderer::SubmitVsync(u32 field, bool registers_written)
 {
-	// VSYNC is never queued: present runs on the MTGS thread behind a drain, so
-	// the back thread stays off the GSDevice on present paths entirely (which
-	// is also what keeps SW + GL-present devices legal in queued modes).
 	DrainBackQueue();
 
-	GSBackQueue::VsyncRecord rec;
+	GSBackQueue::VsyncRecord rec = {};
 	rec.field = field;
 	rec.registers_written = registers_written;
 	// Compares this object's draw and transfer serials with the last frame's. The back thread
@@ -922,9 +919,55 @@ void GSRenderer::SubmitVsync(u32 field, bool registers_written)
 	ExecVsyncRecord(rec);
 }
 
+bool GSRenderer::CanQueueVsync() const
+{
+	return GSConfig.BackThreadQueueVsync && m_split_back && IsBackThreadRunning() &&
+		   g_gs_device && g_gs_device->Features().present_from_back_thread &&
+		   !m_vsync_needs_mtgs.load(std::memory_order_acquire) &&
+		   !GSConfig.DumpGSData && !GSDumpReplayer::IsReplayingDump();
+}
+
+void GSRenderer::QueueVsync(u32 field, bool registers_written, u64 post_serial)
+{
+	if (m_vsyncs_queued - m_vsyncs_run.load(std::memory_order_acquire) >= MAX_QUEUED_VSYNCS)
+		DrainBackQueue();
+
+	if (!m_queued_vsync_regs)
+		m_queued_vsync_regs = std::make_unique<GSPrivRegSet[]>(MAX_QUEUED_VSYNCS);
+	const u32 slot = static_cast<u32>(m_vsyncs_queued % MAX_QUEUED_VSYNCS);
+	std::memcpy(&m_queued_vsync_regs[slot], m_regs, sizeof(GSPrivRegSet));
+	m_vsyncs_queued++;
+
+	GSBackQueue::VsyncRecord rec = {};
+	rec.field = field;
+	rec.registers_written = registers_written;
+	rec.queued = true;
+	rec.regs_slot = static_cast<u8>(slot);
+	rec.post_serial = post_serial;
+	PushRecord(GSBackQueue::RecordType::Vsync, rec);
+}
+
 void GSRenderer::ExecVsyncRecord(const GSBackQueue::VsyncRecord& rec)
 {
-	VSync(rec.field, rec.registers_written, rec.idle_frame);
+	if (!rec.queued)
+	{
+		VSync(rec.field, rec.registers_written, rec.idle_frame);
+		return;
+	}
+
+	GSPrivRegSet* const live_regs = m_regs;
+	m_regs = &m_queued_vsync_regs[rec.regs_slot];
+	VSync(rec.field, rec.registers_written, IsIdleFrame());
+	m_regs = live_regs;
+
+	s_n = rec.post_serial;
+	m_last_draw_n = rec.post_serial;
+	m_vsyncs_run.fetch_add(1, std::memory_order_release);
+}
+
+void GSRenderer::UpdateVsyncNeedsMTGS()
+{
+	m_vsync_needs_mtgs.store(!m_snapshot.empty() || m_dump || m_dump_frames != 0, std::memory_order_release);
 }
 
 void GSRenderer::VSync(u32 field, bool registers_written, bool idle_frame)
@@ -1428,10 +1471,14 @@ void GSRenderer::VSync(u32 field, bool registers_written, bool idle_frame)
 
 	if (GSConfig.ShouldDump(s_n, g_perfmon.GetFrame()) && GSConfig.SaveTransferImages)
 		DumpTransferImages();
+
+	UpdateVsyncNeedsMTGS();
 }
 
 bool GSRenderer::QueueSnapshot(const std::string& path, const u32 gsdump_frames)
 {
+	DrainBackQueue();
+
 	if (!m_snapshot.empty())
 		return false;
 
@@ -1443,6 +1490,7 @@ bool GSRenderer::QueueSnapshot(const std::string& path, const u32 gsdump_frames)
 
 	// this is really gross, but wx we get the snapshot request after shift...
 	m_snapshot_dump_frames = gsdump_frames;
+	UpdateVsyncNeedsMTGS();
 	return true;
 }
 
@@ -1515,6 +1563,8 @@ std::string GSGetBaseSnapshotFilename()
 
 void GSRenderer::StopGSDump()
 {
+	DrainBackQueue();
+
 	m_snapshot = {};
 	m_snapshot_dump_frames = 0;
 	m_dump_frames = 0;

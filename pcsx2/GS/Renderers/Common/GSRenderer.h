@@ -6,6 +6,7 @@
 #include "GS/GSState.h"
 #include "GS/MultiISA.h"
 #include "GS/Renderers/Common/GSFieldShiftDetector.h"
+#include <atomic>
 #include <memory>
 #include <string>
 
@@ -49,6 +50,14 @@ private:
 	u64 m_last_draw_n = 0;
 	u64 m_last_transfer_n = 0;
 
+	/// Queued vsyncs that may be waiting on the back thread
+	static constexpr u32 MAX_QUEUED_VSYNCS = 3;
+	std::unique_ptr<GSPrivRegSet[]> m_queued_vsync_regs;
+	u64 m_vsyncs_queued = 0;
+	std::atomic<u64> m_vsyncs_run{0};
+	std::atomic<bool> m_vsync_needs_mtgs{false};
+	void UpdateVsyncNeedsMTGS();
+
 	/// Length of the current run of blank (nothing-to-merge) frames, reset by the first frame that
 	/// produces output. Feeds ShouldSkipAndroidBlankFrame — a lone alternating blank is an
 	/// interlaced-field artefact, while a RUN of them is a real fade the game is drawing. GS thread
@@ -78,6 +87,8 @@ public:
 
 	virtual void VSync(u32 field, bool registers_written, bool idle_frame);
 	void SubmitVsync(u32 field, bool registers_written);
+	bool CanQueueVsync() const;
+	void QueueVsync(u32 field, bool registers_written, u64 post_serial);
 	void ExecVsyncRecord(const GSBackQueue::VsyncRecord& rec) override;
 	virtual bool CanUpscale() { return false; }
 	virtual float GetUpscaleMultiplier() { return 1.0f; }

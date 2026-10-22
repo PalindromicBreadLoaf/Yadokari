@@ -1102,6 +1102,8 @@ public:
 	// would have.
 	void MirrorPostVsyncState();
 
+	u64 AdvancePastQueuedVsync();
+
 private:
 	GSState* m_back;
 

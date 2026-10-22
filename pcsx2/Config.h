@@ -1070,6 +1070,9 @@ struct Pcsx2Config
 		/// Switch: while the back thread runs, park the MTGS (front) thread on core 3 and give the
 		/// back thread the MTGS thread's core.
 		bool BackThreadUseCore3 = false;
+		/// While the back thread runs on a device that can present from it, queue each vsync behind
+		/// the frame's draws.
+		bool BackThreadQueueVsync = true;
 
 		// RetroArch (.slangp) shader chain, applied at present after ShadeBoost/FXAA via
 		// librashader. Disabled or an empty preset skips the chain entirely (zero cost),

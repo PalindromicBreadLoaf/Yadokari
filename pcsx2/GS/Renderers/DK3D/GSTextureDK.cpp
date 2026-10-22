@@ -285,6 +285,7 @@ void GSDownloadTextureDK::DoCopyFromTexture(
 
 	// Records the copy into the frame command buffer
 	m_device->ReadbackTexture(dktex, src, src_level, m_memblock, copy_offset, m_current_pitch);
+	m_copy_submission = m_device->GetRecordingSubmission();
 	m_needs_flush = true;
 }
 
@@ -304,7 +305,14 @@ void GSDownloadTextureDK::Flush()
 
 	m_needs_flush = false;
 	// Block once for the queued copy instead of per copy.
-	m_device->FlushReadback();
+	m_device->WaitForSubmission(m_copy_submission);
+}
+
+bool GSDownloadTextureDK::Poll()
+{
+	if (m_needs_flush && m_device->IsSubmissionComplete(m_copy_submission))
+		m_needs_flush = false;
+	return !m_needs_flush;
 }
 
 #ifdef PCSX2_DEVBUILD

@@ -900,6 +900,7 @@ bool Pcsx2Config::GSOptions::OptionsAreEqual(const GSOptions& right) const
 		OpEqu(DepthFeedbackMode) &&
 		OpEqu(BackThread) &&
 		OpEqu(BackThreadUseCore3) &&
+		OpEqu(BackThreadQueueVsync) &&
 
 		OpEqu(CAS_Sharpness) &&
 		OpEqu(FSR_Sharpness) &&
@@ -1185,6 +1186,7 @@ void Pcsx2Config::GSOptions::LoadSave(SettingsWrapper& wrap)
 	// "on" value was 3, and the settings UIs bind the key as an integer.
 	BackThread = wrap.EntryBitfield(CURRENT_SETTINGS_SECTION, "GSBackThreadMode", BackThread ? 1 : 0, BackThread ? 1 : 0) != 0;
 	SettingsWrapEntryEx(BackThreadUseCore3, "GSBackThreadUseCore3");
+	SettingsWrapEntryEx(BackThreadQueueVsync, "GSBackThreadQueueVsync");
 
 	SettingsWrapBitfield(ShadeBoost_Brightness);
 	SettingsWrapBitfield(ShadeBoost_Contrast);

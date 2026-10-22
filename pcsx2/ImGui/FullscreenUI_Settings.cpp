@@ -3441,6 +3441,10 @@ void FullscreenUI::DrawGraphicsSettingsPage(SettingsInterface* bsi, bool show_ad
 			FSUI_CSTR("Moves the GS parsing thread to the fourth core. Requires a loader granting core 3. Experimental."),
 			"EmuCore/GS", "GSBackThreadUseCore3", false,
 			GetEffectiveIntSetting(bsi, "EmuCore/GS", "GSBackThreadMode", 0) != 0);
+		DrawToggleSetting(bsi, FSUI_ICONSTR(ICON_FA_MICROCHIP, "Present from the GS Rendering Thread"),
+			FSUI_CSTR("Lets the GS rendering thread present each frame. deko3d only."),
+			"EmuCore/GS", "GSBackThreadQueueVsync", true,
+			GetEffectiveIntSetting(bsi, "EmuCore/GS", "GSBackThreadMode", 0) != 0);
 #endif
 #if !defined(__APPLE__)
 		DrawIntListSetting(bsi, FSUI_ICONSTR(ICON_FA_EXPAND, "Allow Exclusive Fullscreen"),
