@@ -5,7 +5,7 @@
 
 """Annotates a Switch profile report for reading.
 
-Usage: horizon_profile_annotate.py profile.txt [--elf build/switch-vk/switch/app/armsx2.elf] > annotated.txt
+Usage: horizon_profile_annotate.py profile.txt [--elf build/switch-vk/switch/app/yadokari.elf] > annotated.txt
 """
 
 import argparse
@@ -113,8 +113,8 @@ def annotate(lines, names):
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("report")
-    parser.add_argument("--elf", default="build/switch-vk/switch/app/armsx2.elf",
-                        help="the armsx2.elf matching the NRO that produced the report")
+    parser.add_argument("--elf", default="build/switch-vk/switch/app/yadokari.elf",
+                        help="the yadokari.elf matching the NRO that produced the report")
     args = parser.parse_args()
 
     with open(args.report, encoding="utf-8", errors="replace") as f:

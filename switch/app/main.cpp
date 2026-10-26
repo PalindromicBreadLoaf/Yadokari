@@ -39,10 +39,10 @@
 
 namespace
 {
-	constexpr const char* ARMSX2_ROOT = "sdmc:/switch/armsx2";
-	constexpr const char* GAMES_DIR = "sdmc:/switch/armsx2/games";
-	constexpr const char* LOGS_DIR = "sdmc:/switch/armsx2/logs";
-	constexpr const char* SETTINGS_PATH = "sdmc:/switch/armsx2/armsx2.ini";
+	constexpr const char* YADOKARI_ROOT = "sdmc:/switch/yadokari";
+	constexpr const char* GAMES_DIR = "sdmc:/switch/yadokari/games";
+	constexpr const char* LOGS_DIR = "sdmc:/switch/yadokari/logs";
+	constexpr const char* SETTINGS_PATH = "sdmc:/switch/yadokari/yadokari.ini";
 	constexpr u64 IDLE_POLL_NS = 8'000'000ULL;
 
 	constexpr const char* USB_SETTINGS_SECTION = "Horizon";
@@ -494,7 +494,7 @@ int main(int argc, char* argv[])
 	appletLockExit();
 
 	mkdir("sdmc:/switch", 0777);
-	mkdir(ARMSX2_ROOT, 0777);
+	mkdir(YADOKARI_ROOT, 0777);
 	mkdir(GAMES_DIR, 0777);
 	mkdir(LOGS_DIR, 0777);
 
@@ -513,9 +513,9 @@ int main(int argc, char* argv[])
 
 	const bool romfs_available = R_SUCCEEDED(romfsInit());
 	HorizonException::Breadcrumb(romfs_available ? "romfsInit ok" : "romfsInit failed");
-	EmuFolders::AppRoot = ARMSX2_ROOT;
-	EmuFolders::DataRoot = ARMSX2_ROOT;
-	EmuFolders::Settings = Path::Combine(ARMSX2_ROOT, "inis");
+	EmuFolders::AppRoot = YADOKARI_ROOT;
+	EmuFolders::DataRoot = YADOKARI_ROOT;
+	EmuFolders::Settings = Path::Combine(YADOKARI_ROOT, "inis");
 	if (romfs_available)
 		EmuFolders::Resources = "romfs:/resources";
 	else if (!EmuFolders::SetResourcesDirectory())

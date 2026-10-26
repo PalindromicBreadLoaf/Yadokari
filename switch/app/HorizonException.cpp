@@ -129,7 +129,7 @@ extern "C" void __libnx_exception_handler(ThreadExceptionDump* ctx)
 	}
 
 	Report report;
-	report.Append("\n===== ARMSX2-NX crash report =====\n");
+	report.Append("\n===== Yadokari crash report =====\n");
 	report.Append("tick=%016lx aarch64=%d\n", svcGetSystemTick(),
 		threadExceptionIsAArch64(ctx) ? 1 : 0);
 	report.Append("cause: %s (error_desc=0x%03x)\n", DescribeError(ctx->error_desc), ctx->error_desc);

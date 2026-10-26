@@ -596,7 +596,7 @@ namespace
 	void AppendSummary(std::string& out, const std::vector<std::size_t>& order, const std::vector<u64>& sample_counts,
 		const std::vector<u64>& blocked_counts)
 	{
-		out += fmt::format("ARMSX2-NX profile started {}: {:.2f} s, {} sampling rounds (~{} ms apart), {} samples, "
+		out += fmt::format("Yadokari profile started {}: {:.2f} s, {} sampling rounds (~{} ms apart), {} samples, "
 						   "{} dropped (buffer holds {})\n",
 			s_capture.started_at, s_capture.elapsed, s_capture.rounds, SAMPLE_PERIOD_NS / 1'000'000,
 			s_capture.sample_count, s_capture.dropped_samples, s_capture.sample_capacity);

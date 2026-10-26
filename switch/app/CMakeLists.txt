@@ -4,7 +4,7 @@
 
 enable_language(ASM)
 
-add_executable(armsx2
+add_executable(yadokari
 	main.cpp
 	HorizonHost.cpp
 	HorizonUsbStorage.cpp
@@ -18,25 +18,25 @@ set_source_files_properties(HorizonException.cpp HorizonExceptionEntry.S
 # USB mass-storage support
 include("${CMAKE_CURRENT_SOURCE_DIR}/../cmake/UsbHsFs.cmake")
 
-target_include_directories(armsx2 PRIVATE
+target_include_directories(yadokari PRIVATE
 	"${CMAKE_BINARY_DIR}/common/include"
 	"${CMAKE_SOURCE_DIR}"
 	"${CMAKE_SOURCE_DIR}/pcsx2"
 )
 
-set(ARMSX2_NRO_VERSION "${ARMSX2_VERSION}")
-if(NOT ARMSX2_NRO_VERSION)
-	set(ARMSX2_NRO_VERSION "4.0.0")
+set(YADOKARI_NRO_VERSION "${ARMSX2_VERSION}")
+if(NOT YADOKARI_NRO_VERSION)
+	set(YADOKARI_NRO_VERSION "1.0.0")
 endif()
 
-set(ARMSX2_CORE_LINK_TARGETS PCSX2)
+set(YADOKARI_CORE_LINK_TARGETS PCSX2)
 if(TARGET PCSX2_LTO)
-	list(APPEND ARMSX2_CORE_LINK_TARGETS PCSX2_LTO)
+	list(APPEND YADOKARI_CORE_LINK_TARGETS PCSX2_LTO)
 endif()
 
-target_link_libraries(armsx2 PRIVATE
+target_link_libraries(yadokari PRIVATE
 	-Wl,--start-group
-	${ARMSX2_CORE_LINK_TARGETS}
+	${YADOKARI_CORE_LINK_TARGETS}
 	PCSX2_FLAGS
 	-Wl,--end-group
 	usbhsfs
@@ -52,11 +52,11 @@ if(USE_VULKAN OR USE_OPENGL)
 	endif()
 
 	# newlib shims required by NXVK.
-	target_sources(armsx2 PRIVATE nvk_compat.cpp)
-	target_include_directories(armsx2 PRIVATE ${NXVK_INCLUDE_DIRS})
-	target_compile_options(armsx2 PRIVATE ${NXVK_CFLAGS_OTHER})
+	target_sources(yadokari PRIVATE nvk_compat.cpp)
+	target_include_directories(yadokari PRIVATE ${NXVK_INCLUDE_DIRS})
+	target_compile_options(yadokari PRIVATE ${NXVK_CFLAGS_OTHER})
 
-	target_link_libraries(armsx2 PRIVATE ${NXVK_LDFLAGS})
+	target_link_libraries(yadokari PRIVATE ${NXVK_LDFLAGS})
 endif()
 
 include("${CMAKE_CURRENT_SOURCE_DIR}/../cmake/Uam.cmake")
@@ -163,36 +163,36 @@ add_custom_command(
 )
 list(APPEND DK3D_DKSH_FILES "${DK3D_ROMFS_SHADER_DIR}/cas_csh.dksh")
 
-add_custom_target(armsx2_shaders DEPENDS ${DK3D_DKSH_FILES})
-add_dependencies(armsx2 armsx2_shaders)
+add_custom_target(yadokari_shaders DEPENDS ${DK3D_DKSH_FILES})
+add_dependencies(yadokari yadokari_shaders)
 
 # Embed resources into the romfs
-set(ARMSX2_RESOURCE_SRC_DIR "${CMAKE_SOURCE_DIR}/bin/resources")
+set(YADOKARI_RESOURCE_SRC_DIR "${CMAKE_SOURCE_DIR}/bin/resources")
 set(DK3D_ROMFS_RESOURCE_DIR "${DK3D_ROMFS_DIR}/resources")
-set(ARMSX2_RESOURCE_STAMP "${CMAKE_CURRENT_BINARY_DIR}/armsx2_resources.stamp")
-file(GLOB_RECURSE ARMSX2_RESOURCE_FILES CONFIGURE_DEPENDS "${ARMSX2_RESOURCE_SRC_DIR}/*")
+set(YADOKARI_RESOURCE_STAMP "${CMAKE_CURRENT_BINARY_DIR}/yadokari_resources.stamp")
+file(GLOB_RECURSE YADOKARI_RESOURCE_FILES CONFIGURE_DEPENDS "${YADOKARI_RESOURCE_SRC_DIR}/*")
 add_custom_command(
-	OUTPUT "${ARMSX2_RESOURCE_STAMP}"
-	COMMAND ${CMAKE_COMMAND} -E copy_directory "${ARMSX2_RESOURCE_SRC_DIR}" "${DK3D_ROMFS_RESOURCE_DIR}"
-	COMMAND ${CMAKE_COMMAND} -E touch "${ARMSX2_RESOURCE_STAMP}"
-	DEPENDS ${ARMSX2_RESOURCE_FILES}
+	OUTPUT "${YADOKARI_RESOURCE_STAMP}"
+	COMMAND ${CMAKE_COMMAND} -E copy_directory "${YADOKARI_RESOURCE_SRC_DIR}" "${DK3D_ROMFS_RESOURCE_DIR}"
+	COMMAND ${CMAKE_COMMAND} -E touch "${YADOKARI_RESOURCE_STAMP}"
+	DEPENDS ${YADOKARI_RESOURCE_FILES}
 	COMMENT "Copying resources into ROMFS (romfs:/resources)"
 	VERBATIM
 )
-add_custom_target(armsx2_resources DEPENDS "${ARMSX2_RESOURCE_STAMP}")
+add_custom_target(yadokari_resources DEPENDS "${YADOKARI_RESOURCE_STAMP}")
 
 # Pack the compiled shaders and resources into the NRO's ROMFS.
-dkp_add_asset_target(armsx2_romfs "${DK3D_ROMFS_DIR}")
-add_dependencies(armsx2_romfs armsx2_shaders armsx2_resources)
-set_property(TARGET armsx2_romfs APPEND PROPERTY DKP_ASSET_FILES ${DK3D_DKSH_FILES} "${ARMSX2_RESOURCE_STAMP}")
+dkp_add_asset_target(yadokari_romfs "${DK3D_ROMFS_DIR}")
+add_dependencies(yadokari_romfs yadokari_shaders yadokari_resources)
+set_property(TARGET yadokari_romfs APPEND PROPERTY DKP_ASSET_FILES ${DK3D_DKSH_FILES} "${YADOKARI_RESOURCE_STAMP}")
 
-nx_generate_nacp(OUTPUT armsx2.nacp
-	NAME "ARMSX2-NX"
+nx_generate_nacp(OUTPUT yadokari.nacp
+	NAME "Yadokari"
 	AUTHOR "ARMSX2 Team & PalindromicBreadLoaf"
-	VERSION "${ARMSX2_NRO_VERSION}"
+	VERSION "${YADOKARI_NRO_VERSION}"
 )
-nx_create_nro(armsx2
-	OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/armsx2.nro"
-	NACP "${CMAKE_CURRENT_BINARY_DIR}/armsx2.nacp"
-	ROMFS armsx2_romfs
+nx_create_nro(yadokari
+	OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/yadokari.nro"
+	NACP "${CMAKE_CURRENT_BINARY_DIR}/yadokari.nacp"
+	ROMFS yadokari_romfs
 )
