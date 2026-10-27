@@ -63,8 +63,11 @@ add_pcsx2_test(gs_vertex_tests
 	gs_sw_fog_blend_tests.cpp
 	gs_local_memory_move_tests.cpp
 	gs_local_memory_write_stamp_tests.cpp
+	gs_local_memory_write_source_bounds_tests.cpp
+	gs_local_memory_four_bit_stream_tests.cpp
 	gs_write_stamp_writer_tests.cpp
 	gs_hash_memo_tests.cpp
+	gs_hash_raw_key_tests.cpp
 	gs_clut_tests.cpp
 	gs_alpha_known_bits_tests.cpp
 	gs_depth_coverage_tests.cpp
@@ -77,6 +80,7 @@ add_pcsx2_test(gs_vertex_tests
 	gs_null_device_profile_tests.cpp
 	gs_sw_texture_dirty_tests.cpp
 	gs_blend_constant_policy_tests.cpp
+	gs_blend_carry_tests.cpp
 	gs_over_one_two_pass_tests.cpp
 	gs_autoflush_engine_level_tests.cpp
 	gs_draw_buffer_overlap_tests.cpp
@@ -84,6 +88,9 @@ add_pcsx2_test(gs_vertex_tests
 	gs_texture_cache_grid_tests.cpp
 	gs_texture_cache_move_tests.cpp
 	gs_target_update_tests.cpp
+	gs_exact_dirty_mapping_tests.cpp
+	gs_target_rebase_tests.cpp
+	gs_target_rebase_integration_tests.cpp
 	gs_dither_scale_tests.cpp
 	gs_cull_grid_refresh_tests.cpp
 	gs_split_seam_tests.cpp
@@ -92,8 +99,10 @@ add_pcsx2_test(gs_vertex_tests
 	gs_field_shift_detector_tests.cpp
 	gs_channel_shuffle_cover_tests.cpp
 	gs_sw_palette_block_copy_tests.cpp
+	gs_tc_union_cover_tests.cpp
 	gs_cache_file_tests.cpp
 	gs_hash_cache_inject_tests.cpp
+	gs_hash_cache_limits_tests.cpp
 	gs_xxh_block_hasher_tests.cpp
 	gs_texture_replacement_worker_tests.cpp
 )
@@ -145,6 +154,23 @@ if(UNIX)
 		common
 	)
 endif()
+
+# The dump packer needs only the file system helpers and libzip, so its tests compile it directly
+# rather than linking the emulator.
+add_pcsx2_test(gs_dump_bundle_tests
+	gs_dump_bundle_tests.cpp
+	${CMAKE_CURRENT_SOURCE_DIR}/../../../../pcsx2/GS/GSDumpBundle.cpp
+)
+
+target_include_directories(gs_dump_bundle_tests PRIVATE
+	${CMAKE_CURRENT_SOURCE_DIR}/../../../../pcsx2
+)
+
+target_link_libraries(gs_dump_bundle_tests PUBLIC
+	PCSX2_FLAGS
+	common
+	libzip::zip
+)
 
 # The RAISR texture upscaler engine has no GS, GPU or settings dependencies, so its tests compile
 # it directly rather than linking the emulator: this builds in seconds and shows the engine

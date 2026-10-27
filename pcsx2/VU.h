@@ -115,6 +115,15 @@ struct ialuPipe
 	u32 Cycle;
 };
 
+// One write to a VI by a lower instruction, as the branch hazard in VUops.cpp
+// sees it.
+struct VIWriteRec
+{
+	u16 old; // the VI before the write
+	u8 reg;  // 0: no record, a write to VI0 is never kept
+	u8 cyc;  // the low byte of VURegs::cycle at the write
+};
+
 struct alignas(16) VURegs
 {
 	VECTOR VF[32]; // VF and VI need to be first in this struct for proper mapping
@@ -169,6 +178,9 @@ struct alignas(16) VURegs
 	u32 xgkickenable;
 	u32 xgkickendpacket;
 
+	// The branch hazard. A write to a VI opens a four cycle window in
+	// VIBackupCycles; while a branch is the very next cycle it reads
+	// VIOldValue for VIRegNumber instead of the VI. See _vuBackupVI.
 	u8 VIBackupCycles;
 	u32 VIOldValue;
 	u32 VIRegNumber;
@@ -184,6 +196,13 @@ struct alignas(16) VURegs
 	u32 ialuwritepos;
 	u32 ialucount;
 
+	// The last three writes to a VI, newest first, for the earliest-write
+	// search in _vuBackupVI. These fill the 12 bytes of tail padding that
+	// alignas(16) leaves, so sizeof(VURegs) is what it was: microVU's emitted
+	// code reaches VU1's data memory through that size (kVU1MemFromState).
+	// Not part of a save state; a load drops them.
+	VIWriteRec VIWrites[3];
+
 	VURegs()
 	{
 		Mem = NULL;
@@ -198,6 +217,8 @@ struct alignas(16) VURegs
 		return IsVU1() ? vif1Regs : vif0Regs;
 	}
 };
+
+static_assert(sizeof(VURegs) == 1680, "VIWrites must fit in VURegs's tail padding: a larger VURegs moves VU1 memory relative to the register file in microVU's code");
 
 // Which lane of a quadword an ILW or ILWR reads.
 //
@@ -258,3 +279,35 @@ extern void vuMemAllocate();
 extern void vuMemReset();
 extern void vuMemRelease();
 extern u32* GET_VU_MEM(VURegs* VU, u32 addr);
+
+// VU0's window onto VU1's registers is 64 quadwords (VF0-31, then VI0-31, selected by bit 0x400 of the
+// VI-based address): VU1's STATUS register, VI[16], is quadword 48. The vu-aot tier (ARM64 builds) drops
+// the sticky bits of STATUS from the programs it compiles until something reads them; a VU0 access to
+// this quadword, by the interpreter (GET_VU_MEM) or by microVU0's code (mVUaddrFix), is one of those
+// reads, and says so here.
+static constexpr u32 VU0_WINDOW_VU1_STATUS_QWORD = 32 + REG_STATUS_FLAG;
+// A new VM, booted or reset, starts with the tripwire armed again (a savestate load or a settings
+// change does not).
+// The running title (disc serial and CRC), for the vu-aot tripwire's memory across sessions: a title that
+// set it off starts every later session with it set.
+// Turning the setting off clears what vu-aot saved on disk (the compiled cache), and the whole VU program
+// cache with it when EnableVUProgramCache is not on either. Called after the settings change has reset
+// the VU recompilers.
+#if defined(__aarch64__) || defined(_M_ARM64)
+extern void vuAotNoteOutsideStatusRead();
+extern void vuAotResetStickyTripwire();
+extern void vuAotSetTitle(const std::string& serial, u32 crc);
+extern void vuAotSettingChanged(bool wasOn, bool isOn, bool programCacheStillOn);
+// The same for settings applied with no VM running, where "was" is the global value last seen with no VM:
+// vuAotNoteGlobalSetting records it without clearing anything (at startup, and as a VM ends), and
+// vuAotNoVmSettingsApplied compares it with the global value now. A game's own settings never come into it.
+extern void vuAotNoteGlobalSetting(bool on);
+extern void vuAotNoVmSettingsApplied(bool on, bool programCacheStillOn);
+#else
+static inline void vuAotNoteOutsideStatusRead() {}
+static inline void vuAotResetStickyTripwire() {}
+static inline void vuAotSetTitle(const std::string&, u32) {}
+static inline void vuAotSettingChanged(bool, bool, bool) {}
+static inline void vuAotNoteGlobalSetting(bool) {}
+static inline void vuAotNoVmSettingsApplied(bool, bool) {}
+#endif

@@ -43,6 +43,10 @@ on:
         required: false
         type: string
         default: Release
+    secrets:
+      RA_UA_VERSION:
+        description: The ARMSX2 client's RetroAchievements version. A stable build fails without it.
+        required: false
 
 jobs:
   build_linux:
@@ -92,11 +96,22 @@ jobs:
         run: echo "timestamp=$(date -u "+%Y-%m-%d-%H;%M;%S")" >> $GITHUB_OUTPUT
 
       - name: ccache cache files
+        if: ${{ !(inputs.stableBuild == true || inputs.stableBuild == 'true') }}
         uses: actions/cache@v6
         with:
           path: .ccache
           key: ${{ inputs.os }} ${{ inputs.platform }} ${{ inputs.compiler }} ${{ inputs.cmakeBuildType }} ccache ${{ steps.ccache_cache_timestamp.outputs.timestamp }}
           restore-keys: ${{ inputs.os }} ${{ inputs.platform }} ${{ inputs.compiler }} ${{ inputs.cmakeBuildType }} ccache
+
+      # A stable build keeps away from the shared ccache in both directions. Saving it would hand
+      # the RetroAchievements client identity to any pull request, forks included, since they can
+      # restore caches saved here. Restoring it gives stale objects: ccache's direct mode can't see
+      # a header that __has_include finds only in stable builds (ra_ua_secret.h,
+      # DefaultUpdaterChannel.h), so 2.9's first 16K AppImage got the nightly's Host.cpp and came
+      # out without the identity. Stable builds compile everything.
+      - name: No compiler cache for stable builds
+        if: ${{ inputs.stableBuild == true || inputs.stableBuild == 'true' }}
+        run: echo "CCACHE_DISABLE=1" >> "$GITHUB_ENV"
 
       - name: Install Packages
         run: |
@@ -128,6 +143,16 @@ jobs:
           cd bin/resources
           aria2c -Z "${{ inputs.patchesUrl }}/patches.zip"
 
+      # RetroAchievements grants hardcore by the client name and version in the user agent, which
+      # pcsx2/Host.cpp reads from a gitignored header. A stable build must carry it, so a missing
+      # secret fails here; other builds go on without it, softcore only.
+      - name: Embed the RetroAchievements client identity
+        if: inputs.stableBuild == true
+        env:
+          RA_UA_VERSION: ${{ secrets.RA_UA_VERSION }}
+          RA_UA_REQUIRED: "1"
+        run: bash .github/workflows/scripts/common/write-ra-ua-secret.sh
+
       - name: Generate CMake
         env:
           ADDITIONAL_CMAKE_ARGS: ${{ inputs.cmakeflags }}
@@ -157,6 +182,14 @@ jobs:
           ninja
           # Save the Cache
           ccache -s
+
+      # The client doesn't report a refused agent, so check the identity reached the binary.
+      - name: Verify the client identity reached the binary
+        if: inputs.stableBuild == true
+        env:
+          RA_UA_VERSION: ${{ secrets.RA_UA_VERSION }}
+          RA_UA_REQUIRED: "1"
+        run: bash .github/workflows/scripts/common/verify-ra-ua-agent.sh build/bin/armsx2-qt armsx2
 
       - name: Run Tests
         working-directory: ./build

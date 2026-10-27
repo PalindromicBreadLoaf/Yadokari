@@ -52,9 +52,18 @@
 //   x26 = cpuRegs.GPR.r[3].UD[0]   ($v1, 12.6% of dynamic refs)
 //   x27 = cpuRegs.GPR.r[4].UD[0]   ($a0, 7.9%)
 //   x21 = cpuRegs.GPR.r[5].UD[0]   ($a1)
-//   x12 = cpuRegs.GPR.r[26].UD[0]  ($k0, 6.3% — tier 2)
+//   x12 = cpuRegs.GPR.r[6].UD[0]   ($a2 — tier 2)
 //   x13 = cpuRegs.GPR.r[16].UD[0]  ($s0)
-//   x11 = cpuRegs.GPR.r[1].UD[0]   ($at)
+//   x11 = cpuRegs.GPR.r[17].UD[0]  ($s1)
+// The percentages are shares of dynamic UD[0] references in the one Shadow of
+// the Colossus capture the original table was picked on. The two tier-2 homes
+// x12 and x11 held $k0 and $at until 2026-10: $k0 was hot in one title (Shadow
+// of the Colossus, through the BIOS system-call path) and $at in two (Ratchet &
+// Clank UYA and Shadow of the Colossus), while $a2 and $s1 carry real traffic
+// in most titles. Our 46-title register-heat sweep measured the swap at a
+// median -1.24% host instructions per guest instruction inside EE blocks; on
+// the Cortex-A73 handheld the EE thread's cycles moved by -1.2% at best and
+// +0.10% at worst.
 // THE PIN IS AUTHORITATIVE for the lower 64 bits. Under the shipping
 // lazy-dirty policy (EE-SRA 3 Arm E) guest writes
 // update the pin only (armStoreEERegPtr / armStoreEEGPRQuad lane 0) and the
@@ -146,10 +155,10 @@
 #define REEPIN_V0 vixl::aarch64::x29
 #define REEPIN_V1 vixl::aarch64::x26
 #define REEPIN_A0 vixl::aarch64::x27
-#define REEPIN_K0 vixl::aarch64::x12
+#define REEPIN_A2 vixl::aarch64::x12
 #define REEPIN_A1 vixl::aarch64::x21
 #define REEPIN_S0 vixl::aarch64::x13
-#define REEPIN_AT vixl::aarch64::x11
+#define REEPIN_S1 vixl::aarch64::x11
 
 // The static guest→host pin map. Everything pin-related (lookup, reload,
 // flush, write policy) iterates this table; adding a rung = adding a row here,
@@ -168,10 +177,10 @@ static const EEPinnedGPR kEEPinTable[] = {
 	{2, REEPIN_V0},
 	{3, REEPIN_V1},
 	{4, REEPIN_A0},
-	{26, REEPIN_K0},
+	{6, REEPIN_A2},
 	{5, REEPIN_A1},
 	{16, REEPIN_S0},
-	{1, REEPIN_AT},
+	{17, REEPIN_S1},
 };
 
 // Build a MemOperand addressing a cpuRegs field via RSTATE.
@@ -387,6 +396,21 @@ static __fi void armFlushEEClobberedPins()
 	for (const EEPinnedGPR& pin : kEEPinTable)
 	{
 		if (!armIsCalleeSavedRegister(static_cast<int>(pin.host.GetCode())))
+			armAsm->Str(pin.host, armCpuRegMem(&cpuRegs.GPR.r[pin.gpr].UD[0]));
+	}
+}
+
+// Before a plain-AAPCS C call whose callee reads at most the guest GPRs in
+// `gpr_reads` (bit n = GPR n) from memory and writes none: store the pins it
+// reads, and every caller-saved pin, because the call destroys those
+// registers and the armReloadEEClobberedPins that must follow the call reads
+// them back from memory. Callee-saved pins the callee does not read stay
+// dirty in their registers, as they do across the dispatcher.
+static __fi void armFlushEEPinsForCall(u32 gpr_reads)
+{
+	for (const EEPinnedGPR& pin : kEEPinTable)
+	{
+		if (!armIsCalleeSavedRegister(static_cast<int>(pin.host.GetCode())) || (gpr_reads & (1u << pin.gpr)))
 			armAsm->Str(pin.host, armCpuRegMem(&cpuRegs.GPR.r[pin.gpr].UD[0]));
 	}
 }
@@ -737,8 +761,129 @@ void SetBranchImmCall(u32 imm, u32 return_pc);
 
 void iFlushCall(int flushtype);
 void recBranchCall(void (*func)());
+void recBranchCallNoGprWrite(void (*func)(), u32 gpr_reads);
 void recCall(void (*func)());
-u32 scaleblockcycles_clear();
+
+// The single-instruction shape a charge site emits its immediate in. Every
+// caller of scaleblockcycles_clear() below hands its own shape over, because
+// the scaled charge is only patchable in place while it still fits the form
+// already on the page — a charge that outgrows imm12 would have been emitted
+// as a multi-instruction materialise-then-add instead.
+enum class EeChargeForm : u8
+{
+	AddImm12,  // Add/Adds RECCYCLE, RECCYCLE, #charge
+	MovzImm16, // Mov RWARG2, #charge
+};
+
+u32 scaleblockcycles_clear(EeChargeForm form);
+
+// ---------------------------------------------------------------------------
+// Cycle-charge instrumentation
+//
+// The dynamic EE cycle-rate governor transitions by resetting the EE
+// recompiler, which costs tens of milliseconds plus the lazy re-JIT of the
+// next frame's working set. The alternative under investigation is to patch
+// the baked charge immediates in place, and every cost estimate for that pass
+// scales off numbers nobody has measured. These accessors are that
+// measurement, not the pass.
+// ---------------------------------------------------------------------------
+
+// The most recent EE recompiler reset's own duration, in GetCPUTicks() units.
+u64 recEeGetLastResetTicks();
+
+// Cycle-charge sites emitted since the last reset, and blocks registered right
+// now. Both are cleared by the reset, so read them BEFORE a transition — after
+// it they are zero by construction.
+u32 recEeGetChargeSiteCount();
+u32 recEeGetLiveBlockCount();
+
+// Of those charge sites, how many would stop fitting their single-instruction
+// immediate form somewhere in [EECycleRate::GetFloor(), GetConfigured()], and
+// how many blocks hold at least one such site. Underclocking multiplies the
+// charge by up to 2.25x, so a site comfortably inside ADD's imm12 at the
+// configured rate can leave it two steps down. Those sites cannot be repaired
+// in place; the blocks holding them would have to be invalidated and
+// recompiled instead. Cleared by the reset, same as the two above.
+u32 recEeGetFormChangeSiteCount();
+u32 recEeGetFormChangeBlockCount();
+
+// ---------------------------------------------------------------------------
+// The charge-site side table
+//
+// Every charge site is recorded at emit time so a cycle-rate transition can
+// rewrite the immediates in place instead of throwing the whole code cache
+// away. Each of the twelve emitters calls this immediately after its
+// Add/Adds/Mov, and the pairing with scaleblockcycles_clear() is asserted both
+// ways: a charge computed and not recorded, or a record with no charge behind
+// it, is a site that would silently keep charging the old rate.
+//
+// The site address is taken from the emit cursor rather than passed in. That
+// is deliberate: the recorded word is decoded against the form the emitter
+// declared, so a charge that outgrew its immediate and made vixl emit a
+// materialise-then-add is recognised by what is actually on the page, not by
+// bookkeeping that could disagree with it.
+//
+// The site id is bookkeeping for the coverage tests. The twelve emitters are
+// otherwise indistinguishable once their records are in the table, and a
+// coverage test that cannot say which emitter it reached is not one.
+enum class EeChargeSite : u8
+{
+	BranchCall,           // recBranchCall — interpreter-fallback seam
+	BranchCallNoGprWrite, // recBranchCallNoGprWrite — ERET, EI, constant-call SYSCALL
+	BlockTail,            // emitCycleUpdateAndEventCheck — the common tail
+	LoopBackedge,         // SetBranchBackedge — SL-1 resident self-loop
+	WaitLoopFastFwd,      // SetBranchImm under Speedhacks.WaitLoop
+	SuperblockExit,       // recEmitSideExitTail — the MOVZ site
+	ShortBlockTail,       // recRecompile, non-branch block of <= 6 instructions
+	Cop0FlushCycles,      // emitFlushBlockCycles
+	Cop0FlushCyclesAbs,   // emitFlushBlockCyclesAbs — MFC0 Count
+	Vcallms,              // recVCallmsImpl
+	Cop2SyncInterlock,    // cop2EmitConditionalSync, interlocked
+	Cop2SyncPlain,        // cop2EmitConditionalSync, non-interlocked
+	Count
+};
+
+void recEeNoteChargeSite(EeChargeSite which);
+
+// Bring every recorded charge site into agreement with `new_selector` by
+// rewriting the immediate already on the page, so a cycle-rate transition costs
+// a walk of the side table instead of an 88 MiB LUT rewrite, a 32 MiB memset
+// and the lazy re-JIT of the next frame's whole working set.
+//
+// Returns false when the pass did not run or could not complete, in which case
+// NOTHING was touched and the caller must fall back to the full reset. There is
+// no third outcome: a half-applied pass is blocks charging the old rate with
+// nobody tracking which ones, which is the failure this is designed against.
+//
+// Runs on the CPU thread, mid-execute, from EECycleRate::ApplyEffective. That
+// is safe because patching neither moves nor frees code and does not change an
+// instruction boundary — every live return address stays valid and lands on the
+// same instruction, now carrying a different immediate.
+bool recEeRepatchCycleCharges(s8 new_selector);
+
+#ifdef PCSX2_RECOMPILER_TESTS
+// Records held right now, across both arenas. One per charge site by
+// construction, which is what a test pins it against — a drift between the two
+// means a site is emitting a charge the transition pass will never repair.
+u32 recEeGetChargeRecordCount();
+
+// Records emitted by one specific emitter since the last reset. Cleared by the
+// reset with everything else.
+u32 recEeGetChargeSiteCountFor(EeChargeSite which);
+
+// One code arena's base and used extent. The cold side-exit arena carries the
+// superblock exit tail's MOVZ charge, outside every block's
+// [fnptr, fnptr + x86size), so a byte-identity test that reads only the hot
+// block cannot see it; the hot extent is what a test compares before and after
+// a refused pass to prove it wrote nothing at all.
+bool recEeArenaExtent(bool cold, uptr* base, u32* used);
+
+// The hand encoder the patch pass writes with, and the form decoder it checks
+// against, so a test can pin both against vixl at the encoding boundaries
+// rather than restating the bit layout a second time.
+u32 recEeEncodeChargeWordForTest(u32 word, EeChargeForm form, u32 charge);
+bool recEeChargeWordHasFormForTest(u32 word, EeChargeForm form);
+#endif
 
 // COP2 / VU0 sync emit helper (defined in iCOP2-arm64.cpp).
 // interlock=true mirrors x86 COP2_Interlock (CFC2/CTC2/QMFC2/QMTC2 path);
@@ -753,6 +898,16 @@ void cop2EmitConditionalSync(bool interlock, void (*finishFunc)());
 // (defined in iCOP2-arm64.cpp). Must run during dispatcher generation,
 // before any block compiles — called from _DynGen_Dispatchers.
 void cop2DynGenSyncStubs();
+
+// VU0 parked in a recognized wait loop, as the run-ahead sync stub tests it
+// (defined in microVU-arm64.cpp, which owns arming and disarming). Zero when
+// disarmed. Otherwise:
+//   bits  0-15: byte offset of VI[viA] in VURegs; bit 0 holds the loop's exit
+//               sense (1 = the loop exits when the operands are equal)
+//   bits 16-31: byte offset of VI[viB] in VURegs, or 0 when viB is vi0
+// Armed only while recMicroVU0::Execute's spin bounce would answer the next
+// sync on its own, so the stub may do the bounce's arithmetic in its place.
+extern u32 mVU0ParkedSpin;
 
 // (Re)writes _cpuRegistersPack.cop2Rec — the COP2 macro-mode clamp/mask
 // constants the emitters reach via [RSTATE, #imm] (defined in

@@ -2,12 +2,14 @@
 // SPDX-License-Identifier: GPL-3.0+
 
 #include "Achievements.h"
+#include "Arcade/ArcadeInput.h"
 #include "GS.h"
 #include "Host.h"
 #include "IconsFontAwesome.h"
 #include "ImGui/FullscreenUI.h"
 #include "ImGui/ImGuiOverlays.h"
 #include "Input/InputManager.h"
+#include "IopThread/IopThreadVm.h"
 #include "Recording/InputRecording.h"
 #include "SPU2/spu2.h"
 #include "VMManager.h"
@@ -46,6 +48,9 @@ static void HotkeyAdjustVolume(const s32 delta)
 	if (!VMManager::HasValidVM())
 		return;
 
+	// The volume and the mute setting are changed on the audio stream the IOP thread writes (IOP thread design 8.10).
+	IopThread::VmHold iop_hold(IopThread::HoldKind::Emulation);
+
 	// Volume-adjusting hotkeys override mute toggle hotkey. EmuConfig.SPU2.OutputMuted overrides hotkeys.
 	if (!SPU2::SetOutputMuted(false))
 	{
@@ -76,6 +81,9 @@ static void HotkeyToggleMute()
 {
 	if (!VMManager::HasValidVM())
 		return;
+
+	// See HotkeyAdjustVolume.
+	IopThread::VmHold iop_hold(IopThread::HoldKind::Emulation);
 
 	// Attempt to toggle output muting. EmuConfig.SPU2.OutputMuted overrides hotkeys.
 	if (SPU2::SetOutputMuted(!SPU2::IsOutputMuted()))
@@ -254,8 +262,29 @@ DEFINE_HOTKEY("SwapMemCards", TRANSLATE_NOOP("Hotkeys", "System"),
 	TRANSLATE_NOOP("Hotkeys", "Swap Memory Cards"), [](s32 pressed) {
 		if (!pressed && VMManager::HasValidVM())
 			Host::RunOnCPUThread([]() {
+				// Swapping the cards reads and writes the state the IOP's SIO2 code uses (design 8.4).
+				IopThread::VmHold iop_hold(IopThread::HoldKind::Emulation);
 				FileMcd_Swap();
 			});
+	})
+DEFINE_HOTKEY("ArcadeCoinP1", TRANSLATE_NOOP("Hotkeys", "System"), TRANSLATE_NOOP("Hotkeys", "Arcade: Insert Coin (Player 1)"),
+	[](s32 pressed) {
+		if (pressed > 0)
+			ArcadeInput::InsertCoin(0);
+	})
+DEFINE_HOTKEY("ArcadeCoinP2", TRANSLATE_NOOP("Hotkeys", "System"), TRANSLATE_NOOP("Hotkeys", "Arcade: Insert Coin (Player 2)"),
+	[](s32 pressed) {
+		if (pressed > 0)
+			ArcadeInput::InsertCoin(1);
+	})
+DEFINE_HOTKEY("ArcadeService", TRANSLATE_NOOP("Hotkeys", "System"), TRANSLATE_NOOP("Hotkeys", "Arcade: Service Button (Hold)"),
+	[](s32 pressed) {
+		ArcadeInput::SetService(pressed > 0);
+	})
+DEFINE_HOTKEY("ArcadeTest", TRANSLATE_NOOP("Hotkeys", "System"), TRANSLATE_NOOP("Hotkeys", "Arcade: Toggle Test Switch"),
+	[](s32 pressed) {
+		if (pressed > 0)
+			ArcadeInput::ToggleTest();
 	})
 DEFINE_HOTKEY("InputRecToggleMode", TRANSLATE_NOOP("Hotkeys", "System"),
 	TRANSLATE_NOOP("Hotkeys", "Toggle Input Recording Mode"), [](s32 pressed) {

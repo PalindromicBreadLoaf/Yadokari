@@ -13,6 +13,7 @@ import android.view.TextureView
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.FloatBuffer
+import java.util.concurrent.locks.LockSupport
 import kotlin.math.PI
 import kotlin.math.cos
 import kotlin.math.floor
@@ -52,7 +53,20 @@ class XmbGlView(context: Context) : TextureView(context), TextureView.SurfaceTex
     }
 
     override fun onSurfaceTextureAvailable(st: SurfaceTexture, w: Int, h: Int) {
-        thread = RenderThread(st, w, h) { ok -> post { onGlStatus?.invoke(ok) } }.also { it.start() }
+        thread = RenderThread(st, w, h) { ok -> post { onGlStatus?.invoke(ok) } }.also {
+            it.paused = windowVisibility != VISIBLE
+            it.start()
+        }
+    }
+
+    /**
+     * Hold the wave still while the app is out of sight. A TextureView keeps its surface when the
+     * activity stops, so nothing else ends the loop: home, recents and a locked screen all left it
+     * drawing thirty frames a second that no one could see.
+     */
+    override fun onWindowVisibilityChanged(visibility: Int) {
+        super.onWindowVisibilityChanged(visibility)
+        thread?.paused = visibility != VISIBLE
     }
 
     override fun onSurfaceTextureSizeChanged(st: SurfaceTexture, w: Int, h: Int) {
@@ -94,8 +108,12 @@ class XmbGlView(context: Context) : TextureView(context), TextureView.SurfaceTex
         private val cp = FloatArray(28)
         private var startNanos = 0L
 
+        /** Parks the loop while set. Parked, not polled: a hidden wave costs no wakeups at all. */
+        @Volatile var paused = false
+            set(value) { field = value; LockSupport.unpark(this) }
+
         fun resize(w: Int, h: Int) { width = w; height = h; sizeDirty = true }
-        fun finish() { running = false; runCatching { join(500) } }
+        fun finish() { running = false; LockSupport.unpark(this); runCatching { join(500) } }
 
         override fun run() {
             if (!initEgl()) { onStatus(false); return }
@@ -103,6 +121,15 @@ class XmbGlView(context: Context) : TextureView(context), TextureView.SurfaceTex
             startNanos = System.nanoTime()
             var announced = false
             while (running) {
+                if (paused) {
+                    // Woken by the setter or by finish(). park() may also return early, which
+                    // only means another pass over this check. The clock moves with the pause, so
+                    // the wave comes back where it stopped.
+                    val parkedAt = System.nanoTime()
+                    LockSupport.park(this)
+                    startNanos += System.nanoTime() - parkedAt
+                    continue
+                }
                 val frameStart = System.nanoTime()
                 if (sizeDirty) { GLES30.glViewport(0, 0, width, height); sizeDirty = false }
                 val t = (frameStart - startNanos) / 1_000_000_000f
@@ -164,7 +191,7 @@ class XmbGlView(context: Context) : TextureView(context), TextureView.SurfaceTex
             GLES30.glUniform1f(u("flowSpeed"), FLOW_SPEED)
             GLES30.glUniform1f(u("tension"), TENSION)
             GLES30.glUniform1f(u("damping"), DAMPING)
-            GLES30.glUniform1f(u("length"), LENGTH)
+            GLES30.glUniform1f(u("waveLength"), WAVE_LENGTH)
             GLES30.glUniform1f(u("spacing"), SPACING)
             GLES30.glUniform1f(u("perturbation"), PERTURBATION)
             GLES30.glUniform1f(u("perturbationScale"), PERTURBATION_SCALE)
@@ -204,7 +231,7 @@ class XmbGlView(context: Context) : TextureView(context), TextureView.SurfaceTex
                     val legacy = sin((x * PIf * 1.3f + z * 0.8f) - flow * TRAVEL_SPEED1) * TRAVEL_AMP1 * TENSION +
                         sin((x * PIf * 2.8f - z * 1.2f) + flow * TRAVEL_SPEED2) * TRAVEL_AMP2 +
                         PERTURBATION * PERTURBATION_SCALE *
-                        sin((x * (4f + LENGTH * 2f) + z * 4f - flow * 0.6f) * (SPACING * 0.01f))
+                        sin((x * (4f + WAVE_LENGTH * 2f) + z * 4f - flow * 0.6f) * (SPACING * 0.01f))
                     cp[i] = reCore * RE_BLEND + legacy * (1f - RE_BLEND)
                 }
                 for (xi in 0 until STEX_W) splineData[rowBase + xi] = evalSpline(cp, xi.toFloat() / (STEX_W - 1))
@@ -388,7 +415,7 @@ class XmbGlView(context: Context) : TextureView(context), TextureView.SurfaceTex
         private const val FLOW_SPEED = 0.18f
         private const val TENSION = 0.12f
         private const val DAMPING = 0.0001f
-        private const val LENGTH = 0.306001f
+        private const val WAVE_LENGTH = 0.306001f
         private const val SPACING = 407.658f
         private const val TIME_STEP = 1.0f
         private const val BAND_AMP = 0.200f
@@ -452,7 +479,7 @@ uniform float uTime;
 uniform float flowSpeed;
 uniform float tension;
 uniform float damping;
-uniform float length;
+uniform float waveLength;
 uniform float spacing;
 uniform float perturbation;
 uniform float perturbationScale;
@@ -478,10 +505,10 @@ void main() {
   p.z += cos(ffd2.z + uTime * flowSpeed) * ffdZAmp;
   float baseWave = cos(p.x * 2.0 - uTime * 0.5 * timeStep) * waveCosAmp + waveBias;
   baseWave *= (1.0 - damping);
-  baseWave += tension * sin(p.x * length + uTime * flowSpeed * timeStep * 0.25);
+  baseWave += tension * sin(p.x * waveLength + uTime * flowSpeed * timeStep * 0.25);
   float structured = perturbation * perturbationScale * (
-    sin((p.x * length * 6.0 + p.z * 0.5) * spacing * 0.01 + uTime * flowSpeed * timeStep * 0.7) * 0.5 +
-    sin((p.x * length * 10.0 - p.z * 0.8) * spacing * 0.005 - uTime * flowSpeed * timeStep * 0.35) * 0.25
+    sin((p.x * waveLength * 6.0 + p.z * 0.5) * spacing * 0.01 + uTime * flowSpeed * timeStep * 0.7) * 0.5 +
+    sin((p.x * waveLength * 10.0 - p.z * 0.8) * spacing * 0.005 - uTime * flowSpeed * timeStep * 0.35) * 0.25
   );
   float totalWave = (baseWave + structured) * waveHeightScale;
   totalWave = waveSoftClip * tanh(totalWave / max(waveSoftClip, 1e-4));

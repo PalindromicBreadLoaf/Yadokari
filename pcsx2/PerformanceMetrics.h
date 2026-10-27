@@ -86,18 +86,29 @@ namespace PerformanceMetrics
 	/// Close the ADPF session and forget registered threads (VM shutdown).
 	void AdpfShutdown();
 
-	/// ADPF work-period brackets, driven by the frame limiter (VMManager::Internal::Throttle).
-	/// The reported duration must be the active EE/GS/VU work per frame, EXCLUDING the deliberate
-	/// limiter sleep and present wait, per the PerformanceHintManager contract (reportActualWork
-	/// = the last workload cycle, not the frame interval). The limiter waits twice per frame, at
-	/// vsync start and at vsync end, so a frame's work is two segments. EndWorkSegment() closes the
-	/// segment that just ended (called at Throttle entry, before the sleep) and, at the frame's
-	/// last wait, reports both segments as one period; BeginFrameWork() opens the next segment
-	/// after the sleep; PauseFrameWork() invalidates the frame when we are not frame-limiting
-	/// (unlimited / host-vsync pacing / interrupted), so no bogus duration is reported.
-	void AdpfEndWorkSegment(bool frame_end);
-	void AdpfBeginFrameWork();
-	void AdpfPauseFrameWork();
+	/// The CPU thread's frame-work clock, driven by the frame limiter
+	/// (VMManager::Internal::Throttle). The period it measures is the frame's active EE/GS/VU
+	/// work, EXCLUDING the deliberate limiter sleep. The limiter waits twice per frame, at vsync
+	/// start and at vsync end, so a frame's work is two segments. OnFrameWorkSegmentComplete()
+	/// closes the segment that just ended (called at Throttle entry, before the sleep) and returns
+	/// its length in GetCPUTicks() units; OnFrameWorkBegin() opens the next segment after the
+	/// sleep; OnFrameWorkPaused() invalidates the frame when we are not frame-limiting
+	/// (unlimited / host-vsync pacing / execution interrupted), so no wall-time-with-wait
+	/// duration is measured. Zero back from OnFrameWorkSegmentComplete() means no segment was
+	/// open. `frame_end` marks the frame's last wait (vsync end).
+	///
+	/// Two consumers share this one timestamp: the Android ADPF hint, which sums the two
+	/// segments and reports them to PerformanceHintManager at the frame's last wait
+	/// (reportActualWork = the last workload cycle, not the frame interval), and the dynamic EE
+	/// cycle-rate sampler, which is the same measurement on every platform.
+	u64 OnFrameWorkSegmentComplete(u64 now_ticks, bool frame_end);
+	void OnFrameWorkBegin();
+	void OnFrameWorkPaused();
+
+	/// The CPU (EE) thread's own CPU time, in Threading::GetThreadTicksPerSecond() units.
+	/// Reads the same handle SetCPUThread() registered, so there is one handle rather than
+	/// one per consumer. Zero if no CPU thread is registered.
+	u64 GetCPUThreadCPUTime();
 
 	/// Sets the EE thread for CPU usage calculations.
 	void SetCPUThread(Threading::ThreadHandle thread);
@@ -116,6 +127,12 @@ namespace PerformanceMetrics
 	/// TODO: GS-thread wait instrumentation fed by the deko3d backend.
 	void AccumulateGSAcquireWait(u64 ns);
 	void AccumulateGSGpuWait(u64 ns);
+
+	/// Sets the timer for the IOP thread (exists only while the IOP runs on its own thread, concurrently
+	/// with the EE). Registered by the VM when it starts the thread and cleared before it is joined; an empty
+	/// handle means no such thread exists, which is the default configuration. Without it the EE thread's
+	/// figure alone reads as a drop in cost that is really the IOP's work moved to another thread.
+	void SetIOPThread(Threading::ThreadHandle thread);
 
 	u64 GetFrameNumber();
 
@@ -140,6 +157,10 @@ namespace PerformanceMetrics
 	float GetGSBackThreadAverageTime();
 	float GetVUThreadUsage();
 	float GetVUThreadAverageTime();
+	/// True while an IOP thread is registered. Both figures below read zero when it is not.
+	bool HasIOPThread();
+	float GetIOPThreadUsage();
+	float GetIOPThreadAverageTime();
 
 	u32 GetGSSWThreadCount();
 	double GetGSSWThreadUsage(u32 index);
@@ -155,4 +176,41 @@ namespace PerformanceMetrics
 
 	const FrameTimeHistory& GetFrameTimeHistory();
 	u32 GetFrameTimeHistoryPos();
+
+	/// Whether the open GS device can time the GPU. Set by the GS thread when the device opens. Without a
+	/// timer GetGPUUsage() reads zero whatever the GPU is doing, so a reader must not take that as idle.
+	void SetGPUTimerSupported(bool supported);
+	bool HasGPUTimer();
+
+	/// The figures of the last window Update() closed (about every 0.5 s), copied together.
+	/// Update() runs on the GS thread and the getters above are plain reads of what it wrote, so a reader on
+	/// another thread can see half of one window and half of the next; this copy cannot. `sequence` counts the
+	/// windows closed so far and never goes back, so a reader that keeps the last value it saw knows when a
+	/// new window has arrived instead of reading the same one twice.
+	struct WindowSnapshot
+	{
+		u32 sequence = 0;
+		float seconds = 0.0f; // wall time the window covers
+		float speed = 0.0f; // percent of the nominal frame rate, as GetSpeed()
+		double ee_usage = 0.0; // percent of one core, as GetCPUThreadUsage()
+		float gs_usage = 0.0f;
+		float gs_back_usage = 0.0f;
+		float vu_usage = 0.0f;
+		float iop_usage = 0.0f;
+		float gpu_usage = 0.0f;
+		bool has_gs_back_thread = false;
+		bool has_iop_thread = false;
+		bool has_gpu_timer = false;
+		// What each thread cost per frame over the window, in milliseconds (CPU time per frame; the GPU's own
+		// time per frame). Unlike the usage figures these do not saturate at 100%, so they can show a thread
+		// getting cheaper while it is still the limit.
+		float ee_ms = 0.0f;
+		float gs_ms = 0.0f;
+		float gs_back_ms = 0.0f;
+		float gpu_ms = 0.0f;
+	};
+
+	/// False when no window has been closed yet or the GS thread is in the middle of closing one (try again
+	/// later). Safe to call from any thread.
+	bool TryGetWindowSnapshot(WindowSnapshot* out);
 } // namespace PerformanceMetrics

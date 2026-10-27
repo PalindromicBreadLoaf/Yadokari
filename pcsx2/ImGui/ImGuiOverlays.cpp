@@ -4,6 +4,7 @@
 #include "BuildVersion.h"
 #include "Config.h"
 #include "Counters.h"
+#include "EECycleRateSampler.h"
 #include "GS/GS.h"
 #include "GS/GSShaderCompileIndicator.h"
 #include "GS/GSVector.h"
@@ -21,6 +22,7 @@
 #include "ImGui/ImGuiManager.h"
 #include "ImGui/ImGuiOverlays.h"
 #include "Input/InputManager.h"
+#include "IopThread/IopThreadVm.h"
 #include "MTGS.h"
 #include "Patch.h"
 #include "PerformanceMetrics.h"
@@ -78,6 +80,9 @@ SmallString s_cpu_usage_ee_line;
 SmallString s_cpu_usage_gs_line;
 SmallString s_cpu_usage_gs_back_line;
 SmallString s_cpu_usage_vu_line;
+SmallString s_cpu_usage_iop_line;
+// Devel builds, Threaded mode: the IOP thread's waits and queues per frame (IOP thread design, step 11).
+SmallString s_iop_thread_line;
 std::vector<SmallString> s_software_thread_lines;
 SmallString s_gpu_usage_line;
 SmallString s_gpu_debug_info_line;
@@ -688,10 +693,30 @@ __ri void ImGuiManager::DrawPerformanceOverlay(float& position_y, float scale, f
 				DRAW_LINE(osd_font, font_size, s_cpu_jit_line.c_str(), OsdTextColor());
 #endif
 
-				if (EmuConfig.Speedhacks.EECycleRate != 0 || EmuConfig.Speedhacks.EECycleSkip != 0)
+				// The governor's published word is the only governor state this thread reads.
+				// When it is not running the word says so and the configured settings answer,
+				// which is what this line has always shown.
+				const EECycleRateSampler::OverlayState ee_rate =
+					EECycleRateSampler::UnpackOverlayWord(EECycleRateSampler::GetOverlayWord());
+				const bool ee_rate_dynamic = ee_rate.enabled || ee_rate.shadow;
+
+				if (ee_rate_dynamic && ee_rate.effective != ee_rate.configured)
+				{
+					s_cpu_usage_ee_line.format("EE[{}->{}/{}]: ", ee_rate.configured, ee_rate.effective,
+						EmuConfig.Speedhacks.EECycleSkip);
+				}
+				else if (ee_rate_dynamic)
+				{
+					s_cpu_usage_ee_line.format("EE[{}~/{}]: ", ee_rate.configured, EmuConfig.Speedhacks.EECycleSkip);
+				}
+				else if (EmuConfig.Speedhacks.EECycleRate != 0 || EmuConfig.Speedhacks.EECycleSkip != 0)
+				{
 					s_cpu_usage_ee_line.format("EE[{}/{}]: ", EmuConfig.Speedhacks.EECycleRate, EmuConfig.Speedhacks.EECycleSkip);
+				}
 				else
+				{
 					s_cpu_usage_ee_line.assign("EE: ");
+				}
 				FormatProcessorStat(s_cpu_usage_ee_line, PerformanceMetrics::GetCPUThreadUsage(), PerformanceMetrics::GetCPUThreadAverageTime());
 				DRAW_LINE(osd_font, font_size, s_cpu_usage_ee_line.c_str(), OsdTextColor());
 
@@ -715,6 +740,24 @@ __ri void ImGuiManager::DrawPerformanceOverlay(float& position_y, float scale, f
 					FormatProcessorStat(s_cpu_usage_vu_line, PerformanceMetrics::GetVUThreadUsage(), PerformanceMetrics::GetVUThreadAverageTime());
 					DRAW_LINE(osd_font, font_size, s_cpu_usage_vu_line.c_str(), OsdTextColor());
 				}
+
+				// Only exists while the IOP runs on its own thread beside the EE. The EE line above no longer
+				// includes the IOP's work then, so without this one that work is invisible.
+				if (PerformanceMetrics::HasIOPThread())
+				{
+					s_cpu_usage_iop_line.assign("IOP: ");
+					FormatProcessorStat(s_cpu_usage_iop_line, PerformanceMetrics::GetIOPThreadUsage(), PerformanceMetrics::GetIOPThreadAverageTime());
+					DRAW_LINE(osd_font, font_size, s_cpu_usage_iop_line.c_str(), OsdTextColor());
+				}
+
+#if defined(PCSX2_DEVBUILD) || defined(PCSX2_DEBUG)
+				{
+					const std::string iop_stats = IopThread::OsdStatsLine();
+					s_iop_thread_line.assign(iop_stats.c_str());
+					if (!iop_stats.empty())
+						DRAW_LINE(osd_font, font_size, s_iop_thread_line.c_str(), OsdTextColor());
+				}
+#endif
 
 				const u32 gs_sw_threads = PerformanceMetrics::GetGSSWThreadCount();
 				for (u32 thread = 0; thread < gs_sw_threads; thread++)
@@ -816,6 +859,14 @@ __ri void ImGuiManager::DrawPerformanceOverlay(float& position_y, float scale, f
 					DRAW_LINE(osd_font, font_size, s_cpu_usage_gs_back_line.c_str(), OsdTextColor());
 				if (THREAD_VU1)
 					DRAW_LINE(osd_font, font_size, s_cpu_usage_vu_line.c_str(), OsdTextColor());
+				// The frames between two refreshes of the figures draw the text of the last refresh. The IOP line is
+				// formatted where the others are, so without this it showed on the refresh frames only.
+				if (PerformanceMetrics::HasIOPThread())
+					DRAW_LINE(osd_font, font_size, s_cpu_usage_iop_line.c_str(), OsdTextColor());
+#if defined(PCSX2_DEVBUILD) || defined(PCSX2_DEBUG)
+				if (!s_iop_thread_line.empty())
+					DRAW_LINE(osd_font, font_size, s_iop_thread_line.c_str(), OsdTextColor());
+#endif
 
 				const u32 thread_count = std::min(
 					PerformanceMetrics::GetGSSWThreadCount(),
@@ -1169,7 +1220,11 @@ __ri void ImGuiManager::DrawSettingsOverlay(float scale, float margin, float bot
 			Patch::GetActivePatchesCount(),
 			Patch::GetActiveCheatsCount());
 
-	if (EmuConfig.Speedhacks.EECycleRate != 0)
+	const EECycleRateSampler::OverlayState ee_rate =
+		EECycleRateSampler::UnpackOverlayWord(EECycleRateSampler::GetOverlayWord());
+	if (ee_rate.enabled || ee_rate.shadow)
+		APPEND("CR={}->{} ", ee_rate.configured, ee_rate.effective);
+	else if (EmuConfig.Speedhacks.EECycleRate != 0)
 		APPEND("CR={} ", EmuConfig.Speedhacks.EECycleRate);
 	if (EmuConfig.Speedhacks.EECycleSkip != 0)
 		APPEND("CS={} ", EmuConfig.Speedhacks.EECycleSkip);

@@ -30,6 +30,7 @@ target_sources(common PRIVATE
 	ReadbackSpinManager.cpp
 	Semaphore.cpp
 	SettingsWrapper.cpp
+	SHA256.cpp
 	SmallString.cpp
 	StringUtil.cpp
 	TextureDecompress.cpp
@@ -77,6 +78,7 @@ target_sources(common PRIVATE
 	ScopedGuard.h
 	SettingsInterface.h
 	SettingsWrapper.h
+	SHA256.h
 	SingleRegisterTypes.h
 	SmallString.h
 	StringUtil.h
@@ -267,6 +269,7 @@ target_link_libraries(common PRIVATE
 	PNG::PNG
 	WebP::libwebp
 	cpuinfo
+	LZMA::LZMA
 )
 
 target_link_libraries(common PUBLIC

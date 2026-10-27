@@ -14,6 +14,7 @@
 #include "GS/Renderers/Vulkan/VKShaderCache.h"
 #include "GS/Renderers/Vulkan/VKSwapChain.h"
 #include "GS/Renderers/Vulkan/VKLibretro.h"
+#include "GS/Renderers/Common/GSHeadlessPresent.h"
 
 // Libretro presentation backbuffers: the frontend samples the published
 // VkImageView asynchronously (including cached-frame replays long after the
@@ -84,11 +85,16 @@ namespace
 #endif
 
 #include <bit>
+#include <chrono>
 #include <limits>
 #include <mutex>
 #include <optional>
 #include <sstream>
 #include <utility>
+
+#ifdef __ANDROID__
+#include <android/hardware_buffer.h>
+#endif
 
 // Tweakables
 enum : u32
@@ -122,6 +128,11 @@ enum : u32
 	// vertices would otherwise make the GS thread wait for the GPU (GSStreamRingGrowth.h). A title
 	// whose frames fit never pays for more.
 	VERTEX_BUFFER_MAX_SIZE = 64 * 1024 * 1024,
+
+	// The texture upload ring grows the same way. A title that streams textures every frame
+	// (Baldur's Gate: Dark Alliance uploads ~19 MB a frame in one area) otherwise blocks on the GPU
+	// once a frame when the 32 MiB ring comes round, and CPU and GPU stop overlapping.
+	TEXTURE_BUFFER_MAX_SIZE = 128 * 1024 * 1024,
 
 	// The smallest start gsrunner's -vertex-ring-kib may choose.
 	VERTEX_BUFFER_MIN_START_SIZE = 64 * 1024,
@@ -617,6 +628,25 @@ bool GSDeviceVK::SelectDeviceExtensions(ExtensionList* extension_list, bool enab
 	// fp16), so it takes effect from the next device, which is the next game.
 	m_optional_extensions.vk_khr_shader_float16_int8 =
 		GSConfig.LsfgFp16 && SupportsExtension(VK_KHR_SHADER_FLOAT16_INT8_EXTENSION_NAME, false);
+
+#ifdef __ANDROID__
+	// Remote play hands its frames to the video encoder as AHardwareBuffers, so they never pass
+	// through the CPU. Both are on practically every Android driver; the foreign queue family is what
+	// lets the encoder's GL take a frame over, so the buffer extension is only asked for alongside it.
+	// Without them, frames are read back instead.
+	//
+	// Both or neither. SupportsExtension enables what it finds, so asking for the two in a row
+	// enabled the foreign queue family alone on a driver that lists it without the buffer one.
+	const auto listed = [&available_extension_list](const char* name) {
+		return std::any_of(available_extension_list.begin(), available_extension_list.end(),
+			[name](const VkExtensionProperties& properties) { return !std::strcmp(name, properties.extensionName); });
+	};
+	m_optional_extensions.vk_android_external_memory_ahb =
+		listed(VK_EXT_QUEUE_FAMILY_FOREIGN_EXTENSION_NAME) &&
+		listed(VK_ANDROID_EXTERNAL_MEMORY_ANDROID_HARDWARE_BUFFER_EXTENSION_NAME) &&
+		SupportsExtension(VK_EXT_QUEUE_FAMILY_FOREIGN_EXTENSION_NAME, false) &&
+		SupportsExtension(VK_ANDROID_EXTERNAL_MEMORY_ANDROID_HARDWARE_BUFFER_EXTENSION_NAME, false);
+#endif
 
 	return true;
 }
@@ -1491,14 +1521,15 @@ VkRenderPass GSDeviceVK::GetRenderPassForRestarting(VkRenderPass pass)
 		if (it.second != pass)
 			continue;
 
+		// The restarted pass continues the one that was open, so it loads what that pass drew. A
+		// DONT_CARE kept from the first opening (an invalidated target) throws it away instead: on a
+		// tiler the pass then starts from undefined tile memory and stores it over everything drawn
+		// before the restart.
 		RenderPassCacheKey modified_key;
 		modified_key.key = it.first;
-		if (modified_key.color_load_op == VK_ATTACHMENT_LOAD_OP_CLEAR)
-			modified_key.color_load_op = VK_ATTACHMENT_LOAD_OP_LOAD;
-		if (modified_key.depth_load_op == VK_ATTACHMENT_LOAD_OP_CLEAR)
-			modified_key.depth_load_op = VK_ATTACHMENT_LOAD_OP_LOAD;
-		if (modified_key.stencil_load_op == VK_ATTACHMENT_LOAD_OP_CLEAR)
-			modified_key.stencil_load_op = VK_ATTACHMENT_LOAD_OP_LOAD;
+		modified_key.color_load_op = VK_ATTACHMENT_LOAD_OP_LOAD;
+		modified_key.depth_load_op = VK_ATTACHMENT_LOAD_OP_LOAD;
+		modified_key.stencil_load_op = VK_ATTACHMENT_LOAD_OP_LOAD;
 
 		if (modified_key.key == it.first)
 			return pass;
@@ -2129,6 +2160,11 @@ void GSDeviceVK::SubmitCommandBuffer(VKSwapChain* present_swap_chain)
 
 			return;
 		}
+
+		// The surface turned (device rotated, window moved to a display mounted the other way):
+		// rebuild with the new pre-rotation next frame. Other SUBOPTIMALs keep the swap chain.
+		if (res == VK_SUBOPTIMAL_KHR && present_swap_chain->HasSurfaceRotationChanged())
+			m_resize_requested = true;
 
 		// Grab the next image as soon as possible, that way we spend less time blocked on the next
 		// submission. Don't care if it fails, we'll deal with that at the presentation call site.
@@ -3123,14 +3159,21 @@ bool GSDeviceVK::Create(GSVSyncMode vsync_mode, bool allow_present_throttle)
 		return false;
 
 	InitializeState();
+#ifdef __ANDROID__
+	GSRemotePlay::g_renderer_captures.store(true, std::memory_order_release);
+#endif
 	return true;
 }
 
 void GSDeviceVK::Destroy()
 {
+#ifdef __ANDROID__
+	GSRemotePlay::g_renderer_captures.store(false, std::memory_order_release);
+#endif
+
 	// Free the libretro backbuffers while the device is still alive; the
 	// frontend stopped sampling at context_destroy.
-	if (VKLibretro::Active)
+	if (VKLibretro::Active || GSHeadless::IsEnabled())
 	{
 		WaitForGPUIdle();
 		for (std::unique_ptr<GSTextureVK>& bb : s_libretro_bb)
@@ -3160,6 +3203,12 @@ void GSDeviceVK::Destroy()
 		ExecuteCommandBuffer(false);
 		WaitForGPUIdle();
 	}
+
+#ifdef __ANDROID__
+	// The GPU is idle, so remote play's buffers can go at once, ahead of the allocator.
+	if (m_device != VK_NULL_HANDLE)
+		RemotePlayRelease(true);
+#endif
 
 	m_swap_chain.reset();
 
@@ -3278,6 +3327,11 @@ bool GSDeviceVK::SupportsExclusiveFullscreen() const
 	return false;
 }
 
+DisplayRotation GSDeviceVK::GetSurfacePreRotation() const
+{
+	return m_swap_chain ? m_swap_chain->GetPreRotation() : DisplayRotation::Rot0;
+}
+
 void GSDeviceVK::DestroySurface()
 {
 	WaitForGPUIdle();
@@ -3361,7 +3415,8 @@ GSDevice::PresentResult GSDeviceVK::DoBeginPresent(bool frame_skip)
 		// then hands the finished image to the frontend. The backbuffers are
 		// owned outside the texture pool because the frontend keeps sampling
 		// the published view for cached-frame replays.
-		if (VKLibretro::Active)
+		// Headless (GSHeadless) takes the same path with no frontend: the backbuffer is read back.
+		if (VKLibretro::Active || GSHeadless::IsEnabled())
 		{
 			// Reclaim backbuffers retired long enough ago that the frontend's
 			// replay window has moved past them (see kLibretroRetireFrames).
@@ -3424,9 +3479,12 @@ GSDevice::PresentResult GSDeviceVK::DoBeginPresent(bool frame_skip)
 
 	// SUBOPTIMAL is a success: the image is acquired and presentable. Adreno returns it when the
 	// compositor changes state (the touch overlay redrawing), and rebuilding the swap chain for it
-	// blanks the window. Rebuilding would not clear it either, since preTransform stays identity.
-	// Real size changes arrive as a host resize, an Android surface change, or OUT_OF_DATE.
+	// blanks the window, so it is rebuilt only when the surface's rotation changed (the swap chain
+	// is pre-rotated to it; see VKSwapChain::GetPreRotation). Real size changes arrive as a host
+	// resize, an Android surface change, or OUT_OF_DATE.
 	VkResult res = m_resize_requested ? VK_ERROR_OUT_OF_DATE_KHR : m_swap_chain->AcquireNextImage();
+	if (res == VK_SUBOPTIMAL_KHR && m_swap_chain->HasSurfaceRotationChanged())
+		m_resize_requested = true;
 	if (res != VK_SUCCESS && res != VK_SUBOPTIMAL_KHR)
 	{
 		m_swap_chain->ReleaseCurrentImage();
@@ -3527,7 +3585,7 @@ void GSDeviceVK::EndPresent()
 	vkCmdEndRenderPass(cmdbuffer);
 	m_is_presenting = false;
 
-	if (VKLibretro::Active && !m_swap_chain)
+	if ((VKLibretro::Active || GSHeadless::IsEnabled()) && !m_swap_chain)
 	{
 		// Libretro: finish the backbuffer, submit without any swapchain
 		// semantics, and hand the image to the frontend.
@@ -3538,6 +3596,12 @@ void GSDeviceVK::EndPresent()
 		SubmitCommandBuffer(static_cast<VKSwapChain*>(nullptr));
 		MoveToNextCommandBuffer();
 		InvalidateCachedState();
+
+		if (!VKLibretro::Active)
+		{
+			GSHeadless::NotePresented(bb);
+			return;
+		}
 
 		VKLibretro::Frame frame;
 		frame.image = bb->GetImage();
@@ -3908,6 +3972,15 @@ void GSDeviceVK::PublishGPUProfile()
 	const GpuProfileSelection& mobile_profile = m_gpu_profile;
 	SetMobileDriverProfile(mobile_profile.driver);
 #if defined(__ANDROID__)
+	// Remote play's buffer handoff, turned off for a driver whose profile says so. The profile is
+	// only known now, after the device was created with the extensions, so it is their use that
+	// goes: frames are read back instead.
+	if (m_optional_extensions.vk_android_external_memory_ahb &&
+		GetMobileDriverProfile().UsesWorkaround(DriverWorkaround::ReadBackRemotePlayFrames))
+	{
+		Console.WriteLn("VK: remote play reads frames back on this driver (driver profile).");
+		m_optional_extensions.vk_android_external_memory_ahb = false;
+	}
 	// So that IsMaliGPUProfile() and IsAdrenoGPUProfile() answer for the Vulkan device too.
 	SetRuntimeGPUProfile(mobile_profile.runtime_profile);
 	// Per-model pool sizes and ages, which drive GSDevice's pool sizing. From sashkinbro/EmuCoreX.
@@ -4062,7 +4135,7 @@ GSSelfReadRoadDecision GSDeviceVK::ResolveSelfReadRoad()
 	road_inputs.driver_orders_declared_loop = GetMobileDriverProfile().orders_declared_feedback_loop &&
 		(!order_on_request || m_optional_extensions.vk_ext_rasterization_order_attachment_access);
 	// The database saying this part belongs on the declared loop with our own barriers kept: Turnip on
-	// Adreno 730 and up, where the copy road renders wrong.
+	// Adreno 730 and up and on the 722, where the copy road renders wrong.
 	road_inputs.driver_prefers_declared_loop_with_barriers =
 		GetMobileDriverProfile().prefers_declared_loop_with_barriers;
 	road_inputs.override_texture_barriers = GSConfig.OverrideTextureBarriers;
@@ -4195,6 +4268,8 @@ void GSDeviceVK::ResolveFeatureTable()
 	// does it through GpuProfileDetector::SetForcedBugs, which is already folded into the profile
 	// by the time this reads it.
 	m_features.broken_blend_constant = GetMobileDriverProfile().HasBug(DriverBug::BrokenBlendConstant);
+
+	m_features.native_counter_draws = true;
 
 	// Use D32F depth instead of D32S8 when we have framebuffer fetch.
 	m_features.stencil_buffer &= !m_features.framebuffer_fetch;
@@ -4344,7 +4419,8 @@ void GSDeviceVK::ResolveStreamRingMemory()
 	inputs.type_flags = type_flags;
 	inputs.type_count = memory_properties.memoryTypeCount;
 	inputs.prefer_cached_over_write_combined =
-		UsesMobileDriverWorkaround(DriverWorkaround::PreferCachedStreamRingMemory);
+		UsesMobileDriverWorkaround(DriverWorkaround::PreferCachedStreamRingMemory) ||
+		g_gs_measurement_overrides.stream_rings_cached;
 	m_stream_ring_memory = GSDecideStreamRingMemory(inputs);
 }
 
@@ -4986,16 +5062,17 @@ void GSDeviceVK::DoStretchRect(GSTextureVK* sTex, const GSVector4& sRect, GSText
 	DrawStretchRect(sRect, dRect, size);
 }
 
-// Rotate a logical-NDC point (x, y) into physical-NDC by GSConfig.Rotation.
-// Used by the present pass to map a quad laid out for a logically-rotated
-// window onto the unrotated swapchain viewport.
+// Rotate a logical-NDC point (x, y) into physical-NDC by `rotation`, the present rotation
+// (the user's DisplayRotation plus the swap chain pre-rotation, GSDevice::GetPresentRotation).
+// Used by the present pass to map a quad laid out for the logical window onto the swap chain
+// image.
 //   Rot0:   (x,  y)
 //   Rot90:  (y, -x)   (image rotates 90° CW on the panel)
 //   Rot180: (-x,-y)
 //   Rot270: (-y, x)   (image rotates 90° CCW on the panel)
-static void RotateNDCForPresent(float& x, float& y)
+static void RotateNDCForPresent(DisplayRotation rotation, float& x, float& y)
 {
-	switch (GSConfig.Rotation)
+	switch (rotation)
 	{
 		case DisplayRotation::Rot90:
 		{
@@ -5039,16 +5116,17 @@ void GSDeviceVK::DrawStretchRect(const GSVector4& sRect, const GSVector4& dRect,
 	// Present pass: map logical-NDC (computed against the rotated window) onto
 	// the unrotated physical swapchain viewport. Non-present passes pass the
 	// real dst-texture size in `ds` and must not rotate.
-	if (m_is_presenting && GSConfig.Rotation != DisplayRotation::Rot0)
+	const DisplayRotation rotation = m_is_presenting ? GetPresentRotation() : DisplayRotation::Rot0;
+	if (rotation != DisplayRotation::Rot0)
 	{
 		float tlx = left, tly = top;
 		float trx = right, try_ = top;
 		float blx = left, bly = bottom;
 		float brx = right, bry = bottom;
-		RotateNDCForPresent(tlx, tly);
-		RotateNDCForPresent(trx, try_);
-		RotateNDCForPresent(blx, bly);
-		RotateNDCForPresent(brx, bry);
+		RotateNDCForPresent(rotation, tlx, tly);
+		RotateNDCForPresent(rotation, trx, try_);
+		RotateNDCForPresent(rotation, blx, bly);
+		RotateNDCForPresent(rotation, brx, bry);
 
 		const GSVertexPT1 vertices[] = {
 			{GSVector4(tlx, tly, 0.5f, 1.0f), GSVector2(sRect.x, sRect.y)},
@@ -6072,7 +6150,9 @@ bool GSDeviceVK::CreateBuffers()
 		return false;
 	}
 
-	if (!m_texture_stream_buffer.Create(VK_BUFFER_USAGE_TRANSFER_SRC_BIT, TEXTURE_BUFFER_SIZE, "texture"))
+	const u32 texture_max_size =
+		g_gs_measurement_overrides.texture_ring_no_growth ? TEXTURE_BUFFER_SIZE : TEXTURE_BUFFER_MAX_SIZE;
+	if (!m_texture_stream_buffer.Create(VK_BUFFER_USAGE_TRANSFER_SRC_BIT, TEXTURE_BUFFER_SIZE, "texture", texture_max_size))
 	{
 		Host::ReportErrorAsync("GS", "Failed to allocate texture upload buffer");
 		return false;
@@ -6886,9 +6966,10 @@ void GSDeviceVK::RenderImGui()
 	// uScale/uTranslate map pixel coords directly to NDC. Rotation transforms
 	// logical pixels into the physical pixel space of the swapchain viewport,
 	// so uScale must always be in physical units (not logical) for both the
-	// rotated and unrotated paths.
-	const float phys_w = static_cast<float>(m_window_info.surface_width);
-	const float phys_h = static_cast<float>(m_window_info.surface_height);
+	// rotated and unrotated paths. Physical is the swap chain image, whose axes
+	// are swapped from the window's under a 90/270 pre-rotation.
+	const float phys_w = static_cast<float>(m_swap_chain ? m_swap_chain->GetImageWidth() : m_window_info.surface_width);
+	const float phys_h = static_cast<float>(m_swap_chain ? m_swap_chain->GetImageHeight() : m_window_info.surface_height);
 	const GSVector4 uniforms(2.0f / phys_w, 2.0f / phys_h, -1.0f, -1.0f);
 
 	SetUtilityPushConstants(&uniforms, sizeof(uniforms));
@@ -6907,34 +6988,21 @@ void GSDeviceVK::RenderImGui()
 	// maps a logical pixel (lx, ly) on a (lw, lh) logical surface to a
 	// physical pixel on the (phys_w, phys_h) swapchain. Rotation is around
 	// the geometric centre of each surface.
-	const bool rotate = (GSConfig.Rotation != DisplayRotation::Rot0);
+	const DisplayRotation rotation = GetPresentRotation();
+	const bool rotate = (rotation != DisplayRotation::Rot0);
 	const GSVector2i pres = GetPresentationSize();
 	const float lw = static_cast<float>(pres.x);
 	const float lh = static_cast<float>(pres.y);
+	// The turn is RotateNDCForPresent's, the one the game image gets. That works in y-up
+	// coordinates (the present vertex shader flips y) and ImGui's pixels are y-down, so y is
+	// flipped around it; applying the same formula to y-down pixels turns the overlay the other
+	// way, 180 degrees off the game at Rot90/Rot270.
 	const auto rotate_pixel = [&](float lx, float ly, float& px, float& py) {
-		const float lcx = lx - lw * 0.5f;
-		const float lcy = ly - lh * 0.5f;
-		float pcx = lcx;
-		float pcy = lcy;
-		switch (GSConfig.Rotation)
-		{
-			case DisplayRotation::Rot90:
-				pcx = lcy;
-				pcy = -lcx;
-				break;
-			case DisplayRotation::Rot180:
-				pcx = -lcx;
-				pcy = -lcy;
-				break;
-			case DisplayRotation::Rot270:
-				pcx = -lcy;
-				pcy = lcx;
-				break;
-			default:
-				break;
-		}
-		px = pcx + phys_w * 0.5f;
-		py = pcy + phys_h * 0.5f;
+		float x = lx - lw * 0.5f;
+		float y = lh * 0.5f - ly;
+		RotateNDCForPresent(rotation, x, y);
+		px = x + phys_w * 0.5f;
+		py = phys_h * 0.5f - y;
 	};
 
 	for (int n = 0; n < draw_data->CmdLists.Size; n++)
@@ -8312,7 +8380,10 @@ VkDescriptorSet GSDeviceVK::CreateTFXUBODescriptorSet()
 
 void GSDeviceVK::OnStreamRingReplaced(const VKStreamBuffer& ring)
 {
-	// Only the vertex ring is created with room to grow.
+	// Each texture upload names the ring's buffer when it is recorded and nothing binds it, so a
+	// grown texture ring needs nothing redone. Only the vertex ring is bound.
+	if (&ring == &m_texture_stream_buffer)
+		return;
 	pxAssert(&ring == &m_vertex_stream_buffer);
 
 	// Draws already recorded keep the old buffer, which retires with this command buffer. Later
@@ -8370,9 +8441,18 @@ void GSDeviceVK::ExecuteCommandBufferAndRestartRenderPass(bool wait_for_completi
 	GSTexture* const current_rt = m_current_render_target;
 	GSTexture* const current_ds = m_current_depth_target;
 	const FeedbackLoopFlag current_feedback_loop = m_current_framebuffer_feedback_loop;
+	// Callers restart in the middle of a draw whose textures are already bound, then re-apply its
+	// state. Moving to the next command buffer resets every texture slot to the null texture, which
+	// would draw the rest of that draw untextured, so carry the bindings across. They stay valid:
+	// a texture unbinds itself when destroyed.
+	const std::array<GSTextureVK*, NUM_TFX_TEXTURES> tfx_textures = m_tfx_textures;
+	const GSTextureVK* const utility_texture = m_utility_texture;
 
 	EndRenderPass();
 	ExecuteCommandBuffer(GetWaitType(wait_for_completion, GSConfig.HWSpinCPUForReadbacks));
+
+	m_tfx_textures = tfx_textures;
+	m_utility_texture = utility_texture;
 
 	if (render_pass != VK_NULL_HANDLE)
 	{
@@ -8407,7 +8487,8 @@ void GSDeviceVK::ExecuteCommandBufferAndRestartPresent(bool wait_for_completion,
 	vkCmdEndRenderPass(GetCurrentCommandBuffer());
 	ExecuteCommandBuffer(wait_for_completion);
 
-	GSTextureVK* swap_chain_texture = m_swap_chain->GetCurrentTexture();
+	GSTextureVK* swap_chain_texture =
+		m_swap_chain ? m_swap_chain->GetCurrentTexture() : s_libretro_bb[s_libretro_bb_idx].get();
 
 	const VkFramebuffer fb = swap_chain_texture->GetFramebuffer(false);
 	pxAssert(fb);
@@ -9298,6 +9379,26 @@ void GSDeviceVK::DoRenderHW(GSHWDrawConfig& config)
 	GSTextureVK* draw_rt_clone = nullptr;
 	GSTextureVK* colclip_rt = static_cast<GSTextureVK*>(g_gs_device->GetColorClipTexture());
 
+	// A counter draw the renderer asked to have drawn at native resolution (GSHWDrawConfig::colclip_native_scale):
+	// the colclip target, and a point-sampled copy of the depth buffer it tests against, are made at the target's
+	// size divided by its scale, and the resolve stretches the result back with point sampling. Only a fresh
+	// convert-and-resolve draw qualifies, since an existing colclip target already has the full size.
+	const bool native = config.colclip_native_scale > 1.0f && config.ps.colclip_hw && !colclip_rt &&
+	                    config.colclip_mode == GSHWDrawConfig::ColClipMode::ConvertAndResolve && config.rt &&
+	                    config.rt->GetState() == GSTexture::State::Dirty;
+	const float native_div = native ? config.colclip_native_scale : 1.0f;
+	const GSVector2i draw_size = native ?
+		GSVector2i(static_cast<int>(std::ceil(rtsize.x / native_div)), static_cast<int>(std::ceil(rtsize.y / native_div))) :
+		rtsize;
+	const auto to_draw_size = [native, native_div](const GSVector4i& r) {
+		if (!native)
+			return r;
+		return GSVector4i(static_cast<int>(std::floor(r.x / native_div)), static_cast<int>(std::floor(r.y / native_div)),
+			static_cast<int>(std::ceil(r.z / native_div)), static_cast<int>(std::ceil(r.w / native_div)));
+	};
+	GSTextureVK* const full_ds = draw_ds;
+	GSTextureVK* native_ds = nullptr;
+
 	// stream buffer in first, in case we need to exec
 	SetVSConstantBuffer(config.cb_vs);
 	SetPSConstantBuffer(config.cb_ps);
@@ -9447,7 +9548,7 @@ void GSDeviceVK::DoRenderHW(GSHWDrawConfig& config)
 		{
 			config.colclip_update_area = config.drawarea;
 			EndRenderPass();
-			colclip_rt = static_cast<GSTextureVK*>(CreateFeedbackTarget(rtsize.x, rtsize.y, GSTexture::Format::ColorClip, false));
+			colclip_rt = static_cast<GSTextureVK*>(CreateFeedbackTarget(draw_size.x, draw_size.y, GSTexture::Format::ColorClip, false));
 			if (!colclip_rt)
 			{
 				Console.Warning("VK: Failed to allocate ColorClip render target, aborting draw.");
@@ -9488,6 +9589,25 @@ void GSDeviceVK::DoRenderHW(GSHWDrawConfig& config)
 						   (config.ds && static_cast<GSTextureVK*>(config.ds) == m_tfx_textures[0])))
 	{
 		PSSetShaderResource(0, nullptr, false);
+	}
+
+	if (native && full_ds)
+	{
+		// DoStretchRect, not StretchRect: the latter flushes deferred draws, and this is one of them.
+		// The depth-output flag is what makes the copy write depth at all.
+		EndRenderPass();
+		native_ds = static_cast<GSTextureVK*>(CreateDepthStencil(draw_size, false, true));
+		if (!native_ds)
+		{
+			Console.Warning("VK: Failed to allocate native-resolution depth buffer, aborting draw.");
+			Recycle(colclip_rt);
+			g_gs_device->SetColorClipTexture(nullptr);
+			GL_POP();
+			return;
+		}
+		DoStretchRect(static_cast<GSTexture*>(full_ds), GSVector4(0, 0, 1, 1), static_cast<GSTexture*>(native_ds),
+			GSVector4(GSVector4i::loadh(draw_size)), ShaderConvertSelector(ShaderConvert::DEPTH_COPY, 0xf, true), Nearest);
+		draw_ds = native_ds;
 	}
 
 	// render pass restart optimizations
@@ -9611,7 +9731,7 @@ void GSDeviceVK::DoRenderHW(GSHWDrawConfig& config)
 
 	PSSetROVs(draw_rt_rov, draw_ds_rov, config.ps.HasColorOutput(), config.ps.HasDepthROVWrite());
 
-	OMSetRenderTargets(draw_rt, draw_ds, config.scissor, static_cast<FeedbackLoopFlag>(pipe.feedback_loop_flags), rtsize);
+	OMSetRenderTargets(draw_rt, draw_ds, to_draw_size(config.scissor), static_cast<FeedbackLoopFlag>(pipe.feedback_loop_flags), draw_size);
 
 	// Begin render pass if new target or out of the area.
 	if (!InRenderPass())
@@ -9641,8 +9761,8 @@ void GSDeviceVK::DoRenderHW(GSHWDrawConfig& config)
 		// microseconds per PASS, and a narrower area only forces more of them. Commit f9b5395855 has
 		// the mechanism this reverted, and the measurements behind these numbers.
 		const GSVector4i render_area = (pipe.ps.colclip_hw && (config.colclip_mode == GSHWDrawConfig::ColClipMode::ConvertAndResolve) && ds_op != VK_ATTACHMENT_LOAD_OP_CLEAR)
-		                             ? config.drawarea
-		                             : GSVector4i::loadh(rtsize);
+		                             ? to_draw_size(config.drawarea)
+		                             : GSVector4i::loadh(draw_size);
 
 		if (is_clearing_rt)
 		{
@@ -9689,16 +9809,16 @@ void GSDeviceVK::DoRenderHW(GSHWDrawConfig& config)
 	// rt -> colclip hw blit if enabled
 	if (colclip_rt && (config.colclip_mode == GSHWDrawConfig::ColClipMode::ConvertOnly || config.colclip_mode == GSHWDrawConfig::ColClipMode::ConvertAndResolve) && config.rt->GetState() == GSTexture::State::Dirty)
 	{
-		OMSetRenderTargets(draw_rt, draw_ds, GSVector4i::loadh(rtsize), static_cast<FeedbackLoopFlag>(pipe.feedback_loop_flags));
+		OMSetRenderTargets(draw_rt, draw_ds, GSVector4i::loadh(draw_size), static_cast<FeedbackLoopFlag>(pipe.feedback_loop_flags), draw_size);
 		SetUtilityTexture(static_cast<GSTextureVK*>(config.rt), m_point_sampler);
 		SetPipeline(m_colclip_setup_pipelines[pipe.ds][pipe.IsRTFeedbackLoop()]);
 
 		const GSVector4 drawareaf = GSVector4((config.colclip_mode == GSHWDrawConfig::ColClipMode::ConvertOnly) ? GSVector4i::loadh(rtsize) : config.drawarea);
 		const GSVector4 sRect(drawareaf / GSVector4(rtsize).xyxy());
-		DrawStretchRect(sRect, drawareaf, rtsize);
+		DrawStretchRect(sRect, native ? GSVector4(to_draw_size(config.drawarea)) : drawareaf, draw_size);
 
 		GL_POP();
-		OMSetRenderTargets(draw_rt, draw_ds, config.scissor, static_cast<FeedbackLoopFlag>(pipe.feedback_loop_flags));
+		OMSetRenderTargets(draw_rt, draw_ds, to_draw_size(config.scissor), static_cast<FeedbackLoopFlag>(pipe.feedback_loop_flags), draw_size);
 	}
 
 	// VB/IB upload, if we did DATE setup and it's not colclip hw this has already been done
@@ -9786,7 +9906,15 @@ void GSDeviceVK::DoRenderHW(GSHWDrawConfig& config)
 	if (date_image)
 		Recycle(date_image);
 
-	// now blit the colclip texture back to the original target
+	if (native_ds)
+	{
+		EndRenderPass();
+		draw_ds = full_ds;
+		Recycle(native_ds);
+	}
+
+	// now blit the colclip texture back to the original target. The source rectangle is normalised, so a
+	// native-resolution colclip target needs nothing different here.
 	if (colclip_rt)
 	{
 		config.colclip_update_area = config.colclip_update_area.runion(config.drawarea);
@@ -10128,3 +10256,428 @@ void GSDeviceVK::CollectDriverReport(GSDriverReport::BackendReport& out) const
 	w.EndObject();
 	out.backend_json = w.TakeString();
 }
+
+#ifdef __ANDROID__
+
+// ---- Remote play ---------------------------------------------------------------------------------
+//
+// The stream's frames (GS/GSRemotePlay.h). Every presented frame is drawn at the stream's size and
+// copied into a free slot, recorded into the frame's own command buffer ahead of the present, which
+// submits it with everything else. The app's video thread picks it up once the GPU marks it done.
+
+void GSDeviceVK::RemotePlayVSync(GSTexture* src, const GSVector4& src_uv, const GSVector4& area)
+{
+	const u32 max_size = GSRemotePlay::g_max_size.load(std::memory_order_acquire);
+	if (max_size == 0)
+	{
+		if (m_rp_published || m_rp_frame || m_rp_marker_buffer != VK_NULL_HANDLE)
+			RemotePlayRelease(false);
+		return;
+	}
+
+	GSRemotePlay::g_frames.fetch_add(1, std::memory_order_relaxed);
+
+	// A slot the app's side has finished with. When the GPU or the app still holds all of them, this
+	// frame is dropped rather than waited for.
+	GSRemotePlay::Ring& ring = m_rp_ring;
+	u32 index = 0;
+	while (index < ring.slots.size() &&
+		   ring.slots[index].state.load(std::memory_order_acquire) != GSRemotePlay::SlotFree)
+	{
+		index++;
+	}
+	if (index == ring.slots.size())
+	{
+		GSRemotePlay::g_skipped.fetch_add(1, std::memory_order_relaxed);
+		return;
+	}
+	GSRemotePlay::Slot& slot = ring.slots[index];
+
+	// Every frame is the stream's full size, whatever size the game's is. Games switch sizes between
+	// menus, videos and play, and a stream that followed them would restart the encoder here and the
+	// decoder on the friend's device at each switch: a hitch every time. NV12 wants the width a
+	// multiple of 4 and the height even.
+	const u32 width = std::max(4u, (max_size >> 16) & ~3u);
+	const u32 height = std::max(2u, (max_size & 0xffffu) & ~1u);
+
+	if (!m_rp_frame || static_cast<u32>(m_rp_frame->GetWidth()) != width ||
+		static_cast<u32>(m_rp_frame->GetHeight()) != height)
+	{
+		m_rp_frame = GSTextureVK::Create(GSTexture::Usage::RenderTarget, GSTexture::Format::Color, width, height, 1);
+		if (!m_rp_frame)
+		{
+			GSRemotePlay::g_skipped.fetch_add(1, std::memory_order_relaxed);
+			return;
+		}
+	}
+
+	// The slot's storage. A free slot is nobody's, so it can be replaced here, and a frame of either
+	// kind can go into any slot.
+	RemotePlayHardware& hardware = m_rp_hardware[index];
+	RemotePlayReadback& readback = m_rp_readback[index];
+	bool use_hardware = GSRemotePlay::g_hardware.load(std::memory_order_acquire) && !m_rp_hardware_failed &&
+						m_optional_extensions.vk_android_external_memory_ahb &&
+						vkGetAndroidHardwareBufferPropertiesANDROID != nullptr;
+
+	if (use_hardware && (!hardware.buffer || hardware.width != width || hardware.height != height))
+	{
+		RemotePlayHardware created;
+		const bool ok = RemotePlayCreateHardware(created, width, height);
+		{
+			// The app takes its own reference to a slot's buffer under the lock.
+			std::lock_guard lock(GSRemotePlay::g_mutex);
+			RemotePlayDiscard(hardware, false);
+			if (ok)
+				hardware = created;
+			slot.hardware_buffer = ok ? hardware.buffer : nullptr;
+			slot.generation = ok ? GSRemotePlay::g_generation.fetch_add(1, std::memory_order_relaxed) + 1 : 0;
+		}
+		if (!ok)
+		{
+			// Frames go through the CPU from here on, for as long as this device lives.
+			m_rp_hardware_failed = true;
+			use_hardware = false;
+			Console.Warning("VK: Remote play: no shared frame buffers on this device, reading frames back instead.");
+		}
+	}
+
+	const u32 rgba_size = width * height * 4;
+	if (!use_hardware && (!readback.buffer || readback.size < rgba_size))
+	{
+		RemotePlayDiscard(readback, false);
+		if (!RemotePlayCreateReadback(readback, rgba_size))
+		{
+			GSRemotePlay::g_skipped.fetch_add(1, std::memory_order_relaxed);
+			return;
+		}
+		slot.data = readback.data;
+	}
+
+	// One u32 per slot, cleared once and kept mapped, so checking a slot costs a memory read.
+	if (m_rp_marker_buffer == VK_NULL_HANDLE)
+	{
+		const VkBufferCreateInfo bci = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, nullptr, 0,
+			sizeof(u32) * ring.slots.size(), VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_SHARING_MODE_EXCLUSIVE, 0, nullptr};
+		VmaAllocationCreateInfo aci = {};
+		aci.usage = VMA_MEMORY_USAGE_GPU_TO_CPU;
+		aci.flags = VMA_ALLOCATION_CREATE_MAPPED_BIT;
+		aci.requiredFlags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+		VmaAllocationInfo ai = {};
+		if (vmaCreateBuffer(m_allocator, &bci, &aci, &m_rp_marker_buffer, &m_rp_marker_allocation, &ai) != VK_SUCCESS ||
+			!ai.pMappedData)
+		{
+			if (m_rp_marker_buffer != VK_NULL_HANDLE)
+				vmaDestroyBuffer(m_allocator, m_rp_marker_buffer, m_rp_marker_allocation);
+			m_rp_marker_buffer = VK_NULL_HANDLE;
+			m_rp_marker_allocation = VK_NULL_HANDLE;
+			GSRemotePlay::g_skipped.fetch_add(1, std::memory_order_relaxed);
+			return;
+		}
+		std::memset(ai.pMappedData, 0, sizeof(u32) * ring.slots.size());
+		ring.markers = static_cast<const volatile u32*>(ai.pMappedData);
+	}
+
+	if (!m_rp_published)
+	{
+		std::lock_guard lock(GSRemotePlay::g_mutex);
+		ring.prepare_read = &GSDeviceVK::RemotePlayPrepareRead;
+		ring.context = this;
+		GSRemotePlay::g_ring = &ring;
+		m_rp_published = true;
+	}
+
+	// The picture where it goes, black around it. The clear also gives every pixel full alpha, which
+	// the draw then leaves alone: the game's own alpha means nothing on a screen.
+	ClearRenderTarget(m_rp_frame.get(), 0xFF000000u);
+	if (src)
+	{
+		const float fw = static_cast<float>(width);
+		const float fh = static_cast<float>(height);
+		const GSVector4 dst(area.x * fw, area.y * fh, (area.x + area.z) * fw, (area.y + area.w) * fh);
+		StretchRect(src, src_uv, m_rp_frame.get(), dst, ShaderConvertSelector(ShaderConvert::COPY, 0x7), Biln);
+	}
+	else
+	{
+		m_rp_frame->CommitClear();
+	}
+	EndRenderPass();
+
+	const VkCommandBuffer cmd = GetCurrentCommandBuffer();
+	m_rp_frame->TransitionToLayout(GSTextureVK::Layout::TransferSrc);
+	m_rp_frame->SetUseFenceCounter(GetCurrentFenceCounter());
+
+	if (use_hardware)
+	{
+		const VkImageSubresourceRange range = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+
+		// Whatever the encoder last read from it is discarded, so no ownership transfer back is needed.
+		VkImageMemoryBarrier acquire = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+		acquire.srcAccessMask = 0;
+		acquire.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+		acquire.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+		acquire.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+		acquire.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		acquire.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		acquire.image = hardware.image;
+		acquire.subresourceRange = range;
+		vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0,
+			nullptr, 1, &acquire);
+
+		const VkImageCopy copy = {{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+			{0, 0, 0}, {width, height, 1}};
+		vkCmdCopyImage(cmd, m_rp_frame->GetImage(), m_rp_frame->GetVkLayout(), hardware.image,
+			VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+
+		// Handed to the encoder's side (GL, on the same GPU): released to the foreign queue family.
+		// The second scope is TRANSFER, not BOTTOM_OF_PIPE, so the marker write below waits for the
+		// release and its layout change, and a landed marker means GL may read.
+		VkImageMemoryBarrier release = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+		release.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+		release.dstAccessMask = 0;
+		release.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+		release.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+		release.srcQueueFamilyIndex = m_graphics_queue_family_index;
+		release.dstQueueFamilyIndex = VK_QUEUE_FAMILY_FOREIGN_EXT;
+		release.image = hardware.image;
+		release.subresourceRange = range;
+		vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0,
+			nullptr, 1, &release);
+	}
+	else
+	{
+		const VkBufferImageCopy region = {0, 0, 0, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {width, height, 1}};
+		vkCmdCopyImageToBuffer(cmd, m_rp_frame->GetImage(), m_rp_frame->GetVkLayout(), readback.buffer, 1, &region);
+
+		// The frame goes out to the host, and the marker write waits for it, so a marker that shows
+		// this slot's number means its frame is in.
+		const VkBufferMemoryBarrier out = {VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER, nullptr, VK_ACCESS_TRANSFER_WRITE_BIT,
+			VK_ACCESS_HOST_READ_BIT, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, readback.buffer, 0, rgba_size};
+		vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+			VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_HOST_BIT, 0, 0, nullptr, 1, &out, 0, nullptr);
+	}
+
+	// 0 is what a cleared marker reads.
+	if (++m_rp_seq == 0)
+		++m_rp_seq;
+
+	vkCmdFillBuffer(cmd, m_rp_marker_buffer, index * sizeof(u32), sizeof(u32), m_rp_seq);
+	const VkBufferMemoryBarrier marker = {VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER, nullptr, VK_ACCESS_TRANSFER_WRITE_BIT,
+		VK_ACCESS_HOST_READ_BIT, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, m_rp_marker_buffer,
+		index * sizeof(u32), sizeof(u32)};
+	vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 0, nullptr, 1, &marker, 0,
+		nullptr);
+
+	slot.seq = m_rp_seq;
+	slot.width = width;
+	slot.height = height;
+	slot.hardware = use_hardware;
+	slot.recorded_ns = static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+		std::chrono::steady_clock::now().time_since_epoch()).count());
+	slot.state.store(GSRemotePlay::SlotRecorded, std::memory_order_release);
+
+	// Wakes the app's thread, which then waits the few ms until the GPU has the frame done.
+	GSRemotePlay::NotifyRecorded();
+}
+
+// An AHardwareBuffer the GPU can copy a frame into and the encoder's GL can read, imported as an
+// image with its own dedicated memory. False, with nothing left allocated, when any step fails.
+bool GSDeviceVK::RemotePlayCreateHardware(RemotePlayHardware& hardware, u32 width, u32 height)
+{
+	AHardwareBuffer_Desc desc = {};
+	desc.width = width;
+	desc.height = height;
+	desc.layers = 1;
+	desc.format = AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM;
+	// CPU_READ_RARELY although the CPU never reads it: it keeps gralloc from picking a compressed GPU
+	// layout. The writer can be Turnip while the reader is the system GLES driver, and a plain linear
+	// buffer is the one layout both are sure to agree on.
+	desc.usage = AHARDWAREBUFFER_USAGE_GPU_COLOR_OUTPUT | AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE |
+				 AHARDWAREBUFFER_USAGE_CPU_READ_RARELY;
+	if (AHardwareBuffer_allocate(&desc, &hardware.buffer) != 0 || !hardware.buffer)
+	{
+		hardware.buffer = nullptr;
+		return false;
+	}
+
+	VkAndroidHardwareBufferFormatPropertiesANDROID format_properties = {
+		VK_STRUCTURE_TYPE_ANDROID_HARDWARE_BUFFER_FORMAT_PROPERTIES_ANDROID};
+	VkAndroidHardwareBufferPropertiesANDROID properties = {
+		VK_STRUCTURE_TYPE_ANDROID_HARDWARE_BUFFER_PROPERTIES_ANDROID, &format_properties};
+	if (vkGetAndroidHardwareBufferPropertiesANDROID(m_device, hardware.buffer, &properties) != VK_SUCCESS ||
+		properties.memoryTypeBits == 0 || format_properties.format != VK_FORMAT_R8G8B8A8_UNORM)
+	{
+		RemotePlayDiscard(hardware, true);
+		return false;
+	}
+
+	VkExternalMemoryImageCreateInfo external = {VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO};
+	external.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID;
+
+	VkImageCreateInfo ici = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, &external};
+	ici.imageType = VK_IMAGE_TYPE_2D;
+	ici.format = VK_FORMAT_R8G8B8A8_UNORM;
+	ici.extent = {width, height, 1};
+	ici.mipLevels = 1;
+	ici.arrayLayers = 1;
+	ici.samples = VK_SAMPLE_COUNT_1_BIT;
+	ici.tiling = VK_IMAGE_TILING_OPTIMAL;
+	ici.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+	ici.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+	ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+	if (vkCreateImage(m_device, &ici, nullptr, &hardware.image) != VK_SUCCESS)
+	{
+		hardware.image = VK_NULL_HANDLE;
+		RemotePlayDiscard(hardware, true);
+		return false;
+	}
+
+	VkImportAndroidHardwareBufferInfoANDROID import = {VK_STRUCTURE_TYPE_IMPORT_ANDROID_HARDWARE_BUFFER_INFO_ANDROID};
+	import.buffer = hardware.buffer;
+	VkMemoryDedicatedAllocateInfo dedicated = {VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO, &import};
+	dedicated.image = hardware.image;
+	VkMemoryAllocateInfo mai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &dedicated};
+	mai.allocationSize = properties.allocationSize;
+	mai.memoryTypeIndex = static_cast<u32>(std::countr_zero(properties.memoryTypeBits));
+	if (vkAllocateMemory(m_device, &mai, nullptr, &hardware.memory) != VK_SUCCESS)
+	{
+		hardware.memory = VK_NULL_HANDLE;
+		RemotePlayDiscard(hardware, true);
+		return false;
+	}
+
+	if (vkBindImageMemory(m_device, hardware.image, hardware.memory, 0) != VK_SUCCESS)
+	{
+		RemotePlayDiscard(hardware, true);
+		return false;
+	}
+
+	hardware.width = width;
+	hardware.height = height;
+	return true;
+}
+
+// The buffer itself lives on for as long as the encoder's GL still holds an image of it.
+void GSDeviceVK::RemotePlayDiscard(RemotePlayHardware& hardware, bool device_idle)
+{
+	const RemotePlayHardware gone = hardware;
+	hardware = {};
+	if (!gone.buffer && gone.image == VK_NULL_HANDLE && gone.memory == VK_NULL_HANDLE)
+		return;
+
+	const auto destroy = [device = m_device, gone]() {
+		if (gone.image != VK_NULL_HANDLE)
+			vkDestroyImage(device, gone.image, nullptr);
+		if (gone.memory != VK_NULL_HANDLE)
+			vkFreeMemory(device, gone.memory, nullptr);
+		if (gone.buffer)
+			AHardwareBuffer_release(gone.buffer);
+	};
+	if (device_idle)
+		destroy();
+	else
+		m_frame_resources[m_current_frame].cleanup_resources.push_back(destroy);
+}
+
+// A readback slot's buffer, mapped for as long as it exists. Its own memory, so making it visible to
+// the CPU (RemotePlayPrepareRead) touches nothing else's.
+bool GSDeviceVK::RemotePlayCreateReadback(RemotePlayReadback& readback, u32 size)
+{
+	const VkBufferCreateInfo bci = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, nullptr, 0, size,
+		VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_SHARING_MODE_EXCLUSIVE, 0, nullptr};
+	VmaAllocationCreateInfo aci = {};
+	aci.usage = VMA_MEMORY_USAGE_GPU_TO_CPU;
+	aci.flags = VMA_ALLOCATION_CREATE_MAPPED_BIT | VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT;
+	// As GSDownloadTextureVK chooses, for the same reason: cached reads are far faster, except on the
+	// Mali drivers its profile says otherwise for.
+	const bool prefer_coherent = IsDeviceMali() && GetMobileDriverProfile().UsesWorkaround(DriverWorkaround::PreferCoherentReadback);
+	aci.preferredFlags = prefer_coherent ? VK_MEMORY_PROPERTY_HOST_COHERENT_BIT : VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
+
+	VmaAllocationInfo ai = {};
+	if (vmaCreateBuffer(m_allocator, &bci, &aci, &readback.buffer, &readback.allocation, &ai) != VK_SUCCESS ||
+		!ai.pMappedData)
+	{
+		if (readback.buffer != VK_NULL_HANDLE)
+			vmaDestroyBuffer(m_allocator, readback.buffer, readback.allocation);
+		readback = {};
+		return false;
+	}
+
+	VkMemoryPropertyFlags flags = 0;
+	vmaGetMemoryTypeProperties(m_allocator, ai.memoryType, &flags);
+	readback.memory = ai.deviceMemory;
+	readback.data = static_cast<const u8*>(ai.pMappedData);
+	readback.size = size;
+	readback.coherent = (flags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0;
+	return true;
+}
+
+void GSDeviceVK::RemotePlayDiscard(RemotePlayReadback& readback, bool device_idle)
+{
+	if (readback.buffer != VK_NULL_HANDLE)
+	{
+		if (device_idle)
+			vmaDestroyBuffer(m_allocator, readback.buffer, readback.allocation);
+		else
+			DeferBufferDestruction(readback.buffer, readback.allocation);
+	}
+	readback = {};
+}
+
+// The app's video thread, under GSRemotePlay::g_mutex, before it reads a readback slot. The slot's
+// buffer cannot go meanwhile: the GS thread replaces buffers only in free slots, and withdraws the
+// ring under the same lock before it lets them go.
+void GSDeviceVK::RemotePlayPrepareRead(void* context, u32 index)
+{
+	GSDeviceVK* const device = static_cast<GSDeviceVK*>(context);
+	const RemotePlayReadback& readback = device->m_rp_readback[index];
+	if (readback.coherent || readback.memory == VK_NULL_HANDLE)
+		return;
+
+	const VkMappedMemoryRange range = {VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE, nullptr, readback.memory, 0, VK_WHOLE_SIZE};
+	vkInvalidateMappedMemoryRanges(device->m_device, 1, &range);
+}
+
+// Everything remote play allocated goes once it stops, or with the device. device_idle: the GPU has
+// nothing in flight, so it all goes at once; otherwise once the frames that used it are done. A frame
+// the encoder still holds needs no waiting: its buffer outlives the image for as long as GL has it.
+void GSDeviceVK::RemotePlayRelease(bool device_idle)
+{
+	GSRemotePlay::Ring& ring = m_rp_ring;
+	{
+		// The app's side reads slots under this lock, so once the ring is withdrawn nothing reads it.
+		std::lock_guard lock(GSRemotePlay::g_mutex);
+		if (GSRemotePlay::g_ring == &ring)
+			GSRemotePlay::g_ring = nullptr;
+
+		for (GSRemotePlay::Slot& slot : ring.slots)
+		{
+			slot.state.store(GSRemotePlay::SlotFree, std::memory_order_relaxed);
+			slot.data = nullptr;
+			slot.hardware_buffer = nullptr;
+			slot.generation = 0;
+			slot.hardware = false;
+		}
+		ring.markers = nullptr;
+	}
+	m_rp_published = false;
+
+	for (u32 i = 0; i < ring.slots.size(); i++)
+	{
+		RemotePlayDiscard(m_rp_hardware[i], device_idle);
+		RemotePlayDiscard(m_rp_readback[i], device_idle);
+	}
+
+	if (m_rp_marker_buffer != VK_NULL_HANDLE)
+	{
+		if (device_idle)
+			vmaDestroyBuffer(m_allocator, m_rp_marker_buffer, m_rp_marker_allocation);
+		else
+			DeferBufferDestruction(m_rp_marker_buffer, m_rp_marker_allocation);
+		m_rp_marker_buffer = VK_NULL_HANDLE;
+		m_rp_marker_allocation = VK_NULL_HANDLE;
+	}
+
+	m_rp_frame.reset();
+}
+
+#endif // __ANDROID__

@@ -327,6 +327,45 @@ static u32 ParseFixGeneration(std::string_view driver_info)
 	return 0;
 }
 
+// The Adreno 7xx parts on which Turnip takes the declared feedback loop with our per-draw barriers
+// kept (MobileDriverProfile::prefers_declared_loop_with_barriers): the 730 and up, and the 722.
+//
+// Only the 740 was ever run. The 730 and 750 are in as its neighbours in Mesa's freedreno table, and
+// the 722 is in on the same footing, as the least certain of the three. The 722 (Snapdragon 7 Gen 4,
+// Retroid Pocket Duo) is an a7xx generation 1 part derived from the 730: Qualcomm's kernel gives it
+// the 730's clock-gating, protected-register and bus tables, and Turnip runs it through the same
+// CHIP == A7XX paths as the 740. What is not known is how those paths behave with the 722's 1 MiB of
+// GMEM and its smaller cache and core counts. A pass that declares the loop is not tiled, so the
+// GMEM size does not enter those draws. The road this rule replaces, the render-target copy, draws
+// primitives that overlap within one draw wrong on any part. On the Duo (2026-10-21) this road, with
+// our barriers kept, drew the same frames on every run of all eight test dumps.
+//
+// Still out: the 702, which Mesa's freedreno table files as an a6xx-family part, and the 710, 720 and
+// 725. Nothing was run on them.
+static constexpr bool PrefersDeclaredLoopOnA7xx(u16 model)
+{
+	return model >= 730 || model == 722;
+}
+
+// The Adreno 7xx parts on which a generation-2 Turnip build is trusted to order the declared loop
+// with no barrier from us (MobileDriverProfile::orders_declared_feedback_loop): the 730 and up. The
+// 722 is NOT in this list, although it is in the one above.
+//
+// Measured on the Retroid Pocket Duo (Adreno 722) on 2026-10-21, with the Turnip packs axfl2-a722 and
+// axfl2-003, replaying eight dumps through pcsx2-gsrunner with -declare-feedback-loop 2 (barriers
+// kept) and 1 (barriers dropped, the driver's ordering trusted):
+//  - barriers kept: every frame was the same on every run;
+//  - barriers dropped: NASCAR Thunder 2002 and Splashdown differed from the barrier-kept frames by
+//    12 to 19 % of pixels and differed again from one run to the next; the other six dumps were
+//    stable either way.
+// Both packs gave the same result, so it is the part and not a regression in one build. The cause
+// is not known. The 722 therefore keeps our barriers under a generation-2 tag. The Adreno 610 did
+// the same under the generation-1 build, and that claim is bounded at 650 for the same reason.
+static constexpr bool TrustsGeneration2OrderingOnA7xx(u16 model)
+{
+	return model >= 730;
+}
+
 static MobileGpuDriver DetectDriver(const GpuProfileSelection& selection,
 	const MobileDriverContext& context, std::string_view lowered_hints)
 {
@@ -688,8 +727,10 @@ MobileDriverProfile ResolveDriverProfile(const GpuProfileSelection& selection,
 	// is trusted on Adreno 6xx at 650 and up; on Adreno 610 the declared road renders inconsistently
 	// run to run while the copy road is stable, so parts below 650 keep their barriers and copy
 	// road. Generation 2 adds the A7XX half (the per-overlap prim mode and the per-draw flush for a
-	// declared loop), measured on the Adreno 740; it is trusted on Adreno 730 and up, the range the
-	// a7xx road preference below already covers. A Qualcomm driver cannot carry a Mesa git tag.
+	// declared loop), measured on the Adreno 740; it is trusted on the parts
+	// TrustsGeneration2OrderingOnA7xx names, which are the 730 and up. The 722 is on the a7xx road
+	// preference below but not here: with the barriers dropped it drew a different picture on each
+	// run of two dumps. A Qualcomm driver cannot carry a Mesa git tag.
 	profile.declared_loop_fix_generation = ParseFixGeneration(context.driver_info);
 	const bool tagged_turnip_vk = (context.api == MobileGpuApi::Vulkan) && (profile.driver == MobileGpuDriver::MesaTurnip);
 	const bool a6xx_fix = (profile.declared_loop_fix_generation >= 1) &&
@@ -697,7 +738,7 @@ MobileDriverProfile ResolveDriverProfile(const GpuProfileSelection& selection,
 		                  (selection.gpu.model_number >= 650);
 	const bool a7xx_fix = (profile.declared_loop_fix_generation >= 2) &&
 		                  (selection.gpu.architecture == MobileGpuArchitecture::Adreno7xx) &&
-		                  (selection.gpu.model_number >= 730);
+		                  TrustsGeneration2OrderingOnA7xx(selection.gpu.model_number);
 	profile.orders_declared_feedback_loop = tagged_turnip_vk && (a6xx_fix || a7xx_fix);
 	// The a7xx half orders a draw against earlier draws; within a draw it orders overlapping
 	// primitives only for a pipeline that requests rasterization-order access.
@@ -705,13 +746,14 @@ MobileDriverProfile ResolveDriverProfile(const GpuProfileSelection& selection,
 
 	// The a7xx preference is about the part, not the build, so it needs no tag: on Adreno 740 the
 	// declared loop with our barriers is correct and stable where the copy road renders wrong.
-	// Limited to 730-750: the 740 was measured, the 730 and 750 are the neighbouring a7xx
-	// generations in Mesa's freedreno table. 702-725 were never run (Mesa treats the 702 as a6xx
-	// family), so they keep the copy road.
+	// Limited to the parts PrefersDeclaredLoopOnA7xx names: the 740 was measured, the 722 was run
+	// on the Duo and is stable on this road, and the 730 and 750 are in as the 740's neighbours. The
+	// other 7xx parts were never run (Mesa treats the 702 as a6xx family), so they keep the copy
+	// road.
 	profile.prefers_declared_loop_with_barriers = (context.api == MobileGpuApi::Vulkan) &&
 		                                          (profile.driver == MobileGpuDriver::MesaTurnip) &&
 		                                          (selection.gpu.architecture == MobileGpuArchitecture::Adreno7xx) &&
-		                                          (selection.gpu.model_number >= 730);
+		                                          PrefersDeclaredLoopOnA7xx(selection.gpu.model_number);
 
 	for (size_t row = 0; row < s_driver_rules.size(); row++)
 	{

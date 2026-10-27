@@ -170,6 +170,11 @@ enum class DriverWorkaround : u8
 	/// a defect. Without this bit the rings stay write-combined even when a cached coherent type
 	/// exists (that road lost on the SD865). See GSStreamRingMemoryPolicy.h.
 	PreferCachedStreamRingMemory,
+	/// Remote play reads its frames back instead of handing them to the encoder as
+	/// AHardwareBuffers. For a driver whose buffer export or foreign-queue release misbehaves; the
+	/// extensions stay enabled, only their use is off. No rule declares it yet: it is the switch
+	/// that excludes one driver without new code.
+	ReadBackRemotePlayFrames,
 	Count,
 };
 
@@ -257,10 +262,11 @@ struct MobileDriverProfile
 	/// our barriers give the ordering. Weaker than orders_declared_feedback_loop, which lets the
 	/// barriers go and wins if both are set.
 	///
-	/// True for Turnip on Adreno 730 and up (measured on the 740), where the copy road renders
-	/// wrong. The barrier-less declared road races on a7xx under stock Turnip, which never emits
-	/// the ordering state there; a generation-2 build does, and then orders_declared_feedback_loop
-	/// is set as well and wins.
+	/// True for Turnip on Adreno 730 and up and on the 722, where the copy road renders wrong. The
+	/// barrier-less declared road races on a7xx under stock Turnip, which never emits the ordering
+	/// state there; a generation-2 build does, and on the 730 and up orders_declared_feedback_loop is
+	/// set as well and wins. On the 722 it is not set: with the barriers dropped that part drew a
+	/// different picture on each run of two dumps (Duo, 2026-10-21), so it keeps our barriers.
 	bool prefers_declared_loop_with_barriers = false;
 
 	std::string driver_name;

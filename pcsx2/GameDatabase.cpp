@@ -2,11 +2,14 @@
 // SPDX-License-Identifier: GPL-3.0+
 
 #include "GameDatabase.h"
+
+#include "AutoTune/AutoTuneApplier.h"
 #ifdef ARMSX2_EMBEDDED_RESOURCES
 #include "EmbeddedResources.h"
 #endif
 #include "GS/GS.h"
 #include "Host.h"
+#include "VMManager.h"
 #include "IconsFontAwesome.h"
 #include "vtlb.h"
 
@@ -434,6 +437,7 @@ static const char* s_gs_hw_fix_names[] = {
 	"PCRTCOffsets",
 	"PCRTCOverscan",
 	"coalesceRenderPasses",
+	"nativeCounterDraws",
 	"trilinearFiltering",
 	"skipDrawStart",
 	"skipDrawEnd",
@@ -453,6 +457,7 @@ static const char* s_gs_hw_fix_names[] = {
 	"recommendedBlendingLevel",
 	"recommendedAccurateAlphaTest",
 	"recommendedHWAA1",
+	"backThread",
 	"hwDownloadMode",
 	"getSkipCount",
 	"beforeDraw",
@@ -494,6 +499,7 @@ bool GameDatabaseSchema::isUserHackHWFix(GSHWFixId id)
 		case GSHWFixId::RecommendedBlendingLevel:
 		case GSHWFixId::PCRTCOffsets:
 		case GSHWFixId::PCRTCOverscan:
+		case GSHWFixId::BackThread:
 		case GSHWFixId::GetSkipCount:
 		case GSHWFixId::BeforeDraw:
 		case GSHWFixId::MoveHandler:
@@ -685,6 +691,13 @@ void GameDatabaseSchema::GameEntry::applyGameFixes(
 		// Legacy note - speedhacks are setup in the GameDB as integer values, but
 		// are effectively booleans like the gamefixes
 		config.Speedhacks.Set(it.first, it.second);
+
+		// The database has just staked a compatibility claim on this game's EE timing.
+		// Record it: the resolved selector cannot say so afterwards, and the dynamic
+		// governor is only allowed to move a rate nobody claimed.
+		if (it.first == SpeedHack::EECycleRate)
+			config.GameDBSetEECycleRate = true;
+
 		if (!quiet)
 		{
 			Console.WriteLn("GameDB: Setting Speedhack '%s' to [mode=%d]",
@@ -792,6 +805,9 @@ bool GameDatabaseSchema::GameEntry::configMatchesHWFix(const Pcsx2Config::GSOpti
 		case GSHWFixId::CoalesceRenderPasses:
 			return (static_cast<int>(config.CoalesceRenderPasses) == value);
 
+		case GSHWFixId::NativeCounterDraws:
+			return (config.UpscaleMultiplier <= 1.0f || static_cast<int>(config.UserHacks_NativeCounterDraws) == value);
+
 		case GSHWFixId::Mipmap:
 			return (static_cast<int>(config.HWMipmap) == value);
 
@@ -834,6 +850,9 @@ bool GameDatabaseSchema::GameEntry::configMatchesHWFix(const Pcsx2Config::GSOpti
 
 		case GSHWFixId::CPUCLUTRender:
 			return (config.UserHacks_CPUCLUTRender == value);
+
+		case GSHWFixId::BackThread:
+			return (config.BackThread == (value != 0));
 
 		case GSHWFixId::GPUTargetCLUT:
 			return (static_cast<int>(config.UserHacks_GPUTargetCLUTMode) == value);
@@ -1018,6 +1037,10 @@ void GameDatabaseSchema::GameEntry::applyGSHardwareFixes(
 				config.CoalesceRenderPasses = (value > 0);
 				break;
 
+			case GSHWFixId::NativeCounterDraws:
+				config.UserHacks_NativeCounterDraws = (value > 0);
+				break;
+
 			case GSHWFixId::Mipmap:
 				config.HWMipmap = (value > 0);
 				break;
@@ -1094,6 +1117,14 @@ void GameDatabaseSchema::GameEntry::applyGSHardwareFixes(
 				config.UserHacks_CPUCLUTRender = value;
 				break;
 
+			case GSHWFixId::BackThread:
+			{
+				// A recommendation, not an order: it can turn the split on, never off, and only on a host with the cores for it.
+				if (value != 0 && !config.BackThread && VMManager::Internal::CanSplitGS())
+					config.BackThread = true;
+			}
+			break;
+
 			case GSHWFixId::GPUTargetCLUT:
 			{
 				if (value >= 0 && value <= static_cast<int>(GSGPUTargetCLUTMode::InsideTarget))
@@ -1138,7 +1169,8 @@ void GameDatabaseSchema::GameEntry::applyGSHardwareFixes(
 
 			case GSHWFixId::RecommendedBlendingLevel:
 			{
-				if (quiet)
+				// Quiet also while auto-tune applies a trial: a toast per apply stacks up (see AutoTune::IsApplyingSettings).
+				if (quiet || AutoTune::IsApplyingSettings())
 					break;
 
 				if (!is_sw_renderer && value >= 0 && value <= static_cast<int>(AccBlendLevel::Maximum) && static_cast<int>(EmuConfig.GS.AccurateBlendingUnit) < value)
@@ -1172,7 +1204,8 @@ void GameDatabaseSchema::GameEntry::applyGSHardwareFixes(
 
 			case GSHWFixId::RecommendedAccurateAlphaTest:
 			{
-				if (quiet)
+				// Quiet also while auto-tune applies a trial: a toast per apply stacks up (see AutoTune::IsApplyingSettings).
+				if (quiet || AutoTune::IsApplyingSettings())
 					break;
 
 				if (!is_sw_renderer && value >= 0 && value <= 1 &&
@@ -1196,7 +1229,8 @@ void GameDatabaseSchema::GameEntry::applyGSHardwareFixes(
 
 			case GSHWFixId::RecommendedHWAA1:
 			{
-				if (quiet)
+				// Quiet also while auto-tune applies a trial: a toast per apply stacks up (see AutoTune::IsApplyingSettings).
+				if (quiet || AutoTune::IsApplyingSettings())
 					break;
 
 				if (!is_sw_renderer && value >= 0 && value <= 1 &&

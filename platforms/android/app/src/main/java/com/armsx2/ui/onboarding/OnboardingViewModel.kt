@@ -8,9 +8,13 @@ import androidx.documentfile.provider.DocumentFile
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.armsx2.BiosInfo
+import com.armsx2.CustomDriver
+import com.armsx2.GpuInfo
+import com.armsx2.config.ConfigStore
 import com.armsx2.runtime.MainActivityRuntime
 import java.io.File
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kr.co.iefriends.pcsx2.NativeApp
@@ -18,8 +22,24 @@ import kr.co.iefriends.pcsx2.NativeApp
 /** One importable BIOS the user can pick from the setup list. */
 data class BiosCandidate(val name: String, val path: String, val info: BiosInfo)
 
+/** The pages of the setup, in order. [Driver] is only there when one of our GPU drivers is built for this device. */
+enum class SetupStep(val titleKey: String) {
+    Welcome("setup.page.welcome.title"),
+    Storage("setup.step.appData.title"),
+    Bios("setup.page.bios.title"),
+    Games("setup.page.roms.title"),
+    Performance("setup.page.performance.title"),
+    Driver("setup.page.driver.title"),
+    Ready("setup.button.applyFinish"),
+}
+
+/** Where the GPU driver page is: looking up the pack, offering it, installing it, or done. */
+enum class DriverStage { Loading, Ready, Unreachable, Installing, Installed, Failed }
+
 data class OnboardingUiState(
+    /** Index into [steps]. */
     val page: Int = 0,
+    val steps: List<SetupStep> = SetupStep.entries - SetupStep.Driver,
     val systemLocation: StorageLocation = StorageLocation.Internal,
     val biosName: String? = null,
     val biosInfo: BiosInfo? = null,
@@ -29,13 +49,29 @@ data class OnboardingUiState(
     val biosOptions: List<BiosCandidate> = emptyList(),
     val selectedBiosPath: String? = null,
     val gameFolders: List<String> = emptyList(),
+    /** Automatic performance tuning (EmuCore/AutoTune). Off unless the player turned it on before. */
+    val autoTune: Boolean = false,
+    /** Name of the driver source offered on the driver page ("ARMSX2 · MaliSX2"); empty when the page is not shown. */
+    val driverSource: String = "",
+    /** The offered driver is malisx2, which has a kernel requirement worth telling the player about. */
+    val driverIsMali: Boolean = false,
+    val driverStage: DriverStage = DriverStage.Loading,
+    /** The pack the driver page installs, once the release list has been read. */
+    val driverPack: CustomDriver.RemoteDriver? = null,
+    /** Name of the driver the page installed, for the confirmation. */
+    val driverInstalledName: String? = null,
     val busy: Boolean = false,
     val error: String? = null,
-)
+) {
+    val step: SetupStep get() = steps[page.coerceIn(0, steps.lastIndex)]
+}
 
 enum class StorageLocation { Internal, SdCard, Custom }
 
 class OnboardingViewModel(application: Application) : AndroidViewModel(application) {
+    /** The release-list lookup for the driver page, so a second load() does not start another. */
+    private var driverOfferJob: Job? = null
+
     var state = androidx.compose.runtime.mutableStateOf(OnboardingUiState())
         private set
 
@@ -43,7 +79,16 @@ class OnboardingViewModel(application: Application) : AndroidViewModel(applicati
         val existingBios = MainActivityRuntime.bios.value?.let(::File)?.takeIf(File::isFile)
         val info = existingBios?.let(::probeFile)
         val dir = MainActivityRuntime.systemDir.value
+        val renderer = GpuInfo.rendererName()
+        // The page is for a player still on the system driver, on a GPU one of our drivers is built
+        // for. Decided once here: installing the driver must not take the page away under the player.
+        val driverSource = CustomDriver.setupOfferLabel(renderer)
+            ?.takeIf { runCatching { ConfigStore.loadGlobal().output.customDriverId.isBlank() }.getOrDefault(true) }
+        val steps = if (driverSource != null) SetupStep.entries.toList() else SetupStep.entries - SetupStep.Driver
         state.value = state.value.copy(
+            steps = steps,
+            driverSource = driverSource.orEmpty(),
+            driverIsMali = driverSource != null && CustomDriver.offersMaliSX2(renderer),
             systemLocation = when {
                 dir == null -> StorageLocation.Internal
                 dir == MainActivityRuntime.sdCardDataDir(getApplication()) -> StorageLocation.SdCard
@@ -53,12 +98,14 @@ class OnboardingViewModel(application: Application) : AndroidViewModel(applicati
             biosInfo = info,
             selectedBiosPath = existingBios?.absolutePath,
             gameFolders = MainActivityRuntime.romsDirs.value,
+            autoTune = runCatching { ConfigStore.loadGlobal().emuCore.autoTune }.getOrDefault(false),
             page = if (MainActivityRuntime.setupComplete.value) 1 else 0,
         )
+        if (driverSource != null && driverOfferJob == null) lookUpDriverOffer(renderer)
     }
 
     fun next() {
-        if (canContinue()) state.value = state.value.copy(page = (state.value.page + 1).coerceAtMost(4), error = null)
+        if (canContinue()) state.value = state.value.copy(page = (state.value.page + 1).coerceAtMost(state.value.steps.lastIndex), error = null)
     }
 
     fun previous() {
@@ -66,7 +113,53 @@ class OnboardingViewModel(application: Application) : AndroidViewModel(applicati
     }
 
     fun goTo(page: Int) {
-        state.value = state.value.copy(page = page.coerceIn(0, 4), error = null)
+        state.value = state.value.copy(page = page.coerceIn(0, state.value.steps.lastIndex), error = null)
+    }
+
+    /** Reads the release list of the driver the page offers, off the main thread. */
+    private fun lookUpDriverOffer(renderer: String?) {
+        state.value = state.value.copy(driverStage = DriverStage.Loading)
+        driverOfferJob = viewModelScope.launch {
+            val pack = withContext(Dispatchers.IO) { CustomDriver.fetchSetupOffer(renderer) }
+            state.value = state.value.copy(
+                driverPack = pack,
+                driverStage = if (pack != null) DriverStage.Ready else DriverStage.Unreachable,
+            )
+            driverOfferJob = null
+        }
+    }
+
+    /** "Try again" after the release list could not be read. */
+    fun retryDriverOffer() {
+        if (driverOfferJob == null && state.value.driverStage == DriverStage.Unreachable) {
+            lookUpDriverOffer(GpuInfo.rendererName())
+        }
+    }
+
+    /** Downloads the offered driver and makes it the global driver. It takes effect when a game
+     *  next starts, the same as picking it in the GPU driver settings. Navigation is locked while
+     *  it runs, as for a BIOS import. */
+    fun installDriver() {
+        val pack = state.value.driverPack ?: return
+        val stage = state.value.driverStage
+        if (stage != DriverStage.Ready && stage != DriverStage.Failed) return
+        state.value = state.value.copy(driverStage = DriverStage.Installing, busy = true)
+        val context = getApplication<Application>()
+        viewModelScope.launch {
+            val installed = withContext(Dispatchers.IO) { CustomDriver.download(context, pack) }
+            if (installed != null) {
+                runCatching {
+                    val global = ConfigStore.loadGlobal()
+                    ConfigStore.saveGlobal(global.copy(output = global.output.copy(customDriverId = installed.id)))
+                }
+                MainActivityRuntime.customDriverId.value = installed.id
+            }
+            state.value = state.value.copy(
+                driverStage = if (installed != null) DriverStage.Installed else DriverStage.Failed,
+                driverInstalledName = installed?.name,
+                busy = false,
+            )
+        }
     }
 
     fun selectStorage(location: StorageLocation) {
@@ -264,15 +357,31 @@ class OnboardingViewModel(application: Application) : AndroidViewModel(applicati
         state.value = state.value.copy(gameFolders = updated)
     }
 
-    fun canContinue(): Boolean = when (state.value.page) {
-        0, 1 -> true
-        2 -> state.value.biosInfo != null
-        3 -> state.value.gameFolders.isNotEmpty()
-        else -> state.value.biosInfo != null && state.value.gameFolders.isNotEmpty()
+    /** Whether the library scans [uri]'s subfolders too. The library scans again for it the next time
+     *  it is on screen. */
+    fun setFolderSubfolders(uri: String, include: Boolean) {
+        MainActivityRuntime.setRomsDirSubfolders(uri, include)
+        com.armsx2.data.library.LibraryRefresh.request()
+    }
+
+    fun setAutoTune(enabled: Boolean) {
+        state.value = state.value.copy(autoTune = enabled)
+    }
+
+    fun canContinue(): Boolean = when (state.value.step) {
+        SetupStep.Welcome, SetupStep.Storage, SetupStep.Performance, SetupStep.Driver -> true
+        SetupStep.Bios -> state.value.biosInfo != null
+        SetupStep.Games -> state.value.gameFolders.isNotEmpty()
+        SetupStep.Ready -> state.value.biosInfo != null && state.value.gameFolders.isNotEmpty()
     }
 
     fun finish() {
         if (!canContinue()) return
+        // The answer is saved even when it was left as it was, so the saved settings show the player was asked.
+        runCatching {
+            val global = ConfigStore.loadGlobal()
+            ConfigStore.saveGlobal(global.copy(emuCore = global.emuCore.copy(autoTune = state.value.autoTune)))
+        }
         val previousRoot = MainActivityRuntime.currentInitDataRoot()
         MainActivityRuntime.finishSetup()
         // No folder chosen means app-private storage, which is what the pin holds in that case;

@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2002-2026 PCSX2 Dev Team
 // SPDX-License-Identifier: GPL-3.0+
 
+#include "ArcadeLaunch.h"
 #include "AutoUpdaterDialog.h"
 #ifdef ENABLE_QT_DEBUGGER
 #include "Debugger/DebuggerWindow.h"
@@ -12,12 +13,15 @@
 #include "MainWindow.h"
 #include "QtHost.h"
 #include "QtProgressCallback.h"
+#include "QtShot.h"
 #include "QtUtils.h"
 #include "SetupWizardDialog.h"
 
 #include "pcsx2/CDVD/CDVDcommon.h"
 #include "pcsx2/Achievements.h"
+#include "pcsx2/AutoTune/AutoTuneStore.h"
 #include "pcsx2/BuildVersion.h"
+#include "pcsx2/Catalog/DriverPacks.h"
 #include "pcsx2/CDVD/CDVD.h"
 #include "pcsx2/Counters.h"
 #include "pcsx2/DebugTools/Debug.h"
@@ -26,6 +30,7 @@
 #include "pcsx2/GSDumpReplayer.h"
 #include "pcsx2/GameList.h"
 #include "pcsx2/Host.h"
+#include "pcsx2/IopThread/OwnerAsserts.h"
 #include "pcsx2/INISettingsInterface.h"
 #include "pcsx2/ImGui/FullscreenUI.h"
 #include "pcsx2/ImGui/ImGuiFullscreen.h"
@@ -81,7 +86,7 @@ namespace QtHost
 	static void HookSignals();
 	static void RegisterTypes();
 	static void InitializeClipboard();
-	static bool RunSetupWizard();
+	static bool RunSetupWizard(bool* restart_for_driver);
 	std::optional<bool> DownloadFile(QWidget* parent, const QString& title, std::string url, std::vector<u8>* data);
 } // namespace QtHost
 
@@ -211,6 +216,11 @@ void EmuThread::startVM(std::shared_ptr<VMBootParameters> boot_params)
 {
 	if (!isOnEmuThread())
 	{
+		// Every start in the Qt window comes through here first, on the UI thread. An arcade game gets its files ready
+		// (boot program, dongle) now, and the player is told what is missing when it cannot start.
+		if (!ArcadeLaunch::PrepareForBoot(g_main_window, boot_params.get()))
+			return;
+
 		QMetaObject::invokeMethod(this, "startVM", Qt::QueuedConnection, Q_ARG(std::shared_ptr<VMBootParameters>, boot_params));
 		return;
 	}
@@ -987,6 +997,10 @@ void EmuThread::updatePerformanceMetrics(bool force)
 			// roughly half the GS work runs on a second thread this line would otherwise hide.
 			if (PerformanceMetrics::HasGSBackThread())
 				gs_stat += tr(" | GSB: %1%").arg(PerformanceMetrics::GetGSBackThreadUsage(), 0, 'f', 0);
+
+			// Likewise the IOP thread, which has its own thread only when the IOP thread setting is on.
+			if (PerformanceMetrics::HasIOPThread())
+				gs_stat += tr(" | IOP: %1%").arg(PerformanceMetrics::GetIOPThreadUsage(), 0, 'f', 0);
 		}
 
 		QMetaObject::invokeMethod(g_main_window, "setStatusVerboseText", Qt::QueuedConnection, Q_ARG(const QString&, gs_stat));
@@ -1219,6 +1233,7 @@ void Host::PumpMessagesOnCPUThread()
 
 void Host::RunOnCPUThread(std::function<void()> function, bool block /* = false */)
 {
+	BLOCKING_HOST_CALL_ASSERT(block);
 	if (block && g_emu_thread->isOnEmuThread())
 	{
 		// probably shouldn't ever happen, but just in case..
@@ -1530,6 +1545,11 @@ QString QtHost::GetResourcesBasePath()
 std::string QtHost::GetRuntimeDownloadedResourceURL(std::string_view name)
 {
 	return fmt::format("{}/{}", RUNTIME_RESOURCES_URL, Path::URLEncode(name));
+}
+
+void QtHost::NoteGameSettingEdited(SettingsInterface* sif, const char* section, const char* key)
+{
+	AutoTune::DisableForManualChange(*sif, section, key, Host::GetBaseBoolSettingValue("EmuCore", "AutoTune", false));
 }
 
 bool QtHost::SaveGameSettings(SettingsInterface* sif, bool delete_if_empty)
@@ -2289,6 +2309,10 @@ bool QtHost::ParseCommandLineOptions(const QStringList& args, std::shared_ptr<VM
 				AutoBoot(autoboot)->start_unlimited = true;
 				continue;
 			}
+			else if (QtShot::ParseArgument(it, args.end()))
+			{
+				continue;
+			}
 #ifdef ENABLE_RAINTEGRATION
 			else if (CHECK_ARG(QStringLiteral("-raintegration")))
 			{
@@ -2401,7 +2425,7 @@ void QtHost::InitializeClipboard()
 	}
 }
 
-bool QtHost::RunSetupWizard()
+bool QtHost::RunSetupWizard(bool* restart_for_driver)
 {
 	SetupWizardDialog dialog;
 	if (dialog.exec() == QDialog::Rejected)
@@ -2410,6 +2434,7 @@ bool QtHost::RunSetupWizard()
 	// Remove the flag.
 	Host::SetBaseBoolSettingValue("UI", "SetupWizardIncomplete", false);
 	Host::CommitBaseSettingChanges();
+	*restart_for_driver = dialog.driverPackInstalled();
 	return true;
 }
 
@@ -2464,6 +2489,9 @@ int main(int argc, char* argv[])
 	if (!QtHost::InitializeConfig())
 		return EXIT_FAILURE;
 
+	// Selected GPU driver pack (Linux): must be in the environment before anything loads libvulkan.
+	DriverPacks::ApplyEnvironment();
+
 	// Are we just setting up the configuration?
 	if (s_test_config_and_exit)
 		return EXIT_SUCCESS;
@@ -2488,11 +2516,27 @@ int main(int argc, char* argv[])
 	// flag is left set so FullscreenUI picks it up on startup.
 	const bool start_big_picture_mode = s_start_big_picture_mode || Host::GetBaseBoolSettingValue("UI", "StartBigPictureMode", false);
 
+	bool restart_for_driver = false;
 	int result;
-	if (s_run_setup_wizard && !start_big_picture_mode && !QtHost::RunSetupWizard())
+	if (s_run_setup_wizard && !start_big_picture_mode && !QtHost::RunSetupWizard(&restart_for_driver))
 	{
 		result = EXIT_FAILURE;
 		goto shutdown_and_exit;
+	}
+
+	// The wizard installed a GPU driver pack. A pack is read when the process starts, so start again now,
+	// before the main window and the emulation thread's renderer exist.
+	if (restart_for_driver)
+	{
+		std::string restart_error;
+		if (DriverPacks::RelaunchAtExit(&restart_error))
+		{
+			result = EXIT_SUCCESS;
+			goto shutdown_and_exit;
+		}
+		QMessageBox::warning(nullptr, QObject::tr("GPU Driver"),
+			QObject::tr("The GPU driver is installed and selected, but ARMSX2 cannot restart itself (%1). Close ARMSX2 and start it again to use it.")
+				.arg(QString::fromStdString(restart_error)));
 	}
 
 	// Create all window objects, the emuthread might still be starting up at this point.
@@ -2535,6 +2579,9 @@ int main(int argc, char* argv[])
 		g_emu_thread->startVM(std::move(autoboot));
 	else if (!s_nogui_mode)
 		g_main_window->startupUpdateCheck();
+
+	// Screenshot harness (hidden -uishot flags); does nothing without them.
+	QtShot::Start();
 
 	// This doesn't return until we exit.
 	result = app.exec();

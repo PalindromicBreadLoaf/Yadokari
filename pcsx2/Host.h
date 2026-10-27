@@ -180,6 +180,9 @@ namespace Host
 		/// Retrieves the input settings layer, if present. Must call with lock held.
 		SettingsInterface* GetInputSettingsLayer();
 
+		/// Retrieves the auto-tune trial layer, if present. Must call with lock held.
+		SettingsInterface* GetAutoTuneSettingsLayer();
+
 		/// Sets the base settings layer. Should be called by the host at initialization time.
 		void SetBaseSettingsLayer(SettingsInterface* sif);
 
@@ -191,6 +194,9 @@ namespace Host
 
 		/// Sets the input profile settings layer. Called by VMManager when the game changes.
 		void SetInputSettingsLayer(SettingsInterface* sif, std::unique_lock<std::mutex>& settings_lock);
+
+		/// Sets the auto-tune trial layer, which sits above the game layer. Called by AutoTune; null removes it.
+		void SetAutoTuneSettingsLayer(SettingsInterface* sif, std::unique_lock<std::mutex>& settings_lock);
 
 		/// Implementation to retrieve a translated string.
 		s32 GetTranslatedStringImpl(const std::string_view context, const std::string_view msg, char* tbuf, size_t tbuf_space);

@@ -52,7 +52,16 @@ class MemoryCardViewModel(application: Application) : AndroidViewModel(applicati
             return
         }
         val safe = name.trim().replace(Regex("[\\/:*?\"<>|]"), "_").ifBlank { "MemoryCard" }
-        val cardName: String
+        if (safe.all { it == '.' }) {
+            state.value = state.value.copy(error = "Unable to create $safe.")
+            return
+        }
+        val cardName = if (type == 2 || safe.endsWith(".ps2", true)) safe else "$safe.ps2"
+        if (File(cardDirectory(), cardName).exists() ||
+            cardDirectory().listFiles().orEmpty().any { it.name.equals(cardName, true) }) {
+            state.value = state.value.copy(error = "A memory card named $cardName already exists.")
+            return
+        }
         val success = if (type == 2) {
             // FOLDER card = a directory holding an empty `_pcsx2_superblock` marker (the core
             // identifies a folder card by that marker). Build it with the JAVA file API, NOT
@@ -61,14 +70,12 @@ class MemoryCardViewModel(application: Application) : AndroidViewModel(applicati
             // folder mkdir hit — and only CreateDirectoryPath got a Java fallback, file writes
             // didn't), so the native path leaves an empty, invalid 0-byte folder. Java file ops
             // work here. No .ps2 suffix; size is ignored for folder cards.
-            cardName = safe
             runCatching {
                 val dir = File(cardDirectory(), safe).apply { mkdirs() }
                 File(dir, "_pcsx2_superblock").createNewFile()
                 dir.isDirectory
             }.getOrDefault(false)
         } else {
-            cardName = if (safe.endsWith(".ps2", true)) safe else "$safe.ps2"
             runCatching { NativeApp.createMemoryCard(cardName, 1, sizeType.coerceIn(1, 4)) }.getOrDefault(false)
         }
         state.value = if (success) state.value.copy(message = "Created $cardName.") else state.value.copy(error = "Unable to create $cardName.")
@@ -109,37 +116,19 @@ class MemoryCardViewModel(application: Application) : AndroidViewModel(applicati
         val context = getApplication<Application>()
         val target = uniqueFile(cardDirectory(), zipName.substringBeforeLast('.'))
         val ok = runCatching {
-            target.mkdirs()
-            context.contentResolver.openInputStream(uri)?.use { raw ->
-                java.util.zip.ZipInputStream(raw.buffered()).use { zin ->
-                    var entry = zin.nextEntry
-                    while (entry != null) {
-                        // Strip a single wrapping directory so "Mcd001/_pcsx2_superblock"
-                        // and "_pcsx2_superblock" both land correctly.
-                        val rel = entry.name.replace('\\', '/').trimStart('/')
-                        val stripped = if (rel.count { it == '/' } > 0 && !rel.startsWith("_pcsx2_"))
-                            rel.substringAfter('/') else rel
-                        if (stripped.isNotBlank()) {
-                            val out = File(target, stripped)
-                            // Zip-slip guard: never write outside the card directory.
-                            if (out.canonicalPath.startsWith(target.canonicalPath + File.separator) ||
-                                out.canonicalPath == target.canonicalPath) {
-                                if (entry.isDirectory) {
-                                    out.mkdirs()
-                                } else {
-                                    out.parentFile?.mkdirs()
-                                    out.outputStream().use { zin.copyTo(it) }
-                                }
-                            }
-                        }
-                        zin.closeEntry()
-                        entry = zin.nextEntry
-                    }
-                }
-            } ?: error("Unable to read the selected file.")
-            // A folder card is only valid with its superblock; without it the core would
-            // report "unformatted" exactly as before, so fail loudly here instead.
-            File(target, "_pcsx2_superblock").isFile
+            val archive = File.createTempFile("memorycard-", ".zip", context.cacheDir)
+            try {
+                context.contentResolver.openInputStream(uri)?.use { input ->
+                    archive.outputStream().use(input::copyTo)
+                } ?: error("Unable to read the selected file.")
+                val wrapper = findFolderCardWrapper(archive)
+                extractFolderCard(archive, target, wrapper)
+                // A folder card is only valid with its superblock; without it the core would
+                // report "unformatted" exactly as before, so fail loudly here instead.
+                File(target, "_pcsx2_superblock").isFile
+            } finally {
+                archive.delete()
+            }
         }.getOrDefault(false)
         if (!ok) target.deleteRecursively()
         state.value = if (ok) {
@@ -148,6 +137,58 @@ class MemoryCardViewModel(application: Application) : AndroidViewModel(applicati
             state.value.copy(error = "That zip isn't a folder memory card (no _pcsx2_superblock inside).")
         }
         refresh()
+    }
+
+    private fun findFolderCardWrapper(archive: File): String? {
+        val fileNames = mutableListOf<String>()
+        archive.inputStream().use { raw ->
+            java.util.zip.ZipInputStream(raw.buffered()).use { zin ->
+                var entry = zin.nextEntry
+                while (entry != null) {
+                    val rel = entry.name.replace('\\', '/').trimStart('/')
+                    if (!entry.isDirectory && !rel.startsWith("__MACOSX/")) {
+                        fileNames.add(rel)
+                    }
+                    zin.closeEntry()
+                    entry = zin.nextEntry
+                }
+            }
+        }
+        if ("_pcsx2_superblock" in fileNames) return null
+        // One top-level directory holding the superblock is the card; stray top-level files
+        // beside it (a README, .DS_Store) are skipped on extract rather than failing the import.
+        return fileNames.filter {
+            '/' in it && it.substringAfter('/') == "_pcsx2_superblock"
+        }.map { it.substringBefore('/') }.singleOrNull()
+    }
+
+    private fun extractFolderCard(archive: File, target: File, wrapper: String?) {
+        target.mkdirs()
+        archive.inputStream().use { raw ->
+            java.util.zip.ZipInputStream(raw.buffered()).use { zin ->
+                var entry = zin.nextEntry
+                while (entry != null) {
+                    val rel = entry.name.replace('\\', '/').trimStart('/')
+                    val outside = wrapper != null && !rel.startsWith("$wrapper/")
+                    val stripped = if (wrapper != null) rel.substringAfter('/') else rel
+                    if (!outside && stripped.isNotBlank() && !rel.startsWith("__MACOSX/")) {
+                        val out = File(target, stripped)
+                        // Zip-slip guard: never write outside the card directory.
+                        if (out.canonicalPath.startsWith(target.canonicalPath + File.separator) ||
+                            out.canonicalPath == target.canonicalPath) {
+                            if (entry.isDirectory) {
+                                out.mkdirs()
+                            } else {
+                                out.parentFile?.mkdirs()
+                                out.outputStream().use { zin.copyTo(it) }
+                            }
+                        }
+                    }
+                    zin.closeEntry()
+                    entry = zin.nextEntry
+                }
+            }
+        }
     }
 
     /** Import a folder memory card straight from a directory the user picks. */

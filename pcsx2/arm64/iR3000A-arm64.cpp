@@ -10,10 +10,12 @@
 #include "R5900OpcodeTables.h"
 #include "IopBios.h"
 #include "IopHw.h"
+#include "IopThread/EeBridge.h"
 #include "DebugTools/SymbolGuardian.h"
 #include "Common.h"
 #include "VMManager.h"
 #include "Config.h"
+#include "EECycleRate.h"
 
 #include "common/Assertions.h"
 #include "common/AlignedMalloc.h"
@@ -99,16 +101,11 @@ static ArmConstantPool s_iopConstantPool;
 
 static void iopRecRecompile(u32 startpc);
 
-static const void* iopDispatcherEvent = nullptr;
 static const void* iopDispatcherReg = nullptr;
 static const void* iopJITCompile = nullptr;
 static const void* iopEnterRecompiledCode = nullptr;
 static const void* iopExitRecompiledCode = nullptr;
 static const void* iopUnmappedRecLUTPage = nullptr;
-static void recEventTest()
-{
-	_cpuEventTest_Shared();
-}
 
 // ARM64 dispatcher: Load PC → two-level LUT lookup → jump to block
 //
@@ -337,10 +334,6 @@ static void _DynGen_Dispatchers()
 {
 	const u8* start = armGetCurrentCodePointer();
 
-	// Event test: call recEventTest, then fall through to dispatcher
-	iopDispatcherEvent = armGetCurrentCodePointer();
-	armEmitCall((void*)recEventTest);
-
 	iopDispatcherReg = _DynGen_DispatcherReg();
 	iopJITCompile = _DynGen_JITCompile();
 	iopEnterRecompiledCode = _DynGen_EnterRecompiledCode();
@@ -378,8 +371,7 @@ static void iopRecError(int err)
 			break;
 	}
 
-	VMManager::SetPaused(true);
-	Cpu->ExitExecution();
+	EeBridge::RequestPause();
 }
 
 // =====================================================================================================
@@ -1201,6 +1193,7 @@ static void recReserve()
 void recResetIOP()
 {
 	Console.WriteLn(Color_Green, "iR3000A-ARM64 Recompiler reset.");
+	EECycleRate::NoteIopReset();
 
 	if (CHECK_EXTRAMEM != extraRam)
 	{

@@ -106,6 +106,7 @@ void GSRendererHW::Reset(bool hardware_reset)
 	if (!hardware_reset)
 		g_texture_cache->ReadbackAll();
 
+	m_blend_carry.valid = false;
 	g_texture_cache->RemoveAll(true, true, true);
 	g_texture_cache->NoteColdStart();
 	GSHwHack::ResetState();
@@ -129,6 +130,8 @@ void GSRendererHW::UpdateSettings(const Pcsx2Config::GSOptions& old_config)
 
 void GSRendererHW::VSync(u32 field, bool registers_written, bool idle_frame)
 {
+	m_blend_carry.valid = false;
+
 	if (GSTextureCache::IsHashMemoVerify()) [[unlikely]]
 		g_texture_cache->VerifyWriteStamps(m_mem);
 
@@ -178,6 +181,31 @@ void GSRendererHW::VSync(u32 field, bool registers_written, bool idle_frame)
 		g_gs_device->PurgePool();
 		GSConfig.TexturePreloading = TexturePreloadingLevel::Partial;
 	}
+
+#ifdef __SWITCH__
+	// GPU memory comes out of the ~3 GiB application heap, and running out makes
+	// dkMemBlockCreate svcBreak instead of failing gracefully. Targets are kept: they are the
+	// live working set and IncAge retires them. RemoveAll recycles into the pool, so the
+	// pool must be purged after it.
+	{
+		static constexpr u64 SWITCH_TC_VRAM_CAP = 768 * 1024 * 1024;
+
+		const auto vram_usage = []() {
+			return g_texture_cache->GetTargetMemoryUsage() + g_texture_cache->GetSourceMemoryUsage() +
+				   g_texture_cache->GetTotalHashCacheMemoryUsage() + g_gs_device->GetPoolMemoryUsage();
+		};
+
+		if (vram_usage() > SWITCH_TC_VRAM_CAP)
+		{
+			g_gs_device->PurgePool();
+			if (vram_usage() > SWITCH_TC_VRAM_CAP)
+			{
+				g_texture_cache->RemoveAll(true, false, true);
+				g_gs_device->PurgePool();
+			}
+		}
+	}
+#endif
 
 	m_skip = 0;
 	m_skip_offset = 0;
@@ -1896,6 +1924,37 @@ GSVector2i GSRendererHW::GetTargetSize(const GSTextureCache::Source* tex, const 
 	return g_texture_cache->GetTargetSize(m_cached_ctx.FRAME.Block(), m_cached_ctx.FRAME.FBW, m_cached_ctx.FRAME.PSM, valid_size.x, valid_size.y, can_expand);
 }
 
+// A counter draw: every primitive adds +1 or -1 (mod 256) to the same channels, so the target ends up holding
+// a per-pixel count. Shadow of the Colossus counts its shadow volumes this way, with colour clamping off so that
+// 255 wraps to -1. Only the count matters to whoever reads it back, so it can be drawn at native resolution and
+// stretched: that moves the edges of the counted regions by at most one native pixel. The test reads every
+// vertex colour, so the cheap register checks go first and the loop stops at the first vertex that is not +-1.
+bool GSRendererHW::IsColClipCounterDraw() const
+{
+	if (PRIM->TME)
+		return false;
+
+	// Cs * 1 + Cd: A = Cs, B = 0, D = Cd, and C a factor of exactly 1.0 (FIX 128, or a constant source alpha of 128).
+	const GIFRegALPHA& alpha = m_context->ALPHA;
+	if (alpha.A != 0 || alpha.B != 2 || alpha.D != 1)
+		return false;
+	if (!((alpha.C == 2 && alpha.FIX == 128) || (alpha.C == 0 && m_vt.m_eq.a && m_vertex->buff[0].RGBAQ.A == 128)))
+		return false;
+
+	bool plus = false, minus = false;
+	for (u32 i = 0; i < m_vertex->tail; i++)
+	{
+		const GIFRegRGBAQ& c = m_vertex->buff[i].RGBAQ;
+		if (c.R != c.G || c.G != c.B || (c.R != 1 && c.R != 255))
+			return false;
+		plus |= (c.R == 1);
+		minus |= (c.R == 255);
+	}
+
+	// One direction alone only ever adds or subtracts, which is not a count of crossings.
+	return plus && minus;
+}
+
 bool GSRendererHW::NextDrawColClip() const
 {
 	const int get_next_ctx = (m_state_flush_reason == CONTEXTCHANGE) ? m_env.PRIM.CTXT : m_backed_up_ctx;
@@ -3379,8 +3438,21 @@ std::string GSRendererHW::DescribeDraw() const
 	return desc;
 }
 
+bool GSRendererHW::UseSelectedColorInvalidation(const GSTextureCache::Target* rt,
+	const GSVector4i& rect, bool skip_draw) const
+{
+	// A declined clear still dispatches; a successful clear never accepts DrawPrims.
+	return rt && m_in_target_draw && !skip_draw && m_draw_color_dispatch_accepted &&
+		!m_texture_shuffle && !m_channel_shuffle && !m_using_temp_z && !rect.rempty() &&
+		rt->m_TEX0.TBP0 != m_cached_ctx.FRAME.Block() &&
+		((rt->m_TEX0.TBP0 | m_cached_ctx.FRAME.Block()) & (GS_BLOCKS_PER_PAGE - 1)) == 0 &&
+		rt->m_TEX0.PSM == m_cached_ctx.FRAME.PSM && rt->m_TEX0.TBW != 0 &&
+		rt->m_TEX0.TBW == m_cached_ctx.FRAME.FBW;
+}
+
 void GSRendererHW::Draw()
 {
+	m_draw_color_dispatch_accepted = false;
 	static u32 num_skipped_channel_shuffle_draws = 0;
 
 	// We mess with this state as an optimization, so take a copy and use that instead.
@@ -3470,6 +3542,7 @@ void GSRendererHW::Draw()
 
 				m_last_rt->UpdateValidity(valid_area);
 
+				m_blend_carry.valid = false; // submitted outside the chain
 				g_gs_device->RenderHW(m_conf);
 
 				if (GSConfig.DumpGSData)
@@ -5878,11 +5951,21 @@ void GSRendererHW::Draw()
 		if (m_mem.m_clut.GetGPUTexture() && m_mem.m_clut.GetGPUTexture() == rt->m_texture)
 			m_mem.m_clut.SetGPUTextureDirty(rt->m_last_draw, rt->m_texture);
 
-		g_texture_cache->InvalidateVideoMem(context->offset.fb, real_rect, false);
+		// Inside-target draws translate real_rect into the selected target's coordinates.
+		// Snapshot its layout and the bound depth guard before invalidation can retire targets.
+		const bool selected_color = UseSelectedColorInvalidation(rt, real_rect, skip_draw);
+		const GIFRegTEX0 selected_layout = selected_color ? rt->m_TEX0 : GIFRegTEX0{};
+		const bool selected_depth = selected_color && (!ds || ds->m_TEX0.TBP0 != selected_layout.TBP0);
+		const GSOffset color_offset = selected_color ?
+			m_mem.GetOffset(selected_layout.TBP0, selected_layout.TBW, selected_layout.PSM) : context->offset.fb;
+		g_texture_cache->InvalidateVideoMem(color_offset, real_rect, false);
 
 		// Remove overwritten Zs at the FBP.
 		g_texture_cache->InvalidateVideoMemType(GSTextureCache::DepthStencil, m_cached_ctx.FRAME.Block(),
 			m_cached_ctx.FRAME.PSM, m_texture_shuffle ? GetEffectiveTextureShuffleFbmsk() : fm);
+		if (selected_depth)
+			g_texture_cache->InvalidateVideoMemType(GSTextureCache::DepthStencil, selected_layout.TBP0,
+				selected_layout.PSM, fm);
 
 		if (rt && !m_using_temp_z && g_texture_cache->GetTemporaryZ() != nullptr)
 		{
@@ -11100,6 +11183,7 @@ __ri void GSRendererHW::DrawPrims(GSTextureCache::Target* rt, GSTextureCache::Ta
 	// AA1: Set alpha source to coverage 128 when AA1 is not supported.
 	m_conf.ps.fixed_one_a = IsCoverageAlphaFixedOne();
 
+	m_blend_identity = false;
 	if ((!IsOpaque() || m_context->ALPHA.IsBlack()) && rt && ((m_conf.colormask.wrgba & 0x7) || (m_texture_shuffle && !m_texture_shuffle.real_16_bit_source && !m_texture_shuffle.SameGroupShuffle())))
 	{
 		EmulateBlending(blend_alpha_min, blend_alpha_max, date_options, rt, can_scale_rt_alpha, new_scale_rt_alpha);
@@ -11107,6 +11191,11 @@ __ri void GSRendererHW::DrawPrims(GSTextureCache::Target* rt, GSTextureCache::Ta
 	else
 	{
 		m_conf.blend = {}; // No blending please
+
+		// The identity form (Cs - Cd) * As + Cd with a constant As of 1.0: A = Cs, B = D = Cd, C = As. IsOpaque() is
+		// then true through the alpha range clause (A == B is false, D is not 0), so the range is 128 at both ends.
+		m_blend_identity = rt && (m_conf.colormask.wrgba & 0x7) && PRIM->ABE && !m_context->ALPHA.IsBlack() &&
+		                   m_context->ALPHA.A == 0 && m_context->ALPHA.B == 1 && m_context->ALPHA.C == 0 && m_context->ALPHA.D == 1;
 
 		if (can_scale_rt_alpha && !new_scale_rt_alpha && m_conf.colormask.wa)
 		{
@@ -11330,6 +11419,21 @@ __ri void GSRendererHW::DrawPrims(GSTextureCache::Target* rt, GSTextureCache::Ta
 		}
 	}
 
+	// Before the road and the draw log, which read the pixel shader selector this may change.
+	CarryBlendBeforeSubmit(rt, ds);
+
+	// A fresh colclip counter draw with nothing else riding on it: draw it at native resolution (GameDB
+	// nativeCounterDraws). Anything that would add a pass, a barrier or a destination-alpha setup keeps the
+	// full-resolution path.
+	if (GSConfig.UserHacks_NativeCounterDraws && g_gs_device->Features().native_counter_draws && m_conf.ps.colclip_hw &&
+		m_conf.colclip_mode == GSHWDrawConfig::ColClipMode::ConvertAndResolve && rt && rt->GetScale() > 1.0f &&
+		m_conf.destination_alpha == GSHWDrawConfig::DestinationAlphaMode::Off && !m_conf.require_one_barrier &&
+		!m_conf.require_full_barrier && !m_conf.alpha_second_pass.enable && !m_conf.blend_multi_pass.enable &&
+		!m_conf.ps.HasColorROV() && !m_conf.ps.HasDepthROV() && IsColClipCounterDraw())
+	{
+		m_conf.colclip_native_scale = rt->GetScale();
+	}
+
 	m_conf.road = DecideDrawRoad(m_conf, g_gs_device->Features());
 
 	// Completes the row opened at the top of Draw() with the backend view, which only
@@ -11337,7 +11441,10 @@ __ri void GSRendererHW::DrawPrims(GSTextureCache::Target* rt, GSTextureCache::Ta
 	GSDrawLog::EndDraw(m_conf, static_cast<u8>(m_prim_overlap));
 
 	if (!m_channel_shuffle_width)
+	{
+		m_draw_color_dispatch_accepted = rt && m_conf.rt == rt->m_texture && m_conf.colormask.wrgba != 0;
 		g_gs_device->RenderHW(m_conf);
+	}
 	else
 		m_last_rt = rt;
 
@@ -12832,6 +12939,48 @@ GSHWDrawConfig& GSRendererHW::BeginHLEHardwareDraw(
 	return config;
 }
 
+// A draw whose blend was elided as the identity takes the blend of the blended draw submitted just before it
+// (GSBlendCarry.h), so the backend binds one pipeline for the run instead of two around it. What the elided and
+// the blended form write is the same pixels, so this changes which pipeline draws them and nothing it draws.
+//
+// The donor is a blended draw of the same ALPHA register with a plain shape, remembered with the render target and
+// depth target it drew to. Any draw that is not the donor class or does not match it ends the chain. The targets
+// are compared only to find draws that share a render pass: everything of a target that reaches the output (its
+// format, alpha scaling and colour clamp) is in the pixel shader selector, which is compared whole outside the blend
+// bits, so a target that reuses the address of a freed one cannot make an inexact match. The donor is cleared at
+// Reset and VSync anyway, and wherever a draw is submitted by a path that does not come through here.
+void GSRendererHW::CarryBlendBeforeSubmit(GSTextureCache::Target* rt, GSTextureCache::Target* ds)
+{
+	GSBlendCarry::Donor& d = m_blend_carry;
+
+	// The draw is held for the channel shuffle and submitted later (see Draw()), out of the chain.
+	if (m_channel_shuffle_width)
+	{
+		d.valid = false;
+		return;
+	}
+
+	const u32 abcd = GSBlendCarry::PackAlpha(m_context->ALPHA.A, m_context->ALPHA.B, m_context->ALPHA.C, m_context->ALPHA.D);
+
+	if (m_blend_identity)
+	{
+		if (!GSBlendCarry::IsElidedIdentity(m_conf) || !GSBlendCarry::Matches(d, m_conf, rt, ds, abcd))
+		{
+			d.valid = false;
+			return;
+		}
+
+		GSBlendCarry::Adopt(d, m_conf);
+		return;
+	}
+
+	// A blended draw of the donor class becomes the donor; anything else ends the chain.
+	if (GSBlendCarry::IsDonorClass(m_conf, abcd))
+		d = GSBlendCarry::MakeDonor(m_conf, rt, ds, abcd);
+	else
+		d.valid = false;
+}
+
 void GSRendererHW::EndHLEHardwareDraw(bool force_copy_on_hazard /* = false */)
 {
 	GSHWDrawConfig& config = m_conf;
@@ -12879,6 +13028,7 @@ void GSRendererHW::EndHLEHardwareDraw(bool force_copy_on_hazard /* = false */)
 	                      (!GSDevice::IsDualSourceBlendFactor(config.blend.src_factor) &&
 	                       !GSDevice::IsDualSourceBlendFactor(config.blend.dst_factor));
 
+	m_blend_carry.valid = false; // submitted outside the chain
 	config.road = DecideDrawRoad(config, g_gs_device->Features());
 	g_gs_device->RenderHW(m_conf);
 

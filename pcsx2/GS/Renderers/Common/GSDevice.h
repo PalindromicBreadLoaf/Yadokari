@@ -108,6 +108,7 @@ enum class ShaderInterlace
 	BLEND = 2,
 	MAD_BUFFER = 3,
 	MAD_RECONSTRUCT = 4,
+	COMB = 5,
 	Count
 };
 
@@ -655,6 +656,8 @@ struct alignas(16) InterlaceConstantBuffer
 	// (two rows at 2x, one at 1x and at 1.5x). The weave and MAD buffering passes read the first row
 	// that WAS drawn instead of the hole; without it the frame carries a black row at 2x and above.
 	// (first undrawn device row, first drawn device row below it, unused, unused)
+	// The comb pass uses zw instead: (unused, unused, device rows per native line, device row where
+	// native line 0 starts).
 	GSVector4 FieldPad;
 };
 static_assert(sizeof(InterlaceConstantBuffer) == 32, "InterlaceConstantBuffer is correct size");
@@ -1425,6 +1428,11 @@ struct alignas(16) GSHWDrawConfig
 
 	BlendMultiPass blend_multi_pass;
 
+	/// Non-zero: draw this colclip draw at native resolution, dividing the target's size by this
+	/// scale, then resolve back with point sampling. Set only for +-1 counter draws, and only when
+	/// the device reports native_counter_draws. See GSRendererHW::IsColClipCounterDraw().
+	float colclip_native_scale;
+
 	VSConstantBuffer cb_vs;
 	PSConstantBuffer cb_ps;
 
@@ -1605,6 +1613,7 @@ public:
 		bool broken_mad_deinterlace : 1; ///< Driver can't reliably preserve/read the two-bank FastMAD history target.
 		bool present_from_back_thread : 1; ///< The device may present from the GS back thread (GSRenderer::QueueVsync). Deko3D only.
 		bool broken_blend_constant : 1; ///< Driver applies a CONST_COLOR / INV_CONST_COLOR blend factor as if the constant were zero. A fixed (AFIX) factor rides the second fragment output instead -- see GSBlendConstantPolicy.h.
+		bool native_counter_draws : 1; ///< Can draw a fresh convert-and-resolve colclip draw at native resolution (GSHWDrawConfig::colclip_native_scale).
 		GSFeedbackCarry feedback_carry; ///< Which draws may keep the open pass's feedback-loop bits. Vulkan only; see GSDrawRoad.h.
 		FeatureSupport()
 		{
@@ -1703,7 +1712,7 @@ private:
 	static const std::array<HWBlend, 3*3*3*3> m_blendMap;
 
 protected:
-	static constexpr int NUM_INTERLACE_SHADERS = 5;
+	static constexpr int NUM_INTERLACE_SHADERS = 6;
 	static constexpr float MAD_SENSITIVITY = 0.08f;
 	static constexpr u32 MAX_POOLED_TARGETS = 300;
 	static constexpr u32 MAX_TARGET_AGE = 20;
@@ -1966,6 +1975,15 @@ public:
 	GSVector2i GetPresentationSize() const;
 	__fi s32 GetPresentationWidth() const { return GetPresentationSize().x; }
 	__fi s32 GetPresentationHeight() const { return GetPresentationSize().y; }
+
+	/// Rotation the swap chain images were created with because the surface asked for it (see
+	/// VKSwapChain::GetPreRotation). Invisible to layout: the window size stays in the window's
+	/// orientation, and only the final present into the swap chain image applies it.
+	virtual DisplayRotation GetSurfacePreRotation() const { return DisplayRotation::Rot0; }
+
+	/// The rotation the final present applies: the user's DisplayRotation followed by the surface
+	/// pre-rotation. Both are clockwise quarter turns, so they add.
+	DisplayRotation GetPresentRotation() const;
 	__fi float GetWindowScale() const { return m_window_info.surface_scale; }
 	__fi GSVSyncMode GetVSyncMode() const { return m_vsync_mode; }
 	__fi bool IsPresentThrottleAllowed() const { return m_allow_present_throttle; }
@@ -2254,7 +2272,10 @@ public:
 	/// `top_pad` is the device rows of the merge target that were not drawn for this field, because
 	/// the merge offset that field's picture down by a native line: they start where the circuit's
 	/// display rect starts, not necessarily at row 0.
-	void Interlace(const GSVector2i& ds, int field, int mode, float yoffset, const GSFieldPadRows& top_pad);
+	/// line_rows and line_origin: device rows per native line and the device row native line 0 starts
+	/// at, for the comb pass (mode 4), which works in native lines.
+	void Interlace(const GSVector2i& ds, int field, int mode, float yoffset, const GSFieldPadRows& top_pad,
+		float line_rows = 1.0f, float line_origin = 0.0f);
 	void FXAA();
 	void ShadeBoost();
 	/// Runs the configured RetroArch (.slangp) shader chain over m_current, after
@@ -2281,6 +2302,13 @@ public:
 	/// the point of having it: SGSR was designed for Adreno, FSR1's two passes were not.
 	void SGSRUpscale(GSTexture*& tex, GSVector4i& src_rect, GSVector4& src_uv, const GSVector4& draw_rect,
 		bool edge_direction);
+
+	/// Remote play (GSRemotePlay.h), once per presented vsync, before the present opens. While remote
+	/// play runs: draws src's src_uv part into the stream's frame at area (x, y, width, height, as
+	/// fractions of the frame, black around it), or a black frame for a null src, and hands it over.
+	/// Otherwise: lets go of whatever an earlier capture allocated. A renderer that cannot capture
+	/// keeps this no-op and never sets GSRemotePlay::g_renderer_captures.
+	virtual void RemotePlayVSync(GSTexture* src, const GSVector4& src_uv, const GSVector4& area) {}
 
 	bool ResizeRenderTarget(GSTexture** t, int w, int h, bool preserve_contents, bool recycle);
 

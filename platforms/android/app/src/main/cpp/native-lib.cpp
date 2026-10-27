@@ -12,7 +12,9 @@
 #include "pcsx2/GS.h"
 #include "pcsx2/Counters.h"
 #include "pcsx2/Elfheader.h" // ElfObject, for the boot-ELF disc pairing
+#include "pcsx2/IopThread/OwnerAsserts.h"
 #include "pcsx2/VMManager.h"
+#include "pcsx2/AutoTune/AutoTuneApplier.h" // per-game auto-tune record: read, reset, write back
 #include "pcsx2/CDVD/CDVDcommon.h"
 #include "pcsx2/CDVD/IsoReader.h" // ISO extraction for host: quick-loading setups
 #include "pcsx2/CDVD/CDVD.h" // cdvdSaveNVRAM (flush BIOS NVM on background)
@@ -66,6 +68,7 @@
 #include "BuildVersion.h"
 #include "native-lib.h"
 #include "libchdr/chd.h"
+#include <zlib.h>
 #include <algorithm>
 #include <cmath>
 
@@ -80,6 +83,7 @@
 #include <thread>
 #include <regex>
 #include <tuple>
+#include <utility>
 #include <map>
 #include <vector>
 
@@ -131,6 +135,9 @@ std::atomic<bool> s_execute_exit{false};
 // forever (the exit-game hang: EE breaks out, loop re-enters, repeat). Reset
 // at the top of runVMThread so a fresh launch starts clean.
 std::atomic<bool> s_stop_requested{false};
+// The activity is stopped: home, recents, another app, or the screen locked. Set by
+// setAppBackgrounded() from onStop/onStart.
+static std::atomic<bool> s_app_backgrounded{false};
 // Set when setEnabledPatches had to CREATE gamesettings/<serial>_<CRC>.ini for a game
 // that booted without one: no LAYER_GAME is installed in that case, so reloadPatches
 // must reinstall it before the per-game Enable list can take effect.
@@ -138,6 +145,9 @@ static std::atomic<bool> s_game_layer_needs_install{false};
 static std::mutex s_cpu_thread_mutex;
 static std::deque<std::function<void()>> s_cpu_thread_queue;
 static std::thread::id s_cpu_thread_id;
+// Signalled when a task is queued, so a paused CPU thread waiting in the background picks it up at
+// once rather than at its next timeout.
+static std::condition_variable s_cpu_thread_cv;
 int s_window_width = 0;
 int s_window_height = 0;
 // Display refresh rate (Hz) reported by the Kotlin surface layer via
@@ -182,6 +192,7 @@ static jclass     s_NativeApp_class  = nullptr;  // GlobalRef
 static jmethodID  s_vmSetPaused_mid  = nullptr;
 static jmethodID  s_onPadRumble_mid  = nullptr;
 static jmethodID  s_playSound_mid    = nullptr;
+static jmethodID  s_onAutoTuneCommitted_mid = nullptr;
 
 ////
 std::string GetJavaString(JNIEnv *env, jstring jstr) {
@@ -275,6 +286,7 @@ Java_kr_co_iefriends_pcsx2_NativeApp_emulog(JNIEnv *env, jclass, jstring p_msg) 
 // Defined in VMManager.cpp; see AndroidWriteStagedGameIni.
 extern void (*g_android_before_game_settings_load)(const std::string& serial, const std::string& path);
 static void AndroidWriteStagedGameIni(const std::string& serial, const std::string& path);
+static void AndroidOnAutoTuneCommitted(const char* section, const char* key, std::string_view value);
 
 extern "C"
 JNIEXPORT void JNICALL
@@ -294,6 +306,7 @@ Java_kr_co_iefriends_pcsx2_NativeApp_initialize(JNIEnv *env, jclass clazz,
     std::string _szPath = GetJavaString(env, p_szpath);
     std::string _szBiosFolder = GetJavaString(env, p_szbiosfolder);
     g_android_before_game_settings_load = &AndroidWriteStagedGameIni;
+    AutoTune::g_on_committed = &AndroidOnAutoTuneCommitted;
     EmuFolders::AppRoot = _szPath;
     EmuFolders::DataRoot = _szPath;
     EmuFolders::SetResourcesDirectory();
@@ -484,6 +497,8 @@ Java_kr_co_iefriends_pcsx2_NativeApp_initialize(JNIEnv *env, jclass clazz,
         s_vmSetPaused_mid = env->GetStaticMethodID(s_NativeApp_class, "vmSetPaused", "(Z)V");
         s_onPadRumble_mid = env->GetStaticMethodID(s_NativeApp_class, "onPadRumble", "(III)V");
         s_playSound_mid   = env->GetStaticMethodID(s_NativeApp_class, "playSound", "(Ljava/lang/String;)V");
+        s_onAutoTuneCommitted_mid = env->GetStaticMethodID(s_NativeApp_class, "onAutoTuneCommitted",
+            "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V");
     }
 
     // Bind the JNI-backed HTTP downloader's class + method IDs while we
@@ -617,7 +632,20 @@ Java_kr_co_iefriends_pcsx2_NativeApp_loginAchievements(JNIEnv *env, jclass clazz
     const std::string user = GetJavaString(env, p_user);
     const std::string pass = GetJavaString(env, p_pass);
     Error error;
-    const bool ok = Achievements::Login(user.c_str(), pass.c_str(), &error);
+    bool ok = false;
+    // Live achievement clients require the CPU thread.
+    bool temporary_client = !Achievements::IsActive();
+    if (!temporary_client)
+    {
+        // Recheck on the CPU thread: a queued settings apply may have disabled achievements.
+        Host::RunOnCPUThread([user, pass, &error, &ok, &temporary_client]() {
+            temporary_client = !Achievements::IsActive();
+            if (!temporary_client)
+                ok = Achievements::Login(user.c_str(), pass.c_str(), &error);
+        }, /*block=*/true);
+    }
+    if (temporary_client)
+        ok = Achievements::Login(user.c_str(), pass.c_str(), &error);
     if (!ok)
     {
         const std::string msg = error.GetDescription();
@@ -652,7 +680,7 @@ Java_kr_co_iefriends_pcsx2_NativeApp_loginAchievements(JNIEnv *env, jclass clazz
 extern "C"
 JNIEXPORT void JNICALL
 Java_kr_co_iefriends_pcsx2_NativeApp_logoutAchievements(JNIEnv *env, jclass clazz) {
-    Achievements::Logout();
+    Host::RunOnCPUThread([]() { Achievements::Logout(); }, /*block=*/true);
     // Achievements::Logout clears Token from SECRETS but leaves the
     // Username we co-stored there. Drop it too so a fresh launch doesn't
     // re-mirror a stale username back to BASE.
@@ -661,6 +689,18 @@ Java_kr_co_iefriends_pcsx2_NativeApp_logoutAchievements(JNIEnv *env, jclass claz
         s_secrets_settings_interface->DeleteValue("Achievements", "Username");
         s_secrets_settings_interface->Save();
     }
+}
+
+// Persist the base layer if anything changed. Under the settings lock because the base layer is
+// shared with the CPU thread: Host::SetBase*/Get* lock per call, and INISettingsInterface::Save only
+// serialises against another Load/Save, so without the lock it reads m_ini mid-write, and a write
+// landing between SaveFile and its `m_dirty = false` is marked saved without reaching the disk.
+// The lock is not recursive: never call Host::*Setting* or RunOnCPUThread while holding it.
+static void SaveBaseSettingsIfDirty()
+{
+    auto lock = Host::GetSettingsLock();
+    if (s_settings_interface && s_settings_interface->IsDirty())
+        s_settings_interface->Save();
 }
 
 // Enable / disable RetroAchievements hardcore mode. Persists the hardcore
@@ -685,8 +725,7 @@ Java_kr_co_iefriends_pcsx2_NativeApp_setHardcoreMode(JNIEnv *env, jclass clazz, 
     // hardcore under the user's own control while an override is active — the
     // override only supplies the default.
     Host::RemoveBaseSettingValue("Achievements", "HostOverrideSavedHardcore");
-    if (s_settings_interface && s_settings_interface->IsDirty())
-        s_settings_interface->Save();
+    SaveBaseSettingsIfDirty();
     // ApplySettings owns EmuConfig and resets the JIT caches, so it is the CPU thread's to run;
     // see the assert at the top of VMManager::ApplySettings().
     Host::RunOnCPUThread([]() {
@@ -741,8 +780,7 @@ Java_kr_co_iefriends_pcsx2_NativeApp_setAchievementsOption(JNIEnv *env, jclass c
         return;
 
     Host::SetBaseBoolSettingValue("Achievements", ini_key, enabled == JNI_TRUE);
-    if (s_settings_interface && s_settings_interface->IsDirty())
-        s_settings_interface->Save();
+    SaveBaseSettingsIfDirty();
     // ApplySettings owns EmuConfig and resets the JIT caches, so it is the CPU thread's to run;
     // see the assert at the top of VMManager::ApplySettings().
     Host::RunOnCPUThread([]() {
@@ -769,8 +807,7 @@ Java_kr_co_iefriends_pcsx2_NativeApp_setAchievementsOptionInt(JNIEnv *env, jclas
         return;
 
     Host::SetBaseIntSettingValue("Achievements", ini_key, static_cast<int>(value));
-    if (s_settings_interface && s_settings_interface->IsDirty())
-        s_settings_interface->Save();
+    SaveBaseSettingsIfDirty();
     // ApplySettings owns EmuConfig and resets the JIT caches, so it is the CPU thread's to run;
     // see the assert at the top of VMManager::ApplySettings().
     Host::RunOnCPUThread([]() {
@@ -790,8 +827,7 @@ Java_kr_co_iefriends_pcsx2_NativeApp_setAchievementsUnlockSound(JNIEnv *env, jcl
     const std::string path = GetJavaString(env, p_path);
     Host::SetBaseStringSettingValue("Achievements", "UnlockSoundName", path.c_str());
     Host::SetBaseBoolSettingValue("Achievements", "UnlockSound", true);
-    if (s_settings_interface && s_settings_interface->IsDirty())
-        s_settings_interface->Save();
+    SaveBaseSettingsIfDirty();
     // ApplySettings owns EmuConfig and resets the JIT caches, so it is the CPU thread's to run;
     // see the assert at the top of VMManager::ApplySettings().
     Host::RunOnCPUThread([]() {
@@ -812,14 +848,15 @@ static void RestartAchievementsForHostChange() {
     Achievements::Initialize();
 }
 
-static void PersistAndApplyAchievementsSettings() {
-    if (s_settings_interface && s_settings_interface->IsDirty())
-        s_settings_interface->Save();
-    // ApplySettings owns EmuConfig and resets the JIT caches, so it is the CPU thread's to run;
-    // see the assert at the top of VMManager::ApplySettings().
+static void PersistAndApplyAchievementsHostChange() {
+    SaveBaseSettingsIfDirty();
+    // Not blocking: callers run on the UI thread and read nothing back, and the CPU thread does
+    // not run queued tasks while VMManager::Initialize boots a game, so a wait would stall the UI
+    // for the whole boot.
     Host::RunOnCPUThread([]() {
         if (VMManager::HasValidVM())
             VMManager::ApplySettings();
+        RestartAchievementsForHostChange();
     });
 }
 
@@ -858,8 +895,7 @@ Java_kr_co_iefriends_pcsx2_NativeApp_setAchievementsHostOverride(JNIEnv *env, jc
             Host::SetBaseBoolSettingValue("Achievements", "ChallengeMode", false);
     }
 
-    PersistAndApplyAchievementsSettings();
-    RestartAchievementsForHostChange();
+    PersistAndApplyAchievementsHostChange();
 }
 
 extern "C"
@@ -878,8 +914,7 @@ Java_kr_co_iefriends_pcsx2_NativeApp_clearAchievementsHostOverride(JNIEnv *env, 
         Host::SetBaseBoolSettingValue("Achievements", "ChallengeMode", saved);
     }
 
-    PersistAndApplyAchievementsSettings();
-    RestartAchievementsForHostChange();
+    PersistAndApplyAchievementsHostChange();
 }
 
 // Live HW/SW state from the GS thread's POV. The in-game overlay's renderer
@@ -1529,9 +1564,14 @@ static void applyPadButton(u32 port, jint p_key, jint p_range, jboolean p_keyPre
         }
     }
 
-    // An arcade board's controls (see ArcadePadEvent).
+    // An arcade board's controls (see ArcadePadEvent). A cabinet's players are on its JVS board and
+    // nothing is plugged into the PS2 controller ports, so the press goes to the board only: also
+    // sending it to the emulated DualShock 2 gave the game a second input the real board never has.
     if (Arcade::IsActive())
+    {
         ArcadePadEvent(port, p_key, state);
+        return;
+    }
 
     Pad::SetControllerState(port, static_cast<u32>(_key), state);
 }
@@ -1710,17 +1750,20 @@ Java_kr_co_iefriends_pcsx2_NativeApp_setNominalSpeed(JNIEnv *env, jclass clazz,
     // slider in-game did nothing (the string round-trip through ApplySettings
     // didn't re-pace reliably). Clamp matches EmulationSpeedOptions::SanityCheck.
     float scalar = std::clamp(static_cast<float>(p_percent) / 100.0f, 0.05f, 10.0f);
-    // RetroAchievements hardcore forbids slowdown. This direct-apply path skips
-    // VMManager::ApplySettings (so EnforceAchievementsChallengeModeSettings,
-    // which clamps NominalScalar to >=1.0, never runs) — enforce it here.
-    // Fast-forward (>1.0) stays allowed.
-    if (Achievements::IsHardcoreModeActive() && scalar < 1.0f)
-        scalar = 1.0f;
-    Host::SetBaseFloatSettingValue("Framerate", "NominalScalar", scalar);
-    EmuConfig.EmulationSpeed.NominalScalar = scalar;
-    if (VMManager::HasValidVM())
-        VMManager::UpdateTargetSpeed();
-    Console.WriteLnFmt("@@ANDROID_SPEED@@ nominal_scalar={}", scalar);
+    // EmuConfig and UpdateTargetSpeed's MTGS/SPU2 notifications belong to the CPU thread.
+    Host::RunOnCPUThread([scalar]() mutable {
+        // RetroAchievements hardcore forbids slowdown. This direct-apply path skips
+        // VMManager::ApplySettings (so EnforceAchievementsChallengeModeSettings,
+        // which clamps NominalScalar to >=1.0, never runs) — enforce it here.
+        // Fast-forward (>1.0) stays allowed.
+        if (Achievements::IsHardcoreModeActive() && scalar < 1.0f)
+            scalar = 1.0f;
+        Host::SetBaseFloatSettingValue("Framerate", "NominalScalar", scalar);
+        EmuConfig.EmulationSpeed.NominalScalar = scalar;
+        if (VMManager::HasValidVM())
+            VMManager::UpdateTargetSpeed();
+        Console.WriteLnFmt("@@ANDROID_SPEED@@ nominal_scalar={}", scalar);
+    });
 }
 
 extern "C"
@@ -1968,8 +2011,17 @@ public:
     }
     ~ScopedVMPause() {
         if (m_was_running && m_resume_on_destroy && !s_stop_requested.load(std::memory_order_acquire))
-            VMManager::SetPaused(false);
-        if (m_audio_pause_suppressed)
+        {
+            // Resuming resets CPU-owned code caches.
+            Host::RunOnCPUThread([audio_pause_suppressed = m_audio_pause_suppressed]() {
+                if (!s_stop_requested.load(std::memory_order_acquire) &&
+                    VMManager::HasValidVM() && VMManager::GetState() == VMState::Paused)
+                    VMManager::SetPaused(false);
+                if (audio_pause_suppressed)
+                    SPU2::SetOutputPauseSuppressed(false);
+            }, /*block=*/m_parked);
+        }
+        else if (m_audio_pause_suppressed)
             SPU2::SetOutputPauseSuppressed(false);
     }
     ScopedVMPause(const ScopedVMPause&) = delete;
@@ -2046,10 +2098,11 @@ static bool ApplyLiveGSSettings(const char* reason, std::function<bool()> mutate
 }
 
 // Generic setting writer — mirror of pcsx2-qt's settings save path.
-// Writes flow into s_settings_interface (the MemorySettingsInterface
-// installed in initialize); commitSettings flushes them through to the
-// VM. Type comes as a string from Java to keep the JNI surface flat —
-// only four primitives are supported (bool/int/float/string), enough
+// Writes flow into s_settings_interface (the INISettingsInterface installed
+// as the base layer in initialize; each Host::SetBase* takes the settings
+// lock, so this is safe from any thread); commitSettings flushes them
+// through to the VM and saves. Type comes as a string from Java to keep
+// the JNI surface flat — only four primitives are supported (bool/int/float/string), enough
 // for every EmuCore key the UI needs to push.
 extern "C"
 JNIEXPORT void JNICALL
@@ -2117,8 +2170,7 @@ Java_kr_co_iefriends_pcsx2_NativeApp_commitSettings(JNIEnv *env, jclass clazz) {
         if (MTGS::IsOpen())
             MTGS::ApplySettings();
     }, /*block=*/true);
-    if (s_settings_interface && s_settings_interface->IsDirty())
-        s_settings_interface->Save();
+    SaveBaseSettingsIfDirty();
     LogAndroidGSSettings("commit");
 
     // Plumbing roundtrip verifier — once the UI starts pushing real
@@ -2127,13 +2179,15 @@ Java_kr_co_iefriends_pcsx2_NativeApp_commitSettings(JNIEnv *env, jclass clazz) {
     // allow forwarding references (T&&) to bind to bit-fields.
     Console.WriteLnFmt(
         "Settings commit: vuThread={} EECycleRate={} EECycleSkip={} "
-        "vu1Instant={} fastCDVD={} vuFlagHack={}",
+        "vu1Instant={} fastCDVD={} vuFlagHack={} iopThread={} iopThreadLag={}",
         +EmuConfig.Speedhacks.vuThread,
         +EmuConfig.Speedhacks.EECycleRate,
         +EmuConfig.Speedhacks.EECycleSkip,
         +EmuConfig.Speedhacks.vu1Instant,
         +EmuConfig.Speedhacks.fastCDVD,
-        +EmuConfig.Speedhacks.vuFlagHack);
+        +EmuConfig.Speedhacks.vuFlagHack,
+        +EmuConfig.Speedhacks.iopThread,
+        EmuConfig.Speedhacks.iopThreadLag);
 }
 
 // Generic live GS reconfigure. Reloads the whole EmuCore/GS section from the
@@ -2249,6 +2303,11 @@ Java_kr_co_iefriends_pcsx2_NativeApp_reloadPatches(JNIEnv *env, jclass clazz) {
     // Blocking because the UI wants the resulting cheat count back.
     u32 active_cheats = 0;
     Host::RunOnCPUThread([&active_cheats]() {
+        // The VM can end between the check above and this task (CloseCPUThreadQueue runs it then).
+        if (!VMManager::HasValidVM()) {
+            active_cheats = Patch::GetActiveCheatsCount();
+            return;
+        }
         // setEnabledPatches may have just CREATED gamesettings/<serial>_<CRC>.ini for a game
         // that booted without one — no LAYER_GAME is installed then, so the per-game Enable
         // list is invisible to ReloadEnabledLists. ReloadGameSettings re-reads the file,
@@ -2332,17 +2391,20 @@ Java_kr_co_iefriends_pcsx2_NativeApp_enablePad2(JNIEnv *env, jclass clazz) {
     ScopedVMPause vm_pause(false);
     if (!vm_pause.parked())
         return;
-    {
-        auto lock = Host::GetSettingsLock();
-        if (SettingsInterface* si = Host::GetSettingsInterface()) {
-            si->SetStringValue("Pad2", "Type", "DualShock2");
-            si->SetFloatValue("Pad2", "Deadzone", 0.0f);        // app shapes the stick (shapeStickMag)
-            si->SetFloatValue("Pad2", "AxisScale", 1.33f);      // PCSX2 default
-            si->SetFloatValue("Pad2", "ButtonDeadzone", 0.0f);
-        }
-    }
+    // Into the BASE layer, as setSetting and setMultitap write. Host::GetSettingsInterface() is the
+    // layered view and every setter on it is a pxFailRel: writing through it aborted the app the
+    // moment a second pad was plugged in with a game running, which is why hot-plug was switched off.
+    // Remote play (a friend as player 2) needs the port, so it is safe again. The SetBase* calls lock
+    // for themselves.
+    Host::SetBaseStringSettingValue("Pad2", "Type", "DualShock2");
+    Host::SetBaseFloatSettingValue("Pad2", "Deadzone", 0.0f);        // app shapes the stick (shapeStickMag)
+    Host::SetBaseFloatSettingValue("Pad2", "AxisScale", 1.33f);      // PCSX2 default
+    Host::SetBaseFloatSettingValue("Pad2", "ButtonDeadzone", 0.0f);
     {
         std::lock_guard<std::mutex> lk(s_pad_mutex);
+        // Held across the reload, as setMultitap does: pad mutex first, then the settings lock, the
+        // order ApplyUsbPortsToRunningVM takes them in.
+        auto settings_lock = Host::GetSettingsLock();
         EmuConfig.Pad.Ports[1].Type = Pad::ControllerType::DualShock2;
         Pad::LoadConfig(*Host::GetSettingsInterface());
     }
@@ -3545,6 +3607,25 @@ void Host::PumpMessagesOnCPUThread() {
         function();
 }
 
+// Hand the CPU thread role back on every exit of runVMThread. Under the lock the id goes empty, so
+// from here on RunOnCPUThread runs inline in its caller; the queue is taken, not cleared, and what
+// was in it runs here. Clearing it instead dropped every task posted during CPUThreadShutdown(), and
+// a blocking caller of one of those never woke. A drained task sees the same post-teardown world an
+// inline call made a moment later would, so the lambdas that relied only on their JNI entry's VM
+// check re-check inside (HasValidVM / MTGS::IsOpen).
+static void CloseCPUThreadQueue()
+{
+    std::deque<std::function<void()>> queue;
+    {
+        std::lock_guard lock(s_cpu_thread_mutex);
+        s_cpu_thread_id = std::thread::id();
+        queue.swap(s_cpu_thread_queue);
+    }
+
+    for (auto& function : queue)
+        function();
+}
+
 std::vector<std::string> FileSystem::FindContentChdSiblings(const char* filename)
 {
     std::vector<std::string> files;
@@ -3707,6 +3788,7 @@ Java_kr_co_iefriends_pcsx2_NativeApp_runVMThread(JNIEnv *env, jclass clazz,
     const char* error;
     if (!VMManager::PerformEarlyHardwareChecks(&error)) {
         Console.Error("Early hardware check failed: %s", error ? error : "unknown error");
+        CloseCPUThreadQueue();
         return false;
     }
 
@@ -3746,6 +3828,7 @@ Java_kr_co_iefriends_pcsx2_NativeApp_runVMThread(JNIEnv *env, jclass clazz,
     if (!VMManager::Internal::CPUThreadInitialize()) {
         Console.Error("@@ANDROID_CPU_THREAD_INIT_FAILED@@");
         VMManager::Internal::CPUThreadShutdown();
+        CloseCPUThreadQueue();
         return false;
     }
 
@@ -3840,7 +3923,19 @@ Java_kr_co_iefriends_pcsx2_NativeApp_runVMThread(JNIEnv *env, jclass clazz,
             } else if (_vmState == VMState::Paused) {
                 VMManager::IdlePollUpdate();
                 Host::PumpMessagesOnCPUThread();
-                usleep(16000);
+                if (s_app_backgrounded.load(std::memory_order_acquire)) {
+                    // No menu to poll for in the background, and sixty wakeups a second with the
+                    // screen off add up overnight (#817). Sleep until a task arrives (a resume, a
+                    // stop, the return to the foreground) or a second has passed.
+                    std::unique_lock lock(s_cpu_thread_mutex);
+                    s_cpu_thread_cv.wait_for(lock, std::chrono::seconds(1), []() {
+                        return !s_cpu_thread_queue.empty() ||
+                               s_stop_requested.load(std::memory_order_acquire) ||
+                               !s_app_backgrounded.load(std::memory_order_acquire);
+                    });
+                } else {
+                    usleep(16000);
+                }
             } else {
                 usleep(250000);
             }
@@ -3858,11 +3953,7 @@ Java_kr_co_iefriends_pcsx2_NativeApp_runVMThread(JNIEnv *env, jclass clazz,
     ////
     Host::PumpMessagesOnCPUThread();
     VMManager::Internal::CPUThreadShutdown();
-    {
-        std::lock_guard lock(s_cpu_thread_mutex);
-        s_cpu_thread_id = std::thread::id();
-        s_cpu_thread_queue.clear();
-    }
+    CloseCPUThreadQueue();
 
     return true;
 }
@@ -3955,8 +4046,22 @@ Java_kr_co_iefriends_pcsx2_NativeApp_setOutputPauseSuppressed(JNIEnv *env, jclas
     // Close/Open rebuild on resume — the ~1s fast-forward-from-menu hitch, and the
     // "audio dies a few seconds into a paused menu" bug (#333). Keeping it alive across
     // the brief menu pause means resume is a cheap no-op with no rebuild. Only the
-    // overlay pause sets this; background/quit pause normally, and resume() clears it.
+    // overlay pause sets this, and resume() clears it. Leaving the app opens the overlay
+    // too, so setAppBackgrounded() below is what lets go of the device then.
     SPU2::SetOutputPauseSuppressed(suppressed == JNI_TRUE);
+}
+
+extern "C"
+JNIEXPORT void JNICALL
+Java_kr_co_iefriends_pcsx2_NativeApp_setAppBackgrounded(JNIEnv *env, jclass clazz, jboolean backgrounded) {
+    // From the activity's onStop (true) and onStart (false). The overlay pause that leaving the app
+    // opens keeps the audio device running; out of sight it now pauses for real, which lets Android
+    // stop holding its audio wakelock (#825). Coming back starts it again while the pause menu is
+    // still up, so Resume stays instant (#333).
+    const bool bg = (backgrounded == JNI_TRUE);
+    s_app_backgrounded.store(bg, std::memory_order_release);
+    SPU2::SetOutputBackgrounded(bg);
+    Host::RunOnCPUThread([]() { SPU2::UpdateOutputPaused(); });
 }
 
 extern "C"
@@ -4032,6 +4137,9 @@ Java_kr_co_iefriends_pcsx2_NativeApp_flushShaderCache(JNIEnv *env, jclass clazz)
     if (!s_last_flush_time.compare_exchange_strong(last, now, std::memory_order_acq_rel))
         return;
     Host::RunOnCPUThread([]() {
+        // Re-checked here: run from CloseCPUThreadQueue, the GS thread is already gone.
+        if (!MTGS::IsOpen())
+            return;
         MTGS::RunOnGSThread([]() {
             if (g_vulkan_shader_cache)
                 g_vulkan_shader_cache->FlushPipelineCache();
@@ -4061,7 +4169,6 @@ Java_kr_co_iefriends_pcsx2_NativeApp_shutdown(JNIEnv *env, jclass clazz) {
     Console.WriteLn("@@STOP_LATCH_SET@@ val=%d",
         s_stop_requested.load(std::memory_order_acquire) ? 1 : 0);
 
-    VMManager::SetLimiterMode(LimiterModeType::Nominal);
     if (VMManager::GetState() != VMState::Stopping)
         VMManager::SetState(VMState::Stopping);
     if (!s_execute_exit.load(std::memory_order_acquire) && Cpu)
@@ -4175,6 +4282,11 @@ Java_kr_co_iefriends_pcsx2_NativeApp_saveStateToSlot(JNIEnv *env, jclass clazz, 
     // around. It is thread identity, not the park, that makes the ring pushes legal.
     std::string save_error;
     Host::RunOnCPUThread([p_slot, &save_error]() {
+        // The VM can end while this waits in the queue (CloseCPUThreadQueue runs it then).
+        if (!VMManager::HasValidVM()) {
+            save_error = "VM shut down";
+            return;
+        }
         VMManager::SaveStateToSlot(p_slot, /*zip_on_thread=*/false,
             [&save_error](const std::string& error) { save_error = error; });
     }, /*block=*/true);
@@ -4236,11 +4348,79 @@ Java_kr_co_iefriends_pcsx2_NativeApp_loadStateFromSlot(JNIEnv *env, jclass clazz
     // rather than as a second queued job also stops it racing the resume in the pause guard's dtor.
     bool loaded = false;
     Host::RunOnCPUThread([p_slot, &loaded]() {
+        // The VM can end while this waits in the queue (CloseCPUThreadQueue runs it then).
+        if (!VMManager::HasValidVM())
+            return;
         loaded = VMManager::LoadStateFromSlot(p_slot);
         if (loaded)
             MTGS::PresentCurrentFrame();
     }, /*block=*/true);
     return loaded;
+}
+
+static bool SaveStatePathMatchesCurrentGame(std::string_view path) {
+    const std::string_view name = Path::GetFileName(path);
+    const std::string_view suffix = name.size() >= 7 ? name.substr(name.size() - 7) : std::string_view();
+    if (suffix.size() != 7 || suffix[0] != '.' || suffix[1] < '0' || suffix[1] > '9' ||
+        suffix[2] < '0' || suffix[2] > '9' || suffix.substr(3) != ".p2s")
+        return false;
+    const s32 slot = (suffix[1] - '0') * 10 + (suffix[2] - '0');
+    const std::string expected = VMManager::GetSaveStateFileName(
+        VMManager::GetDiscSerial().c_str(), VMManager::GetDiscCRC(), slot);
+    return !expected.empty() && name == Path::GetFileName(expected);
+}
+
+extern "C"
+JNIEXPORT jint JNICALL
+Java_kr_co_iefriends_pcsx2_NativeApp_loadStateFromFile(JNIEnv *env, jclass clazz, jstring p_path) {
+    const std::string path = GetJavaString(env, p_path);
+    const auto fail = [&path](const char* reason, jint status) -> jint {
+        Console.Error("@@ANDROID_LOADSTATE@@ path=%s ok=0 reason=%s crc=%08X serial=%s", path.c_str(),
+            reason, VMManager::GetDiscCRC(), VMManager::GetDiscSerial().c_str());
+        return status;
+    };
+    if (!VMManager::HasValidVM())
+        return fail("no_vm", 0);
+    if (!FileSystem::FileExists(path.c_str()))
+        return fail("no_file", -1);
+    const ScopedVMPause pause_guard;
+    if (!pause_guard.parked())
+        return fail("cpu_thread_not_parked", 0);
+    // Loading and presenting both push to CPU-owned rings, before the pause guard resumes the VM.
+    jint status = 0;
+    Host::RunOnCPUThread([&path, &status, &fail]() {
+        if (!VMManager::HasValidVM()) {
+            status = fail("no_vm", 0);
+            return;
+        }
+        if (!SaveStatesHaveName()) {
+            status = fail("crc_zero", 0);
+            return;
+        }
+        if (!SaveStatePathMatchesCurrentGame(path)) {
+            status = fail("wrong_game", -1);
+            return;
+        }
+        if (!FileSystem::FileExists(path.c_str())) {
+            status = fail("no_file", -1);
+            return;
+        }
+        if (MemcardBusy::IsBusy()) {
+            status = fail("memcard_busy", 0);
+            return;
+        }
+        Error error;
+        if (!VMManager::LoadState(path.c_str(), &error)) {
+            Console.Error(fmt::format("loadStateFromFile: {}", error.GetDescription()));
+            status = fail("load_failed", -1);
+            return;
+        }
+        MTGS::PresentCurrentFrame();
+        status = 1;
+    }, /*block=*/true);
+    if (status == 1)
+        Console.WriteLn("@@ANDROID_LOADSTATE@@ path=%s ok=1", path.c_str());
+    return status;
 }
 
 extern "C"
@@ -4274,6 +4454,9 @@ Java_kr_co_iefriends_pcsx2_NativeApp_changeDisc(JNIEnv *env, jclass clazz, jstri
         return false;
     bool ok = false;
     Host::RunOnCPUThread([&path, &ok]() {
+        // The VM can end while this waits in the queue (CloseCPUThreadQueue runs it then).
+        if (!VMManager::HasValidVM())
+            return;
         ok = VMManager::ChangeDisc(CDVD_SourceType::Iso, path);
     }, /*block=*/true);
     return ok;
@@ -4453,6 +4636,11 @@ Java_kr_co_iefriends_pcsx2_NativeApp_saveAutosaveState(JNIEnv *env, jclass clazz
     // pushes to the single-producer MTGS ring, whose write position is owned by the CPU thread.
     std::string save_error;
     Host::RunOnCPUThread([&save_error]() {
+        // The VM can end while this waits in the queue (CloseCPUThreadQueue runs it then).
+        if (!VMManager::HasValidVM()) {
+            save_error = "VM shut down";
+            return;
+        }
         VMManager::SaveStateToSlot(VMManager::SAVESTATE_SLOT_AUTOSAVE, /*zip_on_thread=*/false,
             [&save_error](const std::string& error) { save_error = error; });
     }, /*block=*/true);
@@ -4489,6 +4677,9 @@ Java_kr_co_iefriends_pcsx2_NativeApp_loadAutosaveState(JNIEnv *env, jclass clazz
     // happens to redraw. Run in the same task so it cannot race the resume in the guard's dtor.
     bool loaded = false;
     Host::RunOnCPUThread([&loaded]() {
+        // The VM can end while this waits in the queue (CloseCPUThreadQueue runs it then).
+        if (!VMManager::HasValidVM())
+            return;
         loaded = VMManager::LoadStateFromSlot(VMManager::SAVESTATE_SLOT_AUTOSAVE);
         if (loaded)
             MTGS::PresentCurrentFrame();
@@ -4599,6 +4790,9 @@ Java_kr_co_iefriends_pcsx2_NativeApp_loadAutosaveStateAt(JNIEnv *env, jclass cla
     // while the memory card is busy, as a slot load does.
     bool loaded = false;
     Host::RunOnCPUThread([&loaded, &filename]() {
+        // The VM can end while this waits in the queue (CloseCPUThreadQueue runs it then).
+        if (!VMManager::HasValidVM())
+            return;
         Error error;
         loaded = VMManager::LoadState(filename.c_str(), &error);
         if (loaded)
@@ -4747,25 +4941,25 @@ void Host::OnSaveStateSaved(const std::string_view filename)
 
 void Host::RunOnCPUThread(std::function<void()> function, bool block /* = false */)
 {
+    BLOCKING_HOST_CALL_ASSERT(block);
     const std::thread::id current_thread = std::this_thread::get_id();
-    bool run_inline = false;
+    std::mutex wait_mutex;
+    std::condition_variable wait_cv;
+    bool done = false;
     {
-        std::lock_guard lock(s_cpu_thread_mutex);
-        run_inline = (s_cpu_thread_id == std::thread::id() || s_cpu_thread_id == current_thread);
-    }
-    if (run_inline)
-    {
-        function();
-        return;
-    }
-
-    if (block)
-    {
-        std::mutex wait_mutex;
-        std::condition_variable wait_cv;
-        bool done = false;
+        // Decide and enqueue under ONE hold of the lock. Deciding in one hold and pushing in a
+        // second lets CloseCPUThreadQueue() run in between: the task then lands in a queue nobody
+        // drains any more, and a blocking caller sleeps forever.
+        std::unique_lock lock(s_cpu_thread_mutex);
+        if (s_cpu_thread_id == std::thread::id() || s_cpu_thread_id == current_thread)
         {
-            std::lock_guard lock(s_cpu_thread_mutex);
+            lock.unlock();
+            function();
+            return;
+        }
+
+        if (block)
+        {
             s_cpu_thread_queue.push_back([&]() {
                 function();
                 {
@@ -4774,16 +4968,18 @@ void Host::RunOnCPUThread(std::function<void()> function, bool block /* = false 
                 }
                 wait_cv.notify_one();
             });
+            s_cpu_thread_cv.notify_one();
         }
+        else
+        {
+            s_cpu_thread_queue.push_back(std::move(function));
+            s_cpu_thread_cv.notify_one();
+            return;
+        }
+    }
 
-        std::unique_lock wait_lock(wait_mutex);
-        wait_cv.wait(wait_lock, [&]() { return done; });
-    }
-    else
-    {
-        std::lock_guard lock(s_cpu_thread_mutex);
-        s_cpu_thread_queue.push_back(std::move(function));
-    }
+    std::unique_lock wait_lock(wait_mutex);
+    wait_cv.wait(wait_lock, [&]() { return done; });
 }
 
 // Post to the GS thread from anywhere. Mirrors pcsx2-qt's implementation (QtHost.cpp) — the
@@ -4840,6 +5036,8 @@ void Host::RequestVMShutdown(bool allow_confirm, bool allow_save_state, bool def
     // the 2nd launch). If we're already shut down, there's nothing left to stop.
     if (VMManager::GetState() == VMState::Shutdown)
         return;
+    // No limiter reset here: the core calls this from whichever thread powers the console off,
+    // and every boot sets the limiter back to Nominal anyway (VMManager::Initialize).
     VMManager::SetState(VMState::Stopping);
     if (!s_execute_exit.load(std::memory_order_acquire) && Cpu)
         Cpu->ExitExecution();
@@ -5394,8 +5592,7 @@ Java_kr_co_iefriends_pcsx2_NativeApp_osdShowAll(JNIEnv*, jclass, jboolean enable
     Host::SetBaseBoolSettingValue("EmuCore/GS", "OsdShowVersion", e);
     Host::SetBaseBoolSettingValue("EmuCore/GS", "OsdShowSettings", e);
     Host::SetBaseBoolSettingValue("EmuCore/GS", "OsdShowInputs", e);
-    if (s_settings_interface && s_settings_interface->IsDirty())
-        s_settings_interface->Save();
+    SaveBaseSettingsIfDirty();
 
     // The EmuConfig half rides applyOsdSetting's CPU-thread hop; the base-layer writes above stay
     // here because they go through the settings interface, not EmuConfig.
@@ -5922,6 +6119,112 @@ Java_kr_co_iefriends_pcsx2_NativeApp_gameIniCommitWrite(JNIEnv*, jclass) {
     return ok ? JNI_TRUE : JNI_FALSE;
 }
 
+// ---- Auto-tune's record of a game ----
+//
+// What auto-tune changed lives in the game's file (gamesettings/<serial>_<CRC>.ini, the keys it set and an
+// [AutoTune] section recording what they were before). The app has no CRC to name that file until a game runs,
+// so these take the app's serial: the running game's file when that is the game, else the one file on disk
+// for that serial. A blank serial means the running game (a homebrew ELF has none).
+static bool AutoTuneResolveGame(const std::string& serial, std::string* out_serial, u32* out_crc) {
+    if (VMManager::HasValidVM()) {
+        const std::string disc_serial = VMManager::GetDiscSerial();
+        if (serial.empty() || StringUtil::compareNoCase(serial, disc_serial)) {
+            u32 crc = VMManager::GetDiscCRC();
+            if (crc == 0)
+                crc = VMManager::GetCurrentCRC();
+            if (crc != 0) {
+                *out_serial = disc_serial;
+                *out_crc = crc;
+                return true;
+            }
+        }
+    }
+    if (serial.empty())
+        return false;
+    // <serial>_<CRC>.ini: the CRC is the hex after the last underscore.
+    const std::string path = AndroidGameSettingsPathForSerial(serial);
+    if (path.empty())
+        return false;
+    const std::string title = std::string(Path::GetFileTitle(path));
+    const size_t underscore = title.rfind('_');
+    if (underscore == std::string::npos)
+        return false;
+    const std::optional<u32> crc = StringUtil::FromChars<u32>(std::string_view(title).substr(underscore + 1), 16);
+    if (!crc.has_value() || crc.value() == 0)
+        return false;
+    *out_serial = serial;
+    *out_crc = crc.value();
+    return true;
+}
+
+static jobjectArray AutoTuneStringArray(JNIEnv* env, const std::vector<std::string*>& items) {
+    jclass string_class = env->FindClass("java/lang/String");
+    jobjectArray array = env->NewObjectArray(static_cast<jsize>(items.size()), string_class, nullptr);
+    for (size_t i = 0; i < items.size(); i++) {
+        if (!items[i])
+            continue; // a null element
+        jstring text = env->NewStringUTF(items[i]->c_str());
+        env->SetObjectArrayElement(array, static_cast<jsize>(i), text);
+        env->DeleteLocalRef(text);
+    }
+    env->DeleteLocalRef(string_class);
+    return array;
+}
+
+// One readable line for each thing auto-tune changed for the game, then one for the steps it tried without
+// benefit. Empty when it changed nothing.
+extern "C" JNIEXPORT jobjectArray JNICALL
+Java_kr_co_iefriends_pcsx2_NativeApp_autoTuneDescribe(JNIEnv* env, jclass, jstring p_serial) {
+    std::string serial;
+    u32 crc = 0;
+    std::vector<std::string> lines;
+    if (AutoTuneResolveGame(p_serial ? GetJavaString(env, p_serial) : std::string(), &serial, &crc))
+        lines = AutoTune::DescribeForGame(serial, crc);
+    std::vector<std::string*> items;
+    for (std::string& line : lines)
+        items.push_back(&line);
+    return AutoTuneStringArray(env, items);
+}
+
+// Puts back what auto-tune changed in the game's file, forgets what it learned, and (for the running game) applies
+// that on the CPU thread. Null when the game has no file. Otherwise {had_record "1"/"0"}, then four strings for each
+// key the record named, so the app can do the same to its own copy: kind, section, key, value.
+//   "restored": put back. The value is the text the file holds again, null where the key was deleted.
+//   "absent":   left alone because the key is not in the file. The value is the text auto-tune wrote. The app's writer
+//               leaves some keys out of the file, so the app decides from its own copy whether the player removed it.
+//   "changed":  left alone because the file holds another value. The value is the text auto-tune wrote.
+extern "C" JNIEXPORT jobjectArray JNICALL
+Java_kr_co_iefriends_pcsx2_NativeApp_autoTuneReset(JNIEnv* env, jclass, jstring p_serial) {
+    std::string serial;
+    u32 crc = 0;
+    if (!AutoTuneResolveGame(p_serial ? GetJavaString(env, p_serial) : std::string(), &serial, &crc))
+        return nullptr;
+    const AutoTune::ResetResult result = AutoTune::ResetForGame(serial, crc);
+
+    std::string had_record = result.had_record ? "1" : "0";
+    static std::string kind_restored("restored");
+    static std::string kind_absent("absent");
+    static std::string kind_changed("changed");
+    std::vector<std::string*> items{&had_record};
+    // Kept alive until the array is built: the pointers above and below point into these.
+    std::vector<std::optional<std::string>> values;
+    values.reserve(result.restored.size());
+    for (const AutoTune::Restored& restored : result.restored) {
+        items.push_back(&kind_restored);
+        items.push_back(const_cast<std::string*>(&restored.section));
+        items.push_back(const_cast<std::string*>(&restored.key));
+        values.push_back(restored.value);
+        items.push_back(values.back().has_value() ? &values.back().value() : nullptr);
+    }
+    for (const AutoTune::LeftAlone& left : result.left_alone) {
+        items.push_back(left.absent ? &kind_absent : &kind_changed);
+        items.push_back(const_cast<std::string*>(&left.section));
+        items.push_back(const_cast<std::string*>(&left.key));
+        items.push_back(const_cast<std::string*>(&left.value));
+    }
+    return AutoTuneStringArray(env, items);
+}
+
 // Build a game's per-game file at launch, for the core to write when it loads it. The same
 // put/claim/commit stream as gameIniBeginWrite; see AndroidWriteStagedGameIni for why the
 // writing has to wait.
@@ -5966,7 +6269,11 @@ extern "C" JNIEXPORT void JNICALL
 Java_kr_co_iefriends_pcsx2_NativeApp_reloadGameSettingsLayer(JNIEnv*, jclass) {
     if (!VMManager::HasValidVM())
         return;
-    Host::RunOnCPUThread([]() { VMManager::ReloadGameSettingsLayer(); }, /*block=*/true);
+    // Re-checked inside: the VM can end while this waits in the queue (CloseCPUThreadQueue runs it).
+    Host::RunOnCPUThread([]() {
+        if (VMManager::HasValidVM())
+            VMManager::ReloadGameSettingsLayer();
+    }, /*block=*/true);
 }
 
 // What the game database sets for [serial], one line per setting a per-game key can claim:
@@ -6015,9 +6322,11 @@ Java_kr_co_iefriends_pcsx2_NativeApp_gameDbClaimingKeys(JNIEnv* env, jclass) {
 //   2048 / 0    plain ISO — every byte is data
 //   2352 / 16   Mode 1 raw — 12 byte sync, 4 byte header, 2048 data, 288 ECC
 //   2352 / 24   Mode 2 Form 1 raw — 16 sync+header, 8 subheader, 2048 data, 280 ECC
+//   2448 / 24   raw with subchannel, data at +24
 //
 // We try them in order and the first one that finds a valid PVD wins. CSO/ZSO
-// and GZ still fall back to filename parsing on the Kotlin side.
+// still fall back to filename parsing on the Kotlin side. Gzip streams use
+// the same layouts after decompression.
 //
 // fd ownership: consumed (closed via fclose on the wrapping FILE*),
 // matching the IsBIOSFromFd contract.
@@ -6025,19 +6334,18 @@ Java_kr_co_iefriends_pcsx2_NativeApp_gameDbClaimingKeys(JNIEnv* env, jclass) {
 
 namespace {
 // Reader abstraction so the SYSTEM.CNF probe is independent of the
-// underlying container (flat ISO/BIN via FILE*, CHD via libchdr). Each
+// underlying container (flat ISO/BIN, gzip, or CHD). Each
 // implementation knows how to fetch up to 2048 bytes of cooked data
 // starting at a given LBA + intra-sector offset.
 using DiscReader = std::function<bool(std::uint32_t lba, std::uint32_t skip, void* buf, std::size_t size)>;
+using OffsetReader = std::function<bool(std::uint64_t offset, void* buf, std::size_t size)>;
 
-// FILE*-backed reader for plain ISO (2048/0) and raw .bin (2352/16, 2352/24).
-static DiscReader MakeFileReader(std::FILE* fp, std::uint32_t sectorSize,
-    std::uint32_t dataOffset, std::uint64_t byteBase = 0)
+static DiscReader MakeOffsetReader(const OffsetReader& read, std::uint32_t sectorSize,
+    std::uint32_t dataOffset, std::uint64_t byteBase)
 {
-    return [fp, sectorSize, dataOffset, byteBase](std::uint32_t lba, std::uint32_t skip, void* buf, std::size_t size) -> bool {
+    return [read, sectorSize, dataOffset, byteBase](std::uint32_t lba, std::uint32_t skip, void* buf, std::size_t size) -> bool {
         const std::uint64_t off = byteBase + static_cast<std::uint64_t>(lba) * sectorSize + dataOffset + skip;
-        if (std::fseek(fp, static_cast<long>(off), SEEK_SET) != 0) return false;
-        return std::fread(buf, 1, size, fp) == size;
+        return read(off, buf, size);
     };
 }
 
@@ -6217,6 +6525,25 @@ static std::string ProbeSerialWithLeadIns(std::uint32_t sectorSize, const Reader
     return {};
 }
 
+// Layouts in likelihood order: .iso is 2048/0, .bin usually 2352/16;
+// 2352/24 and 2448/24 are rare but cheap. Each is tried with the
+// 150-sector/Nero lead-ins, which otherwise hide some CD PVDs.
+static std::string ProbeSerialWithOffsets(const OffsetReader& read)
+{
+    const std::pair<std::uint32_t, std::uint32_t> layouts[] = {
+        {2048, 0}, {2352, 16}, {2352, 24}, {2448, 24},
+    };
+    for (const auto& [sectorSize, dataOffset] : layouts)
+    {
+        std::string serial = ProbeSerialWithLeadIns(sectorSize, [&](std::uint64_t byteBase) {
+            return MakeOffsetReader(read, sectorSize, dataOffset, byteBase);
+        });
+        if (!serial.empty())
+            return serial;
+    }
+    return {};
+}
+
 // Minimal core_file wrapper around an existing FILE*. libchdr only needs
 // fsize/fread/fseek/fclose; we hand-roll them to avoid bringing in the
 // emulator's heavyweight ChdCoreFileWrapper (which deals with parents and
@@ -6260,6 +6587,16 @@ static bool IsChdMagic(std::FILE* fp)
     if (std::fread(hdr, 1, 8, fp) != 8) return false;
     std::fseek(fp, 0, SEEK_SET);
     return std::memcmp(hdr, "MComprHD", 8) == 0;
+}
+
+static bool IsGzipMagic(std::FILE* fp)
+{
+    std::uint8_t hdr[2];
+    if (std::fseek(fp, 0, SEEK_SET) != 0) return false;
+    const bool gzip = std::fread(hdr, 1, sizeof(hdr), fp) == sizeof(hdr) &&
+        hdr[0] == 0x1f && hdr[1] == 0x8b;
+    std::fseek(fp, 0, SEEK_SET);
+    return gzip;
 }
 
 // Open a CHD on top of `fp` (ownership transferred on success — libchdr
@@ -6352,25 +6689,33 @@ Java_kr_co_iefriends_pcsx2_NativeApp_getGameSerialFromFd(JNIEnv* env, jclass, ji
             // wrapper. Don't double-close.
         }
     }
+    else if (IsGzipMagic(fp))
+    {
+        const int gzipFd = dup(fileno(fp));
+        // fseek may rewind only the stdio buffer, leaving the descriptor ahead.
+        gzFile gz = nullptr;
+        if (gzipFd >= 0 && lseek(gzipFd, 0, SEEK_SET) == 0)
+            gz = gzdopen(gzipFd, "rb");
+        if (gz)
+        {
+            serial = ProbeSerialWithOffsets([gz](std::uint64_t offset, void* buf, std::size_t size) {
+                const auto off = static_cast<z_off_t>(offset);
+                return gzseek(gz, off, SEEK_SET) == off &&
+                    gzread(gz, buf, static_cast<unsigned int>(size)) == static_cast<int>(size);
+            });
+            gzclose(gz);
+        }
+        else if (gzipFd >= 0)
+        {
+            close(gzipFd);
+        }
+        std::fclose(fp);
+    }
     else
     {
-        // Plain ISO / raw .bin path. .iso files are virtually always
-        // 2048/0; .bin files are usually 2352/16 (Mode 1 raw); 2352/24
-        // (Mode 2 Form 1) is rare on PS2 but cheap to try as a last
-        // resort. Try PCSX2's 150-sector/Nero-style lead-in variants too,
-        // since some CD-format games otherwise hide their PVD from the
-        // lightweight scanner.
-        if (serial.empty()) serial = ProbeSerialWithLeadIns(2048, [&](std::uint64_t byteBase) {
-            return MakeFileReader(fp, 2048, 0, byteBase);
-        });
-        if (serial.empty()) serial = ProbeSerialWithLeadIns(2352, [&](std::uint64_t byteBase) {
-            return MakeFileReader(fp, 2352, 16, byteBase);
-        });
-        if (serial.empty()) serial = ProbeSerialWithLeadIns(2352, [&](std::uint64_t byteBase) {
-            return MakeFileReader(fp, 2352, 24, byteBase);
-        });
-        if (serial.empty()) serial = ProbeSerialWithLeadIns(2448, [&](std::uint64_t byteBase) {
-            return MakeFileReader(fp, 2448, 24, byteBase);
+        serial = ProbeSerialWithOffsets([fp](std::uint64_t offset, void* buf, std::size_t size) {
+            if (std::fseek(fp, static_cast<long>(offset), SEEK_SET) != 0) return false;
+            return std::fread(buf, 1, size, fp) == size;
         });
         std::fclose(fp);
     }
@@ -6525,6 +6870,55 @@ void Native::onPadRumble(int pad, int largeMotor, int smallMotor) {
                               static_cast<jint>(smallMotor));
 
     if (attached) s_jvm->DetachCurrentThread();
+}
+
+// Auto-tune has moved one setting into this game's settings file. The app regenerates that file from its own
+// copy of the per-game settings (config.game.<key>), wiping the keys it owns, so a value that is only in the file
+// would be gone the next time the app writes it. Hands the key to the app, which writes it into its copy.
+// Called on the CPU thread; the app does the work on its own thread, so this returns at once.
+static void AndroidOnAutoTuneCommitted(const char* section, const char* key, std::string_view value)
+{
+    // The resolution is the one lever the app's writer for the game's file does not emit (it keeps the resolution
+    // in the base layer, see renderUpscalemultiplier), so the next save from the app regenerates the file without
+    // the key and the base layer's older value would take over. Put the kept value there too. The emulator already
+    // runs at this value, so nothing is applied.
+    if (std::strcmp(section, "EmuCore/GS") == 0 && std::strcmp(key, "upscale_multiplier") == 0) {
+        if (const auto parsed = StringUtil::FromChars<float>(value); parsed.has_value())
+            Host::SetBaseFloatSettingValue(section, key, parsed.value());
+    }
+
+    if (!s_jvm || !s_NativeApp_class || !s_onAutoTuneCommitted_mid)
+        return;
+
+    JNIEnv* env = nullptr;
+    bool attached = false;
+    const int status = s_jvm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_6);
+    if (status == JNI_EDETACHED) {
+        if (s_jvm->AttachCurrentThread(&env, nullptr) != JNI_OK)
+            return;
+        attached = true;
+    } else if (status != JNI_OK) {
+        return;
+    }
+
+    const std::string serial = VMManager::GetDiscSerial();
+    const std::string value_str(value);
+    jstring jserial = env->NewStringUTF(serial.c_str());
+    jstring jsection = env->NewStringUTF(section);
+    jstring jkey = env->NewStringUTF(key);
+    jstring jvalue = env->NewStringUTF(value_str.c_str());
+    env->CallStaticVoidMethod(s_NativeApp_class, s_onAutoTuneCommitted_mid, jserial, jsection, jkey, jvalue);
+    if (env->ExceptionCheck()) {
+        env->ExceptionDescribe();
+        env->ExceptionClear();
+    }
+    env->DeleteLocalRef(jserial);
+    env->DeleteLocalRef(jsection);
+    env->DeleteLocalRef(jkey);
+    env->DeleteLocalRef(jvalue);
+
+    if (attached)
+        s_jvm->DetachCurrentThread();
 }
 
 // Android implementation of the cross-platform sound helper. Used by the

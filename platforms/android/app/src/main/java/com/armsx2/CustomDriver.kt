@@ -88,18 +88,69 @@ object CustomDriver {
      *  [MALISX2_SOURCE]'s `supports` widens both. */
     fun offersMaliSX2(renderer: String?): Boolean = MALISX2_SOURCE.supports(renderer)
 
+    // Our own Turnip: Mesa with the ARMSX2 driver patches, built as adrenotools packs.
+    // The emulator recognises these builds by the `(git-axfl<N>-…)` token in
+    // driverInfo and takes the barrier-less in-pass read road on Adreno 650 and up
+    // (6xx only) under one of them (GSGPUDriverProfile.cpp). Same GitHub-releases zip format as
+    // every source below; one release per pack, so the release name is the row title.
+    // Listed on every GPU; the first-run setup offers it on Adreno 6xx and 7xx only ([setupSource]).
+    private val ARMSX2_TURNIP_SOURCE = DriverSource(
+        "ARMSX2 · turnip",
+        "https://api.github.com/repos/bmdhacks/armsx2-turnip/releases",
+        "armsx2turnip",
+    )
+
+    /** Qualcomm's "A" marketing names, which some GL drivers report in GL_RENDERER instead of the
+     *  model number, and the model each one is. Only names identified on a device: the Anbernic
+     *  RG 55G1's "Adreno (TM) A12" is an Adreno 613 (its Vulkan deviceID 0x06010300 is the 613's
+     *  chip id, and Turnip names it 613). The emulator carries the same table (GSGPUProfileAdreno.cpp). */
+    private val ADRENO_MARKETING_MODELS = mapOf(12 to 613)
+    private val ADRENO_MARKETING_NAME = Regex("""Adreno[^A-Za-z0-9]*(?:TM[^A-Za-z0-9]*)?A(\d{1,2})(?!\d)""", RegexOption.IGNORE_CASE)
+
+    /** [renderer] with a listed marketing name replaced by its model number ("Adreno (TM) A12" ->
+     *  "Adreno (TM) 613"), so the model-number matches read it. Anything else comes back unchanged. */
+    internal fun withAdrenoModelNumber(renderer: String?): String? {
+        if (renderer == null) return null
+        val number = ADRENO_MARKETING_NAME.find(renderer)?.groups?.get(1) ?: return renderer
+        val model = ADRENO_MARKETING_MODELS[number.value.toInt()] ?: return renderer
+        // The "A" before the number goes too.
+        return renderer.replaceRange(number.range.first - 1, number.range.last + 1, model.toString())
+    }
+
+    /** Adreno 6xx and 7xx, the parts the armsx2-turnip releases say they are built for. Not 8xx:
+     *  Turnip's a8xx support is young and the driver list recommends a Qualcomm pack there.
+     *  GL_RENDERER reads like "Adreno (TM) 740", or a marketing name ([withAdrenoModelNumber]). */
+    private val ADRENO_6XX_7XX = Regex("""Adreno\D*([67]\d\d)(?!\d)""", RegexOption.IGNORE_CASE)
+    internal fun isAdreno6xxOr7xx(renderer: String?): Boolean {
+        val r = withAdrenoModelNumber(renderer) ?: return false
+        return ADRENO_6XX_7XX.containsMatchIn(r)
+    }
+
+    /** The source the first-run setup offers for [renderer]: ours for the GPU, or null when none of
+     *  our drivers is built for it (the system driver stays). The two predicates never overlap. */
+    private fun setupSource(renderer: String?): DriverSource? = when {
+        MALISX2_SOURCE.supports(renderer) -> MALISX2_SOURCE
+        isAdreno6xxOr7xx(renderer) -> ARMSX2_TURNIP_SOURCE
+        else -> null
+    }
+
+    /** Name of the source the first-run setup offers for [renderer] ("ARMSX2 · MaliSX2"), or null
+     *  when it offers nothing. Cheap and offline, so the setup can decide whether it has a driver
+     *  page before it asks the network anything. */
+    fun setupOfferLabel(renderer: String?): String? = setupSource(renderer)?.label
+
+    /** The newest pack of the source [setupOfferLabel] names, or null when there is none or the
+     *  release list can't be read. Blocks on the network: call it from Dispatchers.IO. GitHub lists
+     *  releases newest first, and a source's list order is kept. */
+    fun fetchSetupOffer(renderer: String?): RemoteDriver? {
+        val src = setupSource(renderer) ?: return null
+        return fetchSource(src, "ARMSX2/" + runCatching { NativeApp.getBuildVersion() }.getOrNull().orEmpty().ifEmpty { "dev" })
+            .firstOrNull()
+    }
+
     private val DRIVER_SOURCES = listOf(
         MALISX2_SOURCE,
-        // Our own Turnip: Mesa with the ARMSX2 driver patches, built as adrenotools packs.
-        // The emulator recognises these builds by the `(git-axfl<N>-…)` token in
-        // driverInfo and takes the barrier-less in-pass read road on Adreno 650 and up
-        // (6xx only) under one of them (GSGPUDriverProfile.cpp). Same GitHub-releases zip format as
-        // every source below; one release per pack, so the release name is the row title.
-        DriverSource(
-            "ARMSX2 · turnip",
-            "https://api.github.com/repos/bmdhacks/armsx2-turnip/releases",
-            "armsx2turnip",
-        ),
+        ARMSX2_TURNIP_SOURCE,
         DriverSource(
             "AdrenoToolsDrivers",
             "https://api.github.com/repos/K11MCH1/AdrenoToolsDrivers/releases",
@@ -217,6 +268,14 @@ object CustomDriver {
             )
         }.sortedBy { it.name.lowercase() }
     }
+
+    /** The driver a game actually runs with: its own pick if that is still installed, else the
+     *  global pick if that is, else null (the system driver). Deleting a driver leaves its id in
+     *  any per-game settings that chose it; those games follow the global driver until the user
+     *  picks again, rather than silently dropping to the system driver. Blank means system. */
+    fun effectiveId(gameId: String, globalId: String, installedIds: Collection<String>): String? =
+        gameId.takeIf { it.isNotBlank() && it in installedIds }
+            ?: globalId.takeIf { gameId.isNotBlank() && it.isNotBlank() && it in installedIds }
 
     /** Recursively remove an installed driver. */
     fun delete(installed: InstalledDriver) {

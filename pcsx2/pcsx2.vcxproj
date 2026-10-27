@@ -42,6 +42,7 @@
       <AdditionalIncludeDirectories>%(AdditionalIncludeDirectories);$(SolutionDir)3rdparty\cubeb\include</AdditionalIncludeDirectories>
       <AdditionalIncludeDirectories>%(AdditionalIncludeDirectories);$(SolutionDir)3rdparty\imgui\include</AdditionalIncludeDirectories>
       <AdditionalIncludeDirectories>%(AdditionalIncludeDirectories);$(SolutionDir)3rdparty\simpleini\include</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>%(AdditionalIncludeDirectories);$(SolutionDir)3rdparty\rapidjson\include</AdditionalIncludeDirectories>
       <AdditionalIncludeDirectories>%(AdditionalIncludeDirectories);$(SolutionDir)3rdparty\libzip\msvc;$(SolutionDir)3rdparty\libzip\lib</AdditionalIncludeDirectories>
       <AdditionalIncludeDirectories>%(AdditionalIncludeDirectories);$(SolutionDir)3rdparty\cpuinfo\include</AdditionalIncludeDirectories>
       <AdditionalIncludeDirectories>%(AdditionalIncludeDirectories);$(SolutionDir)3rdparty\fast_float\include</AdditionalIncludeDirectories>
@@ -202,6 +203,14 @@
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="Achievements.cpp" />
+    <ClCompile Include="Arcade\AcGameFile.cpp" />
+    <ClCompile Include="Arcade\ArcadeFiles.cpp" />
+    <ClCompile Include="Arcade\ArcadeInput.cpp" />
+    <ClCompile Include="Arcade\ArcadeSetup.cpp" />
+    <ClCompile Include="AutoTune\AutoTuneApplier.cpp" />
+    <ClCompile Include="AutoTune\AutoTuneController.cpp" />
+    <ClCompile Include="AutoTune\AutoTuneSampler.cpp" />
+    <ClCompile Include="AutoTune\AutoTuneStore.cpp" />
     <ClCompile Include="arm64\AsmHelpers.cpp">
       <ExcludedFromBuild Condition="'$(Platform)'!='ARM64'">true</ExcludedFromBuild>
     </ClCompile>
@@ -214,6 +223,27 @@
     <ClCompile Include="arm64\RecStubs.cpp">
       <ExcludedFromBuild Condition="'$(Platform)'!='ARM64'">true</ExcludedFromBuild>
     </ClCompile>
+    <ClCompile Include="Autosave.cpp" />
+    <ClCompile Include="Catalog\CoverAutoDownload.cpp" />
+    <ClCompile Include="Catalog\CoverDownloadJob.cpp" />
+    <ClCompile Include="Catalog\CoverSources.cpp" />
+    <ClCompile Include="Catalog\DriverPacks.cpp" />
+    <ClCompile Include="Catalog\FileUtil.cpp" />
+    <ClCompile Include="Catalog\HttpFetcher.cpp" />
+    <ClCompile Include="Catalog\HttpTransportWinHTTP.cpp" />
+    <ClCompile Include="Catalog\Json.cpp" />
+    <ClCompile Include="Catalog\LocalLinkSettings.cpp" />
+    <ClCompile Include="Catalog\PatchRepo.cpp" />
+    <ClCompile Include="Catalog\PnachText.cpp" />
+    <ClCompile Include="Catalog\ResponseCache.cpp" />
+    <ClCompile Include="Catalog\TarGz.cpp" />
+    <ClCompile Include="Catalog\TarZstdExtractor.cpp" />
+    <ClCompile Include="Catalog\TextureArchivePath.cpp" />
+    <ClCompile Include="Catalog\TexturePackCatalog.cpp" />
+    <ClCompile Include="Catalog\TexturePackEngine.cpp" />
+    <ClCompile Include="Catalog\TexturePackInstaller.cpp" />
+    <ClCompile Include="Catalog\TexturePackState.cpp" />
+    <ClCompile Include="Catalog\ZipTextureExtractor.cpp" />
     <ClCompile Include="CDVD\BlockdumpFileReader.cpp" />
     <ClCompile Include="CDVD\CDVDdiscReader.cpp" />
     <ClCompile Include="CDVD\CDVDdiscThread.cpp" />
@@ -352,10 +382,19 @@
     <ClCompile Include="Host\SDLAudioStream.cpp" />
     <ClCompile Include="Hotkeys.cpp" />
     <ClCompile Include="ImGui\FullscreenUI.cpp" />
+    <ClCompile Include="ImGui\FullscreenUI_Arcade.cpp" />
+    <ClCompile Include="ImGui\FullscreenUI_Drivers.cpp" />
+    <ClCompile Include="ImGui\FullscreenUI_OnlinePatches.cpp" />
+    <ClCompile Include="ImGui\FullscreenUI_Packs.cpp" />
+    <ClCompile Include="ImGui\FullscreenUI_Saves.cpp" />
     <ClCompile Include="ImGui\FullscreenUI_Settings.cpp" />
+    <ClCompile Include="ImGui\FullscreenUI_TexturePacks.cpp" />
+    <ClCompile Include="ImGui\FullscreenUIShot.cpp" />
     <ClCompile Include="ImGui\ImGuiFullscreen.cpp" />
+    <ClCompile Include="ImGui\ImGuiFullscreen_Keyboard.cpp" />
     <ClCompile Include="ImGui\ImGuiManager.cpp" />
     <ClCompile Include="ImGui\ImGuiOverlays.cpp" />
+    <ClCompile Include="ImGui\OnScreenKeyboardModel.cpp" />
     <ClCompile Include="INISettingsInterface.cpp" />
     <ClCompile Include="GameDatabase.cpp" />
     <ClCompile Include="Gif_Logger.cpp" />
@@ -389,6 +428,7 @@
     <ClCompile Include="Recording\InputRecordingFile.cpp" />
     <ClCompile Include="Recording\PadData.cpp" />
     <ClCompile Include="Recording\Utilities\InputRecordingLogger.cpp" />
+    <ClCompile Include="SIO\Memcard\MemcardBackup.cpp" />
     <ClCompile Include="SIO\Memcard\MemoryCardFile.cpp" />
     <ClCompile Include="SIO\Memcard\MemoryCardFolder.cpp" />
     <ClCompile Include="SIO\Memcard\MemoryCardProtocol.cpp" />
@@ -438,6 +478,7 @@
     <ClCompile Include="GS\GSCacheFile.cpp" />
     <ClCompile Include="GS\GSClut.cpp" />
     <ClCompile Include="GS\Renderers\Common\GSDevice.cpp" />
+    <ClCompile Include="GS\Renderers\Common\GSHeadlessPresent.cpp" />
     <ClCompile Include="GS\Renderers\DX11\GSDevice11.cpp" />
     <ClCompile Include="GS\Renderers\OpenGL\GSDeviceOGL.cpp">
       <ExcludedFromBuild Condition="'$(Platform)'=='ARM64'">true</ExcludedFromBuild>
@@ -450,6 +491,7 @@
       <ExcludedFromBuild Condition="'$(Platform)'!='x64'">true</ExcludedFromBuild>
     </ClCompile>
     <ClCompile Include="GS\GSDump.cpp" />
+    <ClCompile Include="GS\GSDumpBundle.cpp" />
     <ClCompile Include="GS\Renderers\Common\GSFunctionMap.cpp" />
     <ClCompile Include="GS\DriverReport\GSDriverReport.cpp" />
     <ClCompile Include="GS\DriverReport\GSDriverReportActive.cpp" />
@@ -546,6 +588,9 @@
     <ClCompile Include="ps2\BiosTools.cpp" />
     <ClCompile Include="BuildVersion.cpp" />
     <ClCompile Include="Counters.cpp" />
+    <ClCompile Include="EECycleRate.cpp" />
+    <ClCompile Include="EECycleRateController.cpp" />
+    <ClCompile Include="EECycleRateSampler.cpp" />
     <ClCompile Include="FiFo.cpp" />
     <ClCompile Include="Hw.cpp" />
     <ClCompile Include="HwRead.cpp" />
@@ -648,6 +693,11 @@
     <ClCompile Include="IopDma.cpp" />
     <ClCompile Include="IopIrq.cpp" />
     <ClCompile Include="IopMem.cpp" />
+    <ClCompile Include="IopThread\IopChannels.cpp" />
+    <ClCompile Include="IopThread\IopPlacement.cpp" />
+    <ClCompile Include="IopThread\IopThread.cpp" />
+    <ClCompile Include="IopThread\IopThreadMode.cpp" />
+    <ClCompile Include="IopThread\IopThreadVm.cpp" />
     <ClCompile Include="R3000A.cpp" />
     <ClCompile Include="R3000AInterpreter.cpp" />
     <ClCompile Include="R3000AOpcodeTables.cpp" />
@@ -707,12 +757,44 @@
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="Achievements.h" />
+    <ClInclude Include="Arcade\AcGameFile.h" />
+    <ClInclude Include="Arcade\ArcadeFiles.h" />
+    <ClInclude Include="Arcade\ArcadeInput.h" />
+    <ClInclude Include="Arcade\ArcadeSetup.h" />
+    <ClInclude Include="AutoTune\AutoTuneApplier.h" />
+    <ClInclude Include="AutoTune\AutoTuneController.h" />
+    <ClInclude Include="AutoTune\AutoTuneSampler.h" />
+    <ClInclude Include="AutoTune\AutoTuneStore.h" />
     <ClInclude Include="arm64\AsmHelpers.h">
       <ExcludedFromBuild Condition="'$(Platform)'!='ARM64'">true</ExcludedFromBuild>
     </ClInclude>
     <ClInclude Include="arm64\Vif_UnpackNEON.h">
       <ExcludedFromBuild Condition="'$(Platform)'!='ARM64'">true</ExcludedFromBuild>
     </ClInclude>
+    <ClInclude Include="Autosave.h" />
+    <ClInclude Include="Catalog\BlockingAnswer.h" />
+    <ClInclude Include="Catalog\CancelToken.h" />
+    <ClInclude Include="Catalog\CoverAutoDownload.h" />
+    <ClInclude Include="Catalog\CoverDownloadJob.h" />
+    <ClInclude Include="Catalog\CoverSources.h" />
+    <ClInclude Include="Catalog\DriverPacks.h" />
+    <ClInclude Include="Catalog\Fetch.h" />
+    <ClInclude Include="Catalog\FileOps.h" />
+    <ClInclude Include="Catalog\FileUtil.h" />
+    <ClInclude Include="Catalog\HttpFetcher.h" />
+    <ClInclude Include="Catalog\Json.h" />
+    <ClInclude Include="Catalog\LocalLinkSettings.h" />
+    <ClInclude Include="Catalog\PatchRepo.h" />
+    <ClInclude Include="Catalog\PnachText.h" />
+    <ClInclude Include="Catalog\ResponseCache.h" />
+    <ClInclude Include="Catalog\TarGz.h" />
+    <ClInclude Include="Catalog\TarZstdExtractor.h" />
+    <ClInclude Include="Catalog\TextureArchivePath.h" />
+    <ClInclude Include="Catalog\TexturePackCatalog.h" />
+    <ClInclude Include="Catalog\TexturePackEngine.h" />
+    <ClInclude Include="Catalog\TexturePackInstaller.h" />
+    <ClInclude Include="Catalog\TexturePackState.h" />
+    <ClInclude Include="Catalog\ZipTextureExtractor.h" />
     <ClInclude Include="CDVD\BlockdumpFileReader.h" />
     <ClInclude Include="CDVD\CDVDdiscReader.h" />
     <ClInclude Include="CDVD\CsoFileReader.h" />
@@ -843,10 +925,13 @@
     <ClInclude Include="Host\AudioStreamTypes.h" />
     <ClInclude Include="ImGui\FullscreenUI.h" />
     <ClInclude Include="ImGui\FullscreenUI_Internal.h" />
+    <ClInclude Include="ImGui\FullscreenUIShot.h" />
     <ClInclude Include="ImGui\ImGuiAnimated.h" />
     <ClInclude Include="ImGui\ImGuiFullscreen.h" />
+    <ClInclude Include="ImGui\ImGuiFullscreen_Keyboard.h" />
     <ClInclude Include="ImGui\ImGuiManager.h" />
     <ClInclude Include="ImGui\ImGuiOverlays.h" />
+    <ClInclude Include="ImGui\OnScreenKeyboardModel.h" />
     <ClInclude Include="INISettingsInterface.h" />
     <ClInclude Include="GameDatabase.h" />
     <ClInclude Include="Gif_Unit.h" />
@@ -883,6 +968,7 @@
     <ClInclude Include="Recording\PadData.h" />
     <ClInclude Include="Recording\Utilities\InputRecordingLogger.h" />
     <ClInclude Include="ShaderCacheVersion.h" />
+    <ClInclude Include="SIO\Memcard\MemcardBackup.h" />
     <ClInclude Include="SIO\Memcard\MemoryCardFile.h" />
     <ClInclude Include="SIO\Memcard\MemoryCardFolder.h" />
     <ClInclude Include="SIO\Memcard\MemoryCardProtocol.h" />
@@ -921,6 +1007,7 @@
     <ClInclude Include="GS\GSClut.h" />
     <ClInclude Include="GS\Renderers\Common\GSShaderEnums.h" />
     <ClInclude Include="GS\Renderers\Common\GSDevice.h" />
+    <ClInclude Include="GS\Renderers\Common\GSHeadlessPresent.h" />
     <ClInclude Include="GS\Renderers\DX11\GSDevice11.h" />
     <ClInclude Include="GS\Renderers\OpenGL\GSDeviceOGL.h">
       <ExcludedFromBuild Condition="'$(Platform)'=='ARM64'">true</ExcludedFromBuild>
@@ -936,6 +1023,7 @@
       <ExcludedFromBuild Condition="'$(Platform)'!='x64'">true</ExcludedFromBuild>
     </ClInclude>
     <ClInclude Include="GS\GSDump.h" />
+    <ClInclude Include="GS\GSDumpBundle.h" />
     <ClInclude Include="GS\Renderers\Common\GSFastList.h" />
     <ClInclude Include="GS\Renderers\Common\GSFunctionMap.h" />
     <ClInclude Include="GS\Renderers\Common\GSGPUProfile.h" />
@@ -987,6 +1075,8 @@
     <ClInclude Include="GS\Renderers\Common\GSVertex.h" />
     <ClInclude Include="GS\Renderers\HW\GSVertexHW.h" />
     <ClInclude Include="GS\Renderers\HW\GSAlphaKnownBits.h" />
+    <ClInclude Include="GS\Renderers\HW\GSExactDirtyMapping.h" />
+    <ClInclude Include="GS\Renderers\HW\GSTargetRebase.h" />
     <ClInclude Include="GS\Renderers\HW\GSDepthCoverage.h" />
     <ClInclude Include="GS\Renderers\HW\GSDrawAlphaMask.h" />
     <ClInclude Include="GS\Renderers\HW\GSDrawLog.h" />
@@ -998,6 +1088,7 @@
     <ClInclude Include="GS\Renderers\Common\GSVertexTrace.h" />
     <ClInclude Include="GS\Renderers\Common\GSFieldShiftDetector.h" />
     <ClInclude Include="GS\Renderers\Common\GSFieldShiftPolicy.h" />
+    <ClInclude Include="GS\Renderers\Common\GSBlendCarry.h" />
     <ClInclude Include="GS\Renderers\Common\GSBlendConstantPolicy.h" />
     <ClInclude Include="GS\Renderers\Common\GSBackThreadPolicy.h" />
     <ClInclude Include="GS\Renderers\Common\GSCopyRoadBlendingPolicy.h" />
@@ -1080,6 +1171,9 @@
     <ClInclude Include="SaveState.h" />
     <ClInclude Include="SaveStateLegacy.h" />
     <ClInclude Include="Counters.h" />
+    <ClInclude Include="EECycleRate.h" />
+    <ClInclude Include="EECycleRateController.h" />
+    <ClInclude Include="EECycleRateSampler.h" />
     <ClInclude Include="Dmac.h" />
     <ClInclude Include="Hardware.h" />
     <ClInclude Include="Hw.h" />
@@ -1119,6 +1213,15 @@
     <ClInclude Include="IopCounters.h" />
     <ClInclude Include="IopDma.h" />
     <ClInclude Include="IopMem.h" />
+    <ClInclude Include="IopThread\EeBridge.h" />
+    <ClInclude Include="IopThread\IopBridge.h" />
+    <ClInclude Include="IopThread\IopChannels.h" />
+    <ClInclude Include="IopThread\IopPlacement.h" />
+    <ClInclude Include="IopThread\IopThread.h" />
+    <ClInclude Include="IopThread\IopThreadMode.h" />
+    <ClInclude Include="IopThread\IopThreadVm.h" />
+    <ClInclude Include="IopThread\OwnerAsserts.h" />
+    <ClInclude Include="IopThread\SharedWord.h" />
     <ClInclude Include="R3000A.h" />
     <ClInclude Include="x86\iR3000A.h" />
     <ClInclude Include="IopHw.h" />

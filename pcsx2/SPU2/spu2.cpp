@@ -9,11 +9,16 @@
 #include "Host.h"
 #include "MTGS.h"
 #include "R3000A.h"
+#include "IopThread/IopThreadVm.h"
+#include "IopThread/OwnerAsserts.h"
 #include "Common.h"
 #include "common/ARCADE.h"
 #include "VMManager.h"
+#include "GS/GSRemotePlay.h"
 
 #include "common/Error.h"
+
+#include <atomic>
 
 #if defined(__aarch64__) || defined(_M_ARM64)
 #include "SPU2/spu2_neon.h"
@@ -41,6 +46,8 @@ static u32 s_current_chunk_pos;
 static u32 s_standard_volume = 0;
 static u32 s_fast_forward_volume = 0;
 
+static bool OutputShouldPause(bool vm_paused);
+
 float DCFilterIn[2], DCFilterOut[2];
 
 u32 SPU2::GetConsoleSampleRate()
@@ -56,6 +63,7 @@ u32 SPU2::GetConsoleSampleRate()
 
 void SPU2readDMA4Mem(u16* pMem, u32 size) // size now in 16bit units
 {
+	IOP_SIDE_ASSERT();
 	TimeUpdate(psxRegs.cycle);
 
 	SPU2::FileLog("[%10d] SPU2 readDMA4Mem size %x\n", Cycles, size << 1);
@@ -64,6 +72,7 @@ void SPU2readDMA4Mem(u16* pMem, u32 size) // size now in 16bit units
 
 void SPU2writeDMA4Mem(u16* pMem, u32 size) // size now in 16bit units
 {
+	IOP_SIDE_ASSERT();
 	TimeUpdate(psxRegs.cycle);
 
 	SPU2::FileLog("[%10d] SPU2 writeDMA4Mem size %x at address %x\n", Cycles, size << 1, Cores[0].TSA);
@@ -91,6 +100,7 @@ void SPU2interruptDMA7()
 
 void SPU2readDMA7Mem(u16* pMem, u32 size)
 {
+	IOP_SIDE_ASSERT();
 	TimeUpdate(psxRegs.cycle);
 
 	SPU2::FileLog("[%10d] SPU2 readDMA7Mem size %x\n", Cycles, size << 1);
@@ -99,6 +109,7 @@ void SPU2readDMA7Mem(u16* pMem, u32 size)
 
 void SPU2writeDMA7Mem(u16* pMem, u32 size)
 {
+	IOP_SIDE_ASSERT();
 	TimeUpdate(psxRegs.cycle);
 
 	SPU2::FileLog("[%10d] SPU2 writeDMA7Mem size %x at address %x\n", Cycles, size << 1, Cores[1].TSA);
@@ -113,6 +124,8 @@ AudioStream* SPU2::GetOutputStream()
 
 void SPU2::CreateOutputStream()
 {
+	// The stream the IOP thread writes is replaced: the CPU thread holds the IOP (IOP thread design 8.10).
+	IOP_SIDE_ASSERT();
 	// Initialize volume and mute settings on new session.
 	if (!s_output_stream)
 	{
@@ -141,7 +154,7 @@ void SPU2::CreateOutputStream()
 
 	SPU2::UpdateOutputVolume();
 	s_output_stream->SetNominalRate(GetNominalRate());
-	s_output_stream->SetPaused(VMManager::GetState() == VMState::Paused);
+	s_output_stream->SetPaused(OutputShouldPause(VMManager::GetState() == VMState::Paused));
 }
 
 void SPU2::UpdateSampleRate()
@@ -159,6 +172,9 @@ u32 SPU2::GetOutputVolume()
 
 void SPU2::SetOutputVolume(u32 volume)
 {
+	// The Android JNI setters call this from their own thread with no hold; the design leaves that race (8.10),
+	// and this assert reports it in a Devel build running Lockstep.
+	IOP_SIDE_ASSERT();
 	if (VMManager::GetTargetSpeed() == 1.0f)
 		s_standard_volume = volume;
 	else
@@ -176,6 +192,8 @@ float SPU2::GetNominalRate()
 
 bool SPU2::SetOutputMuted(const bool muted)
 {
+	// See SetOutputVolume.
+	IOP_SIDE_ASSERT();
 	// User setting takes precedence. Unmute not guaranteed by design.
 	if (!s_output_stream || (!muted && EmuConfig.SPU2.OutputMuted))
 		return false;
@@ -230,18 +248,46 @@ void SPU2::SaveOutputVolume()
 // it, and the recovery raced the resume so audio stayed dead until a manual
 // menu resume. When this is set, the pause/resume edges are skipped and the
 // stream is left running (silence-on-underrun) for the duration of the park.
-static bool s_output_pause_suppressed = false;
+static std::atomic<bool> s_output_pause_suppressed{false};
+
+// The app is not visible. Suppression keeps the device warm for a quick resume, but no one resumes
+// a game they cannot see, and a running stream keeps Android's audio mixer holding a wakelock: a
+// game paused behind the menu and the device locked went from 76% to 0% overnight (#825, #817).
+// While this is set, a paused VM pauses its output, suppressed or not.
+static std::atomic<bool> s_output_backgrounded{false};
+
+static bool OutputShouldPause(bool vm_paused)
+{
+	return vm_paused && (!s_output_pause_suppressed.load() || s_output_backgrounded.load());
+}
 
 void SPU2::SetOutputPaused(bool paused)
 {
-	if (s_output_pause_suppressed)
-		return;
-	s_output_stream->SetPaused(paused);
+	IOP_SIDE_ASSERT();
+	// Both edges follow the same rule. While suppressed in the foreground the stream stays
+	// running, so the resume edge finds it running and does nothing, as before. After the
+	// background has paused it, the resume edge starts it again.
+	s_output_stream->SetPaused(OutputShouldPause(paused));
 }
 
 void SPU2::SetOutputPauseSuppressed(bool suppressed)
 {
 	s_output_pause_suppressed = suppressed;
+}
+
+void SPU2::SetOutputBackgrounded(bool backgrounded)
+{
+	s_output_backgrounded = backgrounded;
+}
+
+void SPU2::UpdateOutputPaused()
+{
+	// Called on the CPU thread (the Android backgrounding hook posts it there), which touches the stream the IOP
+	// thread writes, so it holds the IOP itself: nothing else calls it.
+	IopThread::VmHold iop_hold(IopThread::HoldKind::Emulation);
+	const VMState state = VMManager::GetState();
+	if (s_output_stream && (state == VMState::Running || state == VMState::Paused))
+		s_output_stream->SetPaused(OutputShouldPause(state == VMState::Paused));
 }
 
 void SPU2::InternalReset(bool psxmode)
@@ -291,6 +337,7 @@ void SPU2::Reset(bool psxmode)
 
 void SPU2::OnTargetSpeedChanged()
 {
+	IOP_SIDE_ASSERT();
 	if (!s_output_stream)
 		return;
 
@@ -365,6 +412,7 @@ bool SPU2::IsRunningPSXMode()
 
 void SPU2::CheckForConfigChanges(const Pcsx2Config& old_config)
 {
+	IOP_SIDE_ASSERT();
 	const Pcsx2Config::SPU2Options& opts = EmuConfig.SPU2;
 	const Pcsx2Config::SPU2Options& old_opts = old_config.SPU2;
 
@@ -415,11 +463,14 @@ void SPU2::CheckForConfigChanges(const Pcsx2Config& old_config)
 
 void SPU2async()
 {
+	IOP_SIDE_ASSERT();
 	TimeUpdate(psxRegs.cycle);
 }
 
 u16 SPU2read(u32 rmem)
 {
+	IOP_SIDE_ASSERT();
+
 	u16 ret = 0xDEAD;
 	u32 core = 0;
 	const u32 mem = rmem & 0xFFFF;
@@ -472,6 +523,8 @@ u16 SPU2read(u32 rmem)
 
 void SPU2write(u32 rmem, u16 value)
 {
+	IOP_SIDE_ASSERT();
+
 	// Note: Reverb/Effects are very sensitive to having precise update timings.
 	// If the SPU2 isn't in in sync with the IOP, samples can end up playing at rather
 	// incorrect pitches and loop lengths.
@@ -561,6 +614,14 @@ __forceinline void spu2Output(StereoOut32 out)
 	if (s_current_chunk_pos == s_current_chunk.size())
 	{
 		s_current_chunk_pos = 0;
+
+		// Remote play: the same sound for the friend's device, which plays it at 48 kHz, so only at
+		// that rate (an arcade board's runs faster).
+		if (GSRemotePlay::g_audio_on.load(std::memory_order_relaxed) &&
+			SPU2::GetConsoleSampleRate() == GSRemotePlay::AUDIO_SAMPLE_RATE) [[unlikely]]
+		{
+			GSRemotePlay::PushAudio(s_current_chunk.data(), AudioStream::CHUNK_SIZE);
+		}
 
 		s_output_stream->WriteChunk(s_current_chunk.data());
 	}

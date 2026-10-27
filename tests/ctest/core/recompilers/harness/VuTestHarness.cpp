@@ -142,6 +142,12 @@ void VuTestHarness::SetVfBits(u32 reg_idx, u32 x, u32 y, u32 z, u32 w)
 	vf.i.x = x; vf.i.y = y; vf.i.z = z; vf.i.w = w;
 }
 
+void VuTestHarness::SetAccBits(u32 x, u32 y, u32 z, u32 w)
+{
+	auto& acc = Regs(vu_index_).ACC;
+	acc.i.x = x; acc.i.y = y; acc.i.z = z; acc.i.w = w;
+}
+
 void VuTestHarness::SetVi(u32 reg_idx, u32 value)
 {
 	if (reg_idx == 0) // VI[0] is hardwired zero
@@ -261,14 +267,19 @@ void VuTestHarness::SeedEntryState(bool reset_block_cache)
 	// Start at pair 0 (kProgramPc / 8 = 0). Stored as a pair index in
 	// REG_TPC; InterpVU<idx>::Execute will internally `<<= 3` it to a
 	// byte address before fetching from VU.Micro.
-	vu.VI[REG_TPC].UL = kProgramPc / 8u;
-	vu.start_pc = kProgramPc;
+	vu.VI[REG_TPC].UL = start_pc_ / 8u;
+	vu.start_pc = start_pc_;
 
 	// Mark VU<idx> as "running" so Execute's loop predicate fires. The
 	// running-bit lives in VU0.VI[REG_VPU_STAT] for *both* VUs (bit 0x1
 	// for VU0, bit 0x100 for VU1) — always poke VU0's copy here, then
 	// also stamp the local instance for snapshot consistency on VU1.
-	vuRegs[0].VI[REG_VPU_STAT].UL = (vuRegs[0].VI[REG_VPU_STAT].UL & ~0xFFFu) | RunningBit(vu_index_);
+	// Bit 12 is the interpreter's XGKICK-in-flight bit (set by _vuXGKICK,
+	// cleared when the transfer ends; microVU never writes it). It goes with
+	// the low bits: a run stopped by a cycle budget mid-kick leaves it set in
+	// VU0's copy, and the next run would start from it and keep it.
+	constexpr u32 kXgkickInFlight = 1u << 12;
+	vuRegs[0].VI[REG_VPU_STAT].UL = (vuRegs[0].VI[REG_VPU_STAT].UL & ~(0xFFFu | kXgkickInFlight)) | RunningBit(vu_index_);
 	vu.VI[REG_VPU_STAT].UL = vuRegs[0].VI[REG_VPU_STAT].UL;
 
 	// Cycle counter / pipeline state — start fresh so the first test in
@@ -287,8 +298,8 @@ void VuTestHarness::SeedEntryState(bool reset_block_cache)
 	std::memset(&vu.fmac, 0, sizeof(vu.fmac));
 	std::memset(&vu.ialu, 0, sizeof(vu.ialu));
 
-	InterpCpu(vu_index_)->SetStartPC(kProgramPc);
-	JitCpu(vu_index_)->SetStartPC(kProgramPc);
+	InterpCpu(vu_index_)->SetStartPC(start_pc_);
+	JitCpu(vu_index_)->SetStartPC(start_pc_);
 
 	// Drop any compiled block left by a prior test. mVUreset re-emits the
 	// dispatcher and zeroes mVU.prog.lpState — cheapest correct invalidation.
@@ -305,19 +316,19 @@ void VuTestHarness::ResumeUntilTerminated()
 
 void VuTestHarness::ExecuteEngine(BaseVUmicroCPU* cpu)
 {
-	cpu->Execute(kCycleBudget);
+	cpu->Execute(cycle_budget_);
 	if (!resume_until_terminated_)
 		return;
 
 	int resumes = 0;
 	while (!HasTerminated() && resumes < kMaxResumes)
 	{
-		cpu->Execute(kCycleBudget);
+		cpu->Execute(cycle_budget_);
 		++resumes;
 	}
 	EXPECT_TRUE(HasTerminated())
 		<< "VU" << vu_index_ << " was still running after " << kMaxResumes
-		<< " re-entries of " << kCycleBudget << " cycles";
+		<< " re-entries of " << cycle_budget_ << " cycles";
 }
 
 void VuTestHarness::RunInterpFromSeeded()
@@ -468,6 +479,19 @@ void VuTestHarness::RunJitPreserveBlockCache()
 	jit_snapshot_ = VuSnapshot::Capture(vu_index_, mem_windows_);
 	path1_packets_jit_ = path1_packets_;
 
+	FPControlRegister::SetCurrent(saved_fpcr);
+}
+
+void VuTestHarness::ContinueJit(u32 budget, int max_resumes)
+{
+	ASSERT_TRUE(has_run_) << "ContinueJit() continues a JIT run: call RunNoDiff() and RunJitPreserveBlockCache() first";
+	const FPControlRegister saved_fpcr = FPControlRegister::GetCurrent();
+	FPControlRegister::SetCurrent((vu_index_ == 0) ? EmuConfig.Cpu.VU0FPCR : EmuConfig.Cpu.VU1FPCR);
+	path1_packets_ = path1_packets_jit_; // (the sink appends)
+	for (int n = 0; n < max_resumes && !HasTerminated(); n++)
+		JitCpu(vu_index_)->Execute(budget);
+	jit_snapshot_ = VuSnapshot::Capture(vu_index_, mem_windows_);
+	path1_packets_jit_ = path1_packets_;
 	FPControlRegister::SetCurrent(saved_fpcr);
 }
 

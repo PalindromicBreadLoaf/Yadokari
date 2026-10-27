@@ -486,6 +486,33 @@ public class NativeApp {
 	/** Re-read the running game's INI into the core's game layer after rewriting it, so the
 	 *  commit that follows applies what the file says now. Applies nothing itself. */
 	public static native void reloadGameSettingsLayer();
+
+	/** What auto-tune changed for a game, one readable line each, then the steps it tried without
+	 *  benefit. Empty when it changed nothing. [serial] names the game: the running one, else the
+	 *  one settings file on disk for that serial (blank = the running game). */
+	public static native String[] autoTuneDescribe(String serial);
+	/** Puts back what auto-tune changed in the game's settings file and forgets what it learned
+	 *  (applied on the CPU thread when the game is running). Returns null when the game has no
+	 *  file, else {hadRecord "1"/"0"} followed by kind, section, key, value for each key the record
+	 *  named. Kind "restored": put back, the value is what the file holds again (null: the key was
+	 *  deleted). Kind "absent": left alone because the key is not in the file, the value is what
+	 *  auto-tune wrote. Kind "changed": left alone because the file holds another value, the value
+	 *  is what auto-tune wrote. The app must do the same to its own copy of the game's settings
+	 *  (AutoTuneStore.applyReset). */
+	public static native String[] autoTuneReset(String serial);
+
+	/** Called from native (the CPU thread) after auto-tune moved one setting into the game's
+	 *  settings file. [serial] is the running disc's serial, empty for homebrew. The app keeps its
+	 *  own copy of per-game settings and regenerates the file from it, so the value is written into
+	 *  that copy (AutoTuneStore.onCommitted). Nothing may escape: native makes no exception check
+	 *  beyond clearing one. */
+	public static void onAutoTuneCommitted(String serial, String section, String key, String value) {
+		try {
+			com.armsx2.config.AutoTuneStore.INSTANCE.onCommitted(serial, section, key, value);
+		} catch (Throwable t) {
+			android.util.Log.e("ARMSX2", "onAutoTuneCommitted failed: " + section + "/" + key, t);
+		}
+	}
 	/** What the game database sets for a serial: one line per setting a per-game key can claim,
 	 *  "name TAB value TAB flags TAB section/key|section/key". See GameDbOverrides. */
 	public static native String getGameDbEntries(String serial);
@@ -553,7 +580,41 @@ public class NativeApp {
 	 *  back to the last-used gamepad when the port isn't claimed yet (single-player,
 	 *  or before first input) — solo play is unchanged. No-op with no vibrator. */
 	public static void onPadRumble(int pad, int largeMotor, int smallMotor) {
+		// Remote play: player 2 is on a friend's device, so player 2's rumble goes there and not to
+		// a controller here, whatever this device's vibration setting (the friend's applies there).
+		if (pad == 1 && sRemotePlayer2) {
+			sRemotePlayer2Rumble = (Math.max(0, Math.min(255, largeMotor)) << 8) | Math.max(0, Math.min(255, smallMotor));
+			return;
+		}
 		if (!sRumbleEnabled) return;
+		// Native calls this with no exception check (Native::onPadRumble), so nothing may escape:
+		// a throw would leave the IOP thread with a pending exception, which aborts the app at
+		// its next JNI call.
+		try {
+			rumblePlayer(pad, largeMotor, smallMotor);
+		} catch (Throwable ignored) {
+		}
+	}
+
+	// Remote play, host: set while a friend plays as player 2 over a stream (RemotePlayHost), and that
+	// player's motors as the game last set them, (large << 8) | small, read every 30 ms and sent on.
+	public static volatile boolean sRemotePlayer2 = false;
+	public static volatile int sRemotePlayer2Rumble = 0;
+
+	/** Remote play, viewer: runs this device's motors as the host's game asks, on the controller in use
+	 *  ([deviceId], -1 for none yet) or else the handheld's own motor, with this device's vibration
+	 *  settings. 0, 0 stops them. Main thread. */
+	public static void playRemoteRumble(int deviceId, int largeMotor, int smallMotor) {
+		if (!sRumbleEnabled && (largeMotor > 0 || smallMotor > 0)) return;
+		try {
+			float low = Math.max(0f, Math.min(1f, largeMotor / 255f));
+			float high = Math.max(0f, Math.min(1f, smallMotor / 255f));
+			vibrateDevice(deviceId >= 0 ? deviceId : sRumbleDeviceId, low, high, RUMBLE_MS, true);
+		} catch (Throwable ignored) {
+		}
+	}
+
+	private static void rumblePlayer(int pad, int largeMotor, int smallMotor) {
 		int devId = com.armsx2.input.PadRouter.INSTANCE.deviceIdForPort(pad);
 		// Nothing has claimed this slot yet: deal out the pads nobody has spoken for, rather
 		// than guessing. "The pad you last touched" names the SAME controller for every port,
@@ -570,7 +631,18 @@ public class NativeApp {
 		if (devId < 0 && pad != touchPad) return;
 		float low = Math.max(0f, Math.min(1f, largeMotor / 255f));   // low-frequency / large
 		float high = Math.max(0f, Math.min(1f, smallMotor / 255f));  // high-frequency / small
-		vibrateDevice(devId, low, high, RUMBLE_MS, pad == touchPad);
+		vibratePlayer(pad, devId, low, high, RUMBLE_MS, pad == touchPad);
+	}
+
+	/** [devId] and every other controller playing as [port] (PadRouter.otherDevicesForPort): a
+	 *  handheld's own controls and a pad for the TV can both be player 1, and both should feel
+	 *  it. Each goes where its own rumble setting says. The handheld's own motor, which several
+	 *  of them can fall back to, is driven once. */
+	private static void vibratePlayer(int port, int devId, float low, float high, int ms, boolean allowSystemFallback) {
+		boolean handheld = vibrateDevice(devId, low, high, ms, allowSystemFallback);
+		for (int other : com.armsx2.input.PadRouter.INSTANCE.otherDevicesForPort(port, devId)) {
+			handheld |= vibrateDevice(other, low, high, ms, allowSystemFallback && !handheld);
+		}
 	}
 
 	// ---- Achievement / notification sound playback ----
@@ -630,8 +702,9 @@ public class NativeApp {
 	/** Drive [devId]'s vibrator(s) with the PS2 large/high motor intensities for [ms].
 	 *  When the controller exposes no usable vibrator and [allowSystemFallback] is set,
 	 *  drive the device's own haptic motor instead (issue #241 — handhelds like the
-	 *  Odin 3 whose built-in gamepad has no rumble actuator, only system haptics). */
-	private static void vibrateDevice(int devId, float low, float high, int ms, boolean allowSystemFallback) {
+	 *  Odin 3 whose built-in gamepad has no rumble actuator, only system haptics).
+	 *  @return true when it drove the device's own haptic motor. */
+	private static boolean vibrateDevice(int devId, float low, float high, int ms, boolean allowSystemFallback) {
 		try {
 			InputDevice dev = (devId >= 0) ? InputDevice.getDevice(devId) : null;
 
@@ -642,7 +715,7 @@ public class NativeApp {
 			// player's rumble somewhere else" has to be sayable by hand.
 			com.armsx2.input.PadRouter.RumbleMode mode =
 				com.armsx2.input.PadRouter.INSTANCE.rumbleModeForDevice(devId);
-			if (mode == com.armsx2.input.PadRouter.RumbleMode.OFF) return;
+			if (mode == com.armsx2.input.PadRouter.RumbleMode.OFF) return false;
 			boolean forceDevice = mode == com.armsx2.input.PadRouter.RumbleMode.DEVICE;
 
 			// Single combined motor can't reproduce both PS2 actuators, so blend
@@ -664,7 +737,7 @@ public class NativeApp {
 					float scale = (Float.isFinite(sHapticScale) && sHapticScale >= 0f) ? sHapticScale : 1f;
 					int l = Math.round(Math.min(1f, low * scale) * 255f);
 					int h = Math.round(Math.min(1f, high * scale) * 255f);
-					if (usb.rumble(Math.max(0, l), Math.max(0, h))) return;
+					if (usb.rumble(Math.max(0, l), Math.max(0, h))) return false;
 				}
 				drove = driveMotors(motorsOf(dev), low, high, combined, ms);
 			}
@@ -682,10 +755,11 @@ public class NativeApp {
 			// object and buzzing it is exactly right.
 			if (!drove && allowSystemFallback
 				&& (forceDevice || sRumbleFallbackExternal || !isExternalPad(dev))) {
-				rumbleOne(systemVibrator(), combined, ms);
+				return rumbleOne(systemVibrator(), combined, ms);
 			}
 		} catch (Throwable ignored) {
 		}
+		return false;
 	}
 
 	/**
@@ -853,7 +927,7 @@ public class NativeApp {
 		if (devId < 0) devId = nthGamepadDeviceId(port);
 		// devId may stay -1 (touch-only / Odin built-in with no rumble); vibrateDevice
 		// then falls back to the device's own haptic so the test still buzzes (issue #241).
-		vibrateDevice(devId, 0.9f, 0.9f, 500, true);
+		vibratePlayer(port, devId, 0.9f, 0.9f, 500, true);
 	}
 
 	/** One-line report of [port]'s controller and whether Android exposes any vibrator
@@ -972,8 +1046,32 @@ public class NativeApp {
 	// resume rebuild). Set true right before pauseForOverlay's pause(); resume()
 	// clears it. See native setOutputPauseSuppressed / SPU2::SetOutputPauseSuppressed.
 	public static native void setOutputPauseSuppressed(boolean suppressed);
+	// From the activity's onStop (true) and onStart (false). Out of sight, a paused game lets go of
+	// the audio device even across an overlay pause, and the paused CPU thread stops polling.
+	public static native void setAppBackgrounded(boolean backgrounded);
 	public static native void shutdown();
 	public static native boolean hasActiveVM();
+
+	// ---- Remote play (com.armsx2.remoteplay; core side in cpp/remote_play.cpp) ----
+	// The running game's frames and sound for the stream to a friend's device, pulled by the app's
+	// streaming threads (RemotePlayFrames, RemotePlayHost) so nothing calls into Java from the GS or
+	// SPU2 threads. Same calls and meanings as ARMSX3's, which the streaming code was written against.
+	public static native boolean remotePlayStart(int maxWidth, int maxHeight);
+	public static native void remotePlayStop();
+	public static native int remotePlayPollVideo(java.nio.ByteBuffer buffer, int[] info, int timeoutMs);
+	public static native int remotePlayPollAudio(java.nio.ByteBuffer buffer, int capFrames, int timeoutMs);
+	public static native boolean remotePlayCounters(int[] out);
+	public static native long remotePlayImportFrame(int slot, int texture);
+	public static native void remotePlayDestroyImage(long image);
+	public static native void remotePlayReleaseFrame(int slot, int seq);
+	public static native void remotePlaySetHardware(boolean enabled);
+	/** Whether the game is paused, for the viewer's "your friend paused the game". */
+	public static native boolean remotePlayPaused();
+	// The host's router, asked to let the friend in for the session (UPnP): this device's address on
+	// the router's network or null, then the router's public "address:port" for a local UDP port or null.
+	public static native String remotePlayUpnpPrepare();
+	public static native String remotePlayUpnpMap(int internalPort, int externalHint, int leaseSeconds);
+	public static native void remotePlayUpnpUnmap(int externalPort);
 
 	/** Persist the Vulkan pipeline cache to disk so cold restarts don't have
 	 *  to recompile every TFX pipeline. No-op for OpenGL (its cache flushes
@@ -1011,8 +1109,10 @@ public class NativeApp {
 	/**
 	 * Read enough of a PS2 disc image to extract its serial (e.g.
 	 * "SLUS-20312"). Walks the ISO9660 directory to find SYSTEM.CNF and
-	 * parses the BOOT2 line. Handles flat ISO/raw-sector images and CHDs;
-	 * CSO/ZSO/GZ still return null and the caller falls back to filename
+	 * parses the BOOT2 line. Handles flat ISO/raw-sector images, CHDs and
+	 * gzip images; gzip has no random access, so reaching a SYSTEM.CNF far
+	 * into the image inflates everything before it and can take seconds.
+	 * CSO/ZSO still return null and the caller falls back to filename
 	 * parsing. fd is consumed (closed by native).
 	 */
 	public static native String getGameSerialFromFd(int fd);
@@ -1043,6 +1143,8 @@ public class NativeApp {
 	 *  the card. The counter only ticks down while the VM runs, so it does NOT clear while paused. */
 	public static native boolean isMemcardBusy();
 	public static native boolean loadStateFromSlot(int slot);
+	/** 1 = loaded, 0 = transient refusal (retry), -1 = permanent failure. */
+	public static native int loadStateFromFile(String path);
 	public static native String getGamePathSlot(int slot);
 	public static native byte[] getImageSlot(int slot);
 	public static native byte[] getSaveStateImage(String path);

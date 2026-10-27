@@ -153,6 +153,7 @@ namespace FullscreenUI
 		PauseMenu,
 		Achievements,
 		Leaderboards,
+		MemcardBackups,
 	};
 
 	enum class PauseSubMenu
@@ -160,6 +161,7 @@ namespace FullscreenUI
 		None,
 		Exit,
 		Achievements,
+		Arcade,
 	};
 
 	enum class SettingsPage
@@ -181,6 +183,9 @@ namespace FullscreenUI
 		Patches,
 		Cheats,
 		GameFixes,
+		Drivers,
+		Arcade,
+		TexturePacks,
 		Count
 	};
 
@@ -233,6 +238,7 @@ namespace FullscreenUI
 	inline MainWindowType s_current_main_window = MainWindowType::None;
 	inline PauseSubMenu s_current_pause_submenu = PauseSubMenu::None;
 	inline u32 s_setup_wizard_step = 0;
+	inline bool s_setup_offer_driver = false; ///< the first-run setup has a GPU Driver step (decided when it opens)
 	inline bool s_initialized = false;
 	inline bool s_tried_to_initialize = false;
 	inline bool s_pause_menu_was_open = false;
@@ -431,10 +437,15 @@ namespace FullscreenUI
 	SettingsInterface* GetEditingSettingsInterface(bool game_settings);
 	bool ShouldShowAdvancedSettings(SettingsInterface* bsi);
 	void SetSettingsChanged(SettingsInterface* bsi);
+	/// A settings row wrote or removed `section`/`key` in `bsi`. As above, and when `bsi` is a game's own settings and the key is one
+	/// auto-tune moves, auto-tune is turned off for that game: the player just chose that value (AutoTune::DisableForManualChange).
+	void SetSettingsChanged(SettingsInterface* bsi, const char* section, const char* key);
 	bool GetEffectiveBoolSetting(SettingsInterface* bsi, const char* section, const char* key, bool default_value);
 	s32 GetEffectiveIntSetting(SettingsInterface* bsi, const char* section, const char* key, s32 default_value);
 	void DoCopyGameSettings();
 	void DoClearGameSettings();
+	void RefreshGameAutoTuneLines();
+	void DoResetGameAutoTune();
 	void ResetControllerSettings();
 	void DoLoadInputProfile();
 	void DoSaveInputProfile();
@@ -516,6 +527,10 @@ namespace FullscreenUI
 	// Whose settings are being edited. Kept beside the interface rather than read off
 	// the entry, which is null when an ELF is what opened the page. Empty for those.
 	inline std::string s_game_settings_serial;
+	inline u32 s_game_settings_crc = 0;
+	// What auto-tune changed for the game being edited, one line each (AutoTune::DescribeForGame). Read when the page
+	// opens and after a reset, not every frame.
+	inline std::vector<std::string> s_game_autotune_lines;
 	inline std::vector<std::pair<std::string, bool>> s_game_list_directories_cache;
 	inline std::vector<GSAdapterInfo> s_graphics_adapter_list_cache;
 	inline std::vector<Patch::PatchInfo> s_game_patch_list;
@@ -534,5 +549,105 @@ namespace FullscreenUI
 	inline std::vector<std::pair<InputBindingKey, std::pair<float, float>>> s_input_binding_value_ranges;
 	inline Common::Timer s_input_binding_timer;
 	inline bool s_prefer_english_titles;
+
+	//////////////////////////////////////////////////////////////////////////
+	// Features ported from the Android app (FullscreenUI_Packs.cpp)
+	//////////////////////////////////////////////////////////////////////////
+	void DrawTextureUpscaleSetting(SettingsInterface* bsi);
+	/// Draws the Local Link rows when `api` (the EthApi setting) selects it; returns true if it did.
+	bool DrawLocalLinkSettings(SettingsInterface* bsi, const std::string& api, bool network_enabled);
+	void LocalLinkApiSelected(SettingsInterface* bsi, const std::string& api);
+	void DrawAutoCoverSettings(SettingsInterface* bsi);
+	void DrawCoverRegionPinSetting(const GameList::Entry& entry);
+	/// Once per frame: starts the automatic cover download after the game list has settled.
+	void PollAutoCovers();
+	void ShutdownAutoCovers();
+
+	//////////////////////////////////////////////////////////////////////////
+	// Memory card backups and autosaves (FullscreenUI_Saves.cpp)
+	//////////////////////////////////////////////////////////////////////////
+	/// Memory card page: the Automatic Backups toggle and the row that opens the backups window.
+	void DrawMemcardBackupSettings(SettingsInterface* bsi);
+	void OpenMemcardBackupsWindow();
+	/// MainWindowType::MemcardBackups.
+	void DrawMemcardBackupsWindow();
+	/// While Big Picture is initialised it answers the boot-time "restore this card?" question
+	/// (as the fallback; the host's own handler wins). ShutdownSavesUI() withdraws it and stops the
+	/// backup window's worker.
+	void RegisterMemcardRestorePrompt();
+	void ShutdownSavesUI();
+	/// Opens the restore question with a sample card and no effect, for the screenshot harness.
+	void OpenMemcardPromptPreview();
+	/// Interface page, after "Create Save State Backups": autosave interval, count to keep, on shutdown.
+	void DrawAutosaveSettings(SettingsInterface* bsi);
+	/// Load State selector: adds the game's autosaves after its numbered slots. Load only.
+	void AppendAutosaveListEntries(const std::string& serial, u32 crc);
+	/// True for the slot numbers AppendAutosaveListEntries gives its tiles.
+	bool IsAutosaveSlot(s32 slot);
+
+	// GPU driver packs (FullscreenUI_Drivers.cpp)
+	/// Whether the page is listed: driver packs exist here (desktop Linux with an Adreno GPU), or one is installed or
+	/// selected, so the choice can still be undone. Reads the selection, so the settings lock must not be held.
+	// First-run setup's GPU Driver step. The step draws without the settings lock.
+	bool ShouldOfferDriverInSetup();
+	void DrawDriverSetupStep();
+	bool IsDriverSetupInstalling();
+	bool IsDriverSetupInstalled();
+	/// Selects the pack the step installed. True if it did, which means the caller restarts so it loads. Takes
+	/// the settings lock.
+	bool FinishDriverSetup();
+	void RestartForDriverSetup();
+
+	bool ShowDriversSettingsPage();
+	void DrawDriversSettingsPage(SettingsInterface* bsi);
+	/// Cancels the page's downloads and joins its threads.
+	void ShutdownDriversPage();
+
+	// Arcade, Namco System 246/256 (FullscreenUI_Arcade.cpp)
+	//////////////////////////////////////////////////////////////////////////
+	/// The global "Arcade Setup" settings page: boot files, arcade BIOS, the button layout for every arcade game.
+	void DrawArcadeSettingsPage();
+	/// An "Arcade" section on the Summary page of one game's settings: what it lacks, its own button layout.
+	void DrawArcadeGameSettings(const GameList::Entry& entry);
+	/// Starts an arcade game (an .acgame, or a loose image) through ArcadeSetup::Service::Prepare(), or shows what it
+	/// lacks. False when `path` is not an arcade game, which the caller starts as it always did. `save_state` is the
+	/// path of a state to load once the game has booted.
+	bool StartArcadePath(const std::string& path, std::optional<s32> state_index, std::optional<bool> fast_boot, std::string save_state = {});
+	/// An arcade game is running.
+	bool IsArcadeSessionActive();
+	/// The pause menu's own entry for the Arcade submenu (nothing while no arcade game runs), how many rows it adds
+	/// to `submenu`, and the submenu itself with the ids of its first and last row for the wrap-around.
+	void DrawArcadePauseMenuEntry();
+	u32 GetArcadePauseMenuItemCount(PauseSubMenu submenu);
+	void GetArcadePauseWrapIds(ImGuiID* first, ImGuiID* last);
+	void DrawArcadePauseSubMenu(bool just_focused);
+	/// Once per frame: lets go of the Service button a moment after the pause menu pressed it.
+	void PollArcade();
+	void ShutdownArcade();
+	/// Screenshot harness (FullscreenUIShot.cpp): "arcade<what>" pages, for the states a page name cannot reach.
+	bool ShotArcade(std::string_view what, std::string* error);
+	std::string ShotArcadeNames();
+
+	// Online patches and cheats (FullscreenUI_OnlinePatches.cpp)
+	//////////////////////////////////////////////////////////////////////////
+	/// The "Browse Online" row of the per-game Patches (`cheats` false) and Cheats pages.
+	void DrawOnlinePatchesRow(bool cheats);
+	/// What pressing that row does: searches, or reopens the results already found for this game.
+	void BrowseOnlinePatches(bool cheats);
+	/// Once per frame: the results popup, while one is open.
+	void DrawOnlinePatchesResults();
+	void ShutdownOnlinePatches();
+
+	// Texture packs (FullscreenUI_TexturePacks.cpp)
+	//////////////////////////////////////////////////////////////////////////
+	/// The Texture Packs settings page: the online catalog, pack details, installing and installed packs.
+	void DrawTexturePacksSettingsPage();
+	/// "Browse Texture Packs" row for the Texture Replacement section of the Graphics page; opens the page
+	/// for every game, or for the game whose settings are being edited.
+	void DrawTexturePacksBrowseSetting(SettingsInterface* bsi);
+	void ShutdownTexturePacks();
+	/// Screenshot harness: opens the page in a named state; false, with `error`, if the state is unknown.
+	bool OpenTexturePacksForShot(std::string_view variant, std::string* error);
+	std::string TexturePacksShotVariants();
 
 } // namespace FullscreenUI

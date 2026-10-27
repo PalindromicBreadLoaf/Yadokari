@@ -7,12 +7,18 @@
 #include "GS/Renderers/Common/GSFastList.h"
 #include "GS/Renderers/Common/GSDirtyRect.h"
 #include "GS/Renderers/HW/GSAlphaKnownBits.h"
+#include "GS/Renderers/HW/GSExactDirtyMapping.h"
 
 #include <array>
 #include <deque>
 #include <unordered_set>
 #include <utility>
 #include <limits>
+
+namespace GSTargetRebase
+{
+struct Plan;
+}
 
 class GSHwHack;
 
@@ -112,7 +118,12 @@ public:
 
 		HashCacheKey();
 
-		static HashCacheKey Create(const GIFRegTEX0& TEX0, const GIFRegTEXA& TEXA, const u32* clut, const GSVector2i* lod, SourceRegion region);
+		/// `raw_blocks` lets a paletted window (T8, T4, T8H, T4HL, T4HH) that is at least one block in each
+		/// direction be hashed from the bytes of its blocks as they sit in local memory, instead of from the
+		/// texels they unswizzle to. Two windows with the same raw key have the same texels, so it is as good
+		/// a cache key, and it needs no unswizzle. It is not the texel hash, which names texture pack files
+		/// and upscaler results, so a lookup for those passes false and gets the texel hash.
+		static HashCacheKey Create(const GIFRegTEX0& TEX0, const GIFRegTEXA& TEXA, const u32* clut, const GSVector2i* lod, SourceRegion region, bool raw_blocks);
 
 		HashCacheKey WithRemovedCLUTHash() const;
 		void RemoveCLUTHash();
@@ -162,6 +173,29 @@ public:
 		u64 mismatches = 0; ///< Of those, how many differed.
 		u64 sweeps = 0; ///< Frame boundaries at which the pages of local memory were hashed.
 		u64 missed_writers = 0; ///< Pages whose bytes changed between two sweeps with no mark in between.
+	};
+
+	/// A 64-bit hash for each 256-byte block of local memory, kept valid by the hash-dirty bitmap of
+	/// GSLocalMemory (see HashCacheKey::Create). Defined in the .cpp.
+	struct BlockHashCache;
+
+	/// What the block hash cache did, over every cache of the process.
+	struct BlockHashStats
+	{
+		u64 levels = 0; ///< Texture levels keyed through the cache.
+		u64 blocks = 0; ///< Blocks of those levels.
+		u64 rehashed = 0; ///< Of those, how many had to be hashed (their hash-dirty bit was set), or were masked H-format blocks.
+	};
+
+	/// What -verify-block-hash found. Totals over every cache of the process.
+	struct BlockHashVerifyReport
+	{
+		u64 levels = 0; ///< Levels whose cached block hashes were each compared with a fresh hash.
+		u64 blocks = 0; ///< Blocks compared.
+		u64 stale_blocks = 0; ///< Of those, how many cached hashes differed: a store into local memory that was not marked.
+		u64 lookups = 0; ///< Keys whose cached form was compared with the form without the cache.
+		u64 extra_misses = 0; ///< Lookups where two windows had one key without the cache and two with it: a hit lost.
+		u64 false_hits = 0; ///< Lookups where two windows had one key with the cache and two without it: a wrong texture.
 	};
 
 	class Surface : public GSAlignedClass<32>
@@ -293,6 +327,12 @@ public:
 		bool m_used = false;
 		float OffsetHack_modxy = 0.0f;
 		GSDirtyRectList m_dirty;
+		/// Rectangles AddDirtyRectTarget has pushed onto m_dirty, and the count FullRectDirtyByUnion last
+		/// tested the list at: the list gets one union test per change, not one per call.
+		u32 m_dirty_adds = 0;
+		u32 m_dirty_cover_checked = 0;
+		/// A pixel the last union test found in none of the rectangles; tried first by the next one.
+		GSVector2i m_dirty_hole = GSVector2i(-1, -1);
 		GSVector4i m_valid{};
 		GSVector4i m_drawn_since_read{};
 		int readbacks_since_draw = 0;
@@ -509,6 +549,8 @@ protected:
 		u64 region; ///< SourceRegion::bits of the base level.
 		u64 tex0[HASH_MEMO_MAX_LEVELS]; ///< Per level, the TEX0 bits the hash reads.
 		u32 levels; ///< Number of levels hashed. 0 in an empty entry.
+		bool raw_blocks; ///< The hash was allowed to read raw blocks (HashCacheKey::Create), which is a different hash.
+		bool block_hash_cache; ///< The raw levels were keyed through the block hash cache, which is another hash again.
 	};
 	struct HashMemo
 	{
@@ -520,6 +562,12 @@ protected:
 	static inline bool s_hash_memo_verify = false;
 	struct HashMemoSweep;
 	std::unique_ptr<HashMemoSweep> m_hash_memo_sweep;
+
+	/// The block hash cache of this texture cache, made at the first lookup that needs it.
+	std::unique_ptr<BlockHashCache> m_block_hash_cache;
+	BlockHashCache& SyncBlockHashCache(GSLocalMemory& mem);
+	static inline bool s_block_hash_cache_enabled = true;
+	static inline bool s_block_hash_verify = false;
 
 	FastList<Target*> m_dst[2];
 	FastList<TargetHeightElem> m_target_heights;
@@ -651,6 +699,7 @@ public:
 	__fi u64 GetHashCacheMemoryUsage() const { return m_hash_cache_memory_usage; }
 	__fi u64 GetHashCacheReplacementMemoryUsage() const { return m_hash_cache_replacement_memory_usage; }
 	__fi u64 GetTotalHashCacheMemoryUsage() const { return (m_hash_cache_memory_usage + m_hash_cache_replacement_memory_usage); }
+	__fi size_t GetHashCacheEntryCount() const { return m_hash_cache.size(); }
 	__fi u64 GetSourceMemoryUsage() const { return m_source_memory_usage; }
 	__fi u64 GetTargetMemoryUsage() const { return m_target_memory_usage; }
 	__fi const HashMemoStats& GetHashMemoStats() const { return m_hash_memo.stats; }
@@ -665,6 +714,61 @@ public:
 	/// its stamp did not, which is a store that was not marked. Call at a frame boundary, on the thread that
 	/// writes `mem`, with no writer in flight.
 	void VerifyWriteStamps(const GSLocalMemory& mem);
+
+	/// The per-block hash cache. A paletted window that is keyed from the bytes of its blocks (see
+	/// HashCacheKey::Create) is keyed from a hash of each block's hash, and the hash of a block is computed
+	/// when its hash-dirty bit in GSLocalMemory is set and kept until it is set again, so a window that was
+	/// looked up last frame costs the blocks written since, and not all of its bytes. Every lookup of such a
+	/// window, on every backend, relies on the marks of the writers of local memory to be complete.
+	///
+	/// On by default. Off, a window is keyed by one hash of its raw blocks, with no cache (gsrunner
+	/// -block-hash-cache off, to check a suspect title without a rebuild). The two keys of a window differ,
+	/// and two windows have one key if and only if they have one in the other, so which is in use changes no
+	/// pixel and no hit.
+	static void SetBlockHashCacheEnabled(bool enable) { s_block_hash_cache_enabled = enable; }
+	static bool IsBlockHashCacheEnabled() { return s_block_hash_cache_enabled; }
+
+	/// Verify mode for the block hash cache (pcsx2-gsrunner -verify-block-hash), off by default. While it is
+	/// on, every level keyed through the cache has each of its blocks hashed afresh and compared with the
+	/// cached hash, the key is also made without the cache, and the two forms must agree on which windows are
+	/// one. The memo of texture hashes is not consulted, so every lookup is checked. Neither changes what the
+	/// renderer does.
+	static void SetBlockHashVerify(bool enable);
+	static bool IsBlockHashVerify() { return s_block_hash_verify; }
+	static BlockHashVerifyReport GetBlockHashVerifyReport();
+	static BlockHashStats GetBlockHashStats();
+
+	/// How much AgeHashCache keeps. Entries unused for 30 frames go regardless; past these limits the oldest
+	/// unreferenced entries go first. An entry's memory is its texture's, a replacement or an upscale counted
+	/// the same as a texture of the guest's own texels.
+	struct HashCacheLimits
+	{
+		/// Entries are never dropped for memory while there are no more than this many (the limit the cache had
+		/// before there was a memory limit), so a title keeps at least what it always did.
+		u32 floor_entries = 800;
+		/// The most entries kept, whatever they hold. 0 = no limit.
+		u32 max_entries = 1600;
+		/// The most bytes of textures kept above `floor_entries` entries. 0 = no limit.
+		u64 max_bytes = 128ull << 20;
+	};
+	static void SetHashCacheLimits(const HashCacheLimits& limits);
+	static HashCacheLimits GetHashCacheLimits();
+
+	/// The most the hash cache has held at the end of a frame (just before AgeHashCache drops anything), over
+	/// every cache of the process, and the same moment's total of the memory the renderer accounts for.
+	struct HashCacheStats
+	{
+		u64 peak_entries = 0;
+		u64 peak_bytes = 0; ///< The textures of the entries: GetTotalHashCacheMemoryUsage().
+		u64 peak_total_bytes = 0; ///< Targets, sources, hash cache and the device's texture pool.
+		u64 frames = 0; ///< Frames sampled.
+		u64 sum_bytes = 0; ///< Sum of the per-frame bytes, for the mean.
+	};
+	static HashCacheStats GetHashCacheStats();
+
+	/// The block hash of `block` of `mem`: of its 256 bytes, hashed now if its hash-dirty bit is set. The cache
+	/// is bound to the memory by GSLocalMemory::Id(); a different memory than the last one invalidates it.
+	u64 BlockHash(GSLocalMemory& mem, u32 block);
 
 	void Read(Target* t, const GSVector4i& r, bool force_synchronous = false);
 	void Read(Source* t, const GSVector4i& r);
@@ -686,6 +790,30 @@ public:
 	void ResizeTarget(Target* t, GSVector4i rect, u32 tbp, u32 psm, u32 tbw);
 	static bool FullRectDirty(Target* target, u32 rgba_mask);
 	static bool FullRectDirty(Target* target);
+
+	/// Whether the rectangles of `list` that name every channel of `rgba_mask`, in format `psm` at buffer width
+	/// `bw`, together cover every pixel of `area`. Rectangles in another format or width, and ones that leave
+	/// out a channel of the mask, are not counted, so a list with only those is never reported covering.
+	/// FullRectDirty's test is the case of one rectangle. `hole`, if given, is a pixel of an earlier answer: it
+	/// is tried first, a list that still misses it is answered at once, and a list that does not cover the area
+	/// leaves in it a pixel of the area that no rectangle holds (when it found one), for the next call.
+	static bool DirtyRectsCover(const GSDirtyRectList& list, u32 psm, u32 bw, u32 rgba_mask, const GSVector4i& area, GSVector2i* hole = nullptr);
+	/// FullRectDirty for a list of several rectangles: the target's own channels are dirty in every pixel of
+	/// its valid rectangle, so no pixel of it is newer than local memory. Tests the list once per change to
+	/// it (Target::m_dirty_adds), so a caller may ask after every call that can have changed it.
+	static bool FullRectDirtyByUnion(Target* target);
+	/// Retire a target by FullRectDirtyByUnion (on by default). Off is the same-binary control of an A/B
+	/// (pcsx2-gsrunner -union-retire) and the other arm of a differential test.
+	static void SetUnionRetire(bool enable);
+	static bool GetUnionRetire();
+	struct UnionRetireStats
+	{
+		u64 tests = 0; ///< lists tested (a list of two or more rectangles, changed since its last test)
+		u64 sweeps = 0; ///< of those, the ones whose rectangles' areas could add up to the target's
+		u64 retired = 0; ///< targets retired because their rectangles together cover them
+	};
+	static UnionRetireStats GetUnionRetireStats();
+	static void ResetUnionRetireStats();
 	bool CanTranslate(u32 bp, u32 bw, u32 spsm, GSVector4i r, u32 dbp, u32 dpsm, u32 dbw);
 	GSVector4i TranslateAlignedRectByPage(u32 tbp, u32 tebp, u32 tbw, u32 tpsm, GSVector4i t_r, u32 sbp, u32 spsm, u32 sbw, GSVector4i src_r, bool is_invalidation = false);
 	GSVector4i TranslateAlignedRectByPage(Target* t, u32 sbp, u32 spsm, u32 sbw, GSVector4i src_r, bool is_invalidation = false);
@@ -701,6 +829,14 @@ public:
 	void CombineAlignedInsideTargets(Target* target, GSTextureCache::Source* src = nullptr);
 
 private:
+	// This set depends only on its source layout and rect, never GS memory contents, so it cannot go stale.
+	GSExactDirtyMapping::WrittenPages m_written_c32_blocks;
+
+	bool TryDirtyRectByC32Blocks(u32 sbp, u32 spsm, u32 sbw, Target* target, const GSVector4i& rect);
+	bool TryRebaseTargetForOverwrite(Target* target, const GIFRegTEX0& incoming, const GSVector4i& draw_rect,
+		const Source* source, const Target* depth, u32 width_page_offset, bool is_shuffle);
+	void CommitTargetRebase(Target* target, GSTexture* texture, const GSTargetRebase::Plan& plan);
+
 	Target* ProcessTargetAfterLookup(RescaleHelper& rescaler, Target* dst, GIFRegTEX0 TEX0, const GSVector2i& size, int type,
 		bool used, u32 fbmask, bool is_frame, bool preload, bool preserve_rgb = true, bool preserve_alpha = true,
 		const GSVector4i draw_rc = GSVector4i::zero(), bool is_shuffle = false, bool possible_clear = false,

@@ -70,7 +70,7 @@ __fi void mVUloadReg(const a64::VRegister& reg, const a64::Register& base, int64
 // values in their natural lane while the writeback reads lane 0, silently
 // clobbering VU memory with whatever happened to be in the recycled
 // Q register's lane 0.
-__fi void mVUloadMem(const a64::VRegister& reg, const a64::Register& base, int64_t off, int xyzw)
+__fi void mVUloadMem(const a64::VRegister& reg, const mVUmemRef& addr, int xyzw)
 {
 	int lane;
 	switch (xyzw)
@@ -80,10 +80,17 @@ __fi void mVUloadMem(const a64::VRegister& reg, const a64::Register& base, int64
 		case 0x2: lane = 8;  break; // Z — into lane 0
 		case 0x1: lane = 12; break; // W — into lane 0
 		default:
-			armAsm->Ldr(reg, a64::MemOperand(base, off));
+			armAsm->Ldr(reg, addr.at());
 			return;
 	}
-	armAsm->Ldr(a64::VRegister(reg.GetCode(), 32), a64::MemOperand(base, off + lane));
+	armAsm->Ldr(a64::VRegister(reg.GetCode(), 32), addr.at(lane));
+}
+
+// Whether every access mVUloadMem makes for `xyzw` is at the address itself:
+// all but the single-lane y, z and w loads, which add their lane's offset.
+static __fi bool mVUloadMemAtZero(int xyzw)
+{
+	return xyzw != 0x4 && xyzw != 0x2 && xyzw != 0x1;
 }
 
 // Store VF register components to memory with xyzw mask.
@@ -300,11 +307,21 @@ static inline u32 branchAddr(const mV)
 	return ((((iPC + 2) + (_Imm11_ * 2)) & mVU.progMemMask) * 4);
 }
 
-static void mVUwaitMTVU()
+// What the waitMTVU thunk calls when VU0 (or COP2 macro mode) addresses VU1's register window.
+// `vi` is the VI-based address mVUaddrFix was fixing up (the thunk passes gprT1). Under MTVU the
+// access waits for the VU1 thread; whatever the threading, an access to the quadword that holds
+// VU1's STATUS register tells the vu-aot tier that something outside VU1 can see the sticky bits it
+// drops.
+static void mVUwaitMTVU(u32 vi)
 {
-	if (IsDevBuild)
-		DevCon.WriteLn("microVU0: Waiting on VU1 thread to access VU1 regs!");
-	vu1Thread.WaitVU();
+	if (THREAD_VU1)
+	{
+		if (IsDevBuild)
+			DevCon.WriteLn("microVU0: Waiting on VU1 thread to access VU1 regs!");
+		vu1Thread.WaitVU();
+	}
+	if ((vi & 0x3f) == VU0_WINDOW_VU1_STATUS_QWORD)
+		vuAotNoteOutsideStatusRead();
 }
 
 static void mVUTBit()
@@ -338,6 +355,7 @@ __fi void mVUaddrFix(mV, const a64::Register& gprReg)
 		armAsm->B(&notVU1Access, a64::eq);
 
 		// Accessing VU1 regs from VU0
+		pxAssert(gprReg.GetCode() == gprT1.GetCode()); // (the waitMTVU thunk reads the address from gprT1)
 		if (THREAD_VU1)
 		{
 			// COP2 macro mode emits this inline into an EE block where the
@@ -348,10 +366,24 @@ __fi void mVUaddrFix(mV, const a64::Register& gprReg)
 			// lazy-dirty no-op in write-through mode.
 			if (mVU.cop2)
 				armEmitEEClobberedPinFlushForCOP2();
-			// Need to wait for VU1 thread
+			// Need to wait for VU1 thread (and to tell the vu-aot tier if this is the STATUS quadword)
 			armEmitCall((void*)mVU.waitMTVU);
 			if (mVU.cop2)
 				armEmitEEClobberedPinReloadForCOP2();
+		}
+		else if (mVUvuAotVU0WindowHook())
+		{
+			// Nothing to wait for. The access to VU1's STATUS register (VI[16]: quadword 48 of the
+			// window) goes to the same thunk, which saves every register a C call can clobber, so
+			// no pin or cached value needs to be flushed around it. Any other quadword of the
+			// window costs the compare and the branch. Only while the vu-aot tier is wanted: it is
+			// the tripwire's hook, and with the setting off nothing is emitted here.
+			a64::Label notStatus;
+			armAsm->And(RWSCRATCH, gprReg.W(), 0x3f);
+			armAsm->Cmp(RWSCRATCH, VU0_WINDOW_VU1_STATUS_QWORD);
+			armAsm->B(&notStatus, a64::ne);
+			armEmitCall((void*)mVU.waitMTVU);
+			armAsm->Bind(&notStatus);
 		}
 		armAsm->And(gprReg.W(), gprReg.W(), 0x3f);
 		// Add offset in u128 units (x86 mVUaddrFix uses pointer arithmetic so
@@ -373,6 +405,11 @@ __fi void mVUaddrFix(mV, const a64::Register& gprReg)
 	}
 }
 
+// mVUaddrFix with the VI index in another register. VU1's UBFIZ takes the
+// quadword index from bits 0-9 of `src` wherever it sits, so the copy into
+// `dst` (and any sign or zero extension, which touches only bits 16 and up)
+// that would stand in front of it is not needed. VU0 copies and runs the
+// full path.
 __fi void mVUaddrFixFrom(mV, const a64::Register& dst, const a64::Register& src)
 {
 	if (isVU1)
@@ -380,42 +417,23 @@ __fi void mVUaddrFixFrom(mV, const a64::Register& dst, const a64::Register& src)
 		armAsm->Ubfiz(dst.W(), src.W(), 4, 10);
 		return;
 	}
-	if (!dst.Is(src))
+	if (dst.GetCode() != src.GetCode())
 		armAsm->Mov(dst.W(), src.W());
-	mVUaddrFix(mVU, dst);
-}
-
-__fi void mVUaddrFixVI(mV, const a64::Register& dst, int vi, s32 imm)
-{
-	const int cached = mVU.regAlloc->findCachedVI(vi);
-	if (cached >= 0 && imm == 0)
-	{
-		mVUaddrFixFrom(mVU, dst, armWRegister(cached));
-		return;
-	}
-	if (cached >= 0)
-	{
-		if (imm > 0)
-			armAsm->Add(dst.W(), armWRegister(cached), static_cast<u32>(imm));
-		else
-			armAsm->Sub(dst.W(), armWRegister(cached), static_cast<u32>(-imm));
-	}
-	else
-	{
-		mVU.regAlloc->moveVIToGPR(dst, vi);
-		if (imm > 0)
-			armAsm->Add(dst.W(), dst.W(), static_cast<u32>(imm));
-		else if (imm < 0)
-			armAsm->Sub(dst.W(), dst.W(), static_cast<u32>(-imm));
-	}
 	mVUaddrFix(mVU, dst);
 }
 
 // Turn a byte index into VU data memory, already in gprIdxq, into something a
 // load or store can address: on VU1 one Add off the pin, the distance riding
 // in the access's own offset field; on VU0 the pointer is still loaded.
-__fi mVUmemRef mVUmemAtIndex(mV, const a64::Register& gprIdxq)
+//
+// `atZeroOnly`: every access the caller makes is at the address itself, with
+// no lane offset on top. Then micro mode needs nothing emitted at all: the
+// access takes [gprVUMem, index].
+__fi mVUmemRef mVUmemAtIndex(mV, const a64::Register& gprIdxq, bool atZeroOnly = false)
 {
+	if (atZeroOnly && !mVU.cop2)
+		return {gprVUMem, 0, gprIdxq};
+
 	if (isVU1)
 	{
 		armAsm->Add(gprIdxq, gprVUState, gprIdxq);
@@ -466,6 +484,13 @@ __fi bool mVUoptimizeConstantAddr(mV, u32 srcreg, s32 offset, s32 offsetSS_,
 		if (offset & 0x400)
 			return false; // cross-VU-register access — runtime path handles it
 		byteAddr = ((offset & 0xff) << 4) + offsetSS_;
+
+		// Micro mode holds VU0's memory pointer in gprVUMem.
+		if (!mVU.cop2 && byteAddr <= dispLimit)
+		{
+			out = {gprVUMem, byteAddr};
+			return true;
+		}
 	}
 
 	armAsm->Ldr(gprOutQ, mVUstateMem(offsetof(VURegs, Mem)));

@@ -6,6 +6,7 @@
 #include "Config.h"
 #include "common/FileSystem.h"
 #include "common/Path.h"
+#include "vuaot/VuAotMvuTrace.h"
 
 
 //------------------------------------------------------------------
@@ -503,9 +504,10 @@ static void mVUtestCycles(mV, microFlagCycles& mFC)
 {
 	iPC = mVUstartPC;
 
-	if (isVU0 && EmuConfig.Speedhacks.EECycleRate != 0 && (!EmuConfig.Gamefixes.VUSyncHack || EmuConfig.Speedhacks.EECycleRate < 0))
+	const s8 mVUeeCycleRate = EECycleRate::GetEffective();
+	if (isVU0 && mVUeeCycleRate != 0 && (!EmuConfig.Gamefixes.VUSyncHack || mVUeeCycleRate < 0))
 	{
-		switch (std::min(static_cast<int>(EmuConfig.Speedhacks.EECycleRate), static_cast<int>(mVUcycles)))
+		switch (std::min(static_cast<int>(mVUeeCycleRate), static_cast<int>(mVUcycles)))
 		{
 			case -3: mVUcycles *= 2.0f;       break;
 			case -2: mVUcycles *= 1.6666667f; break;
@@ -1001,15 +1003,272 @@ __ri void eBitWarning(mV)
 
 void mVUdebugPrintBlocks(mV, bool isEndPC) {}
 
+// Hands this block's first-pass decisions to vu-aot: its validator (pcsx2-vurunner
+// --vuaot-ir, vu-aot unit tests) and the tiers that compile the block in
+// microVU's place. Called once per compile, after mVUsetFlags and
+// mVUoptimizePipeState, before the second pass can overwrite IRinfo by
+// compiling a successor. Emits nothing; only built when a hook wants it.
+static void mVUbuildBlockTrace(microVU& mVU, u32 startPC, vuaot::MvuBlockTrace& t)
+{
+	t.vuIndex = mVU.index;
+	t.startPC = startPC;
+	std::memcpy(t.entryState, &mVUpBlock->pState, sizeof(t.entryState));
+	std::memcpy(t.endState, &mVUregs, sizeof(t.endState));
+	t.count = mVUcount;
+	t.cycles = mVUcycles;
+	t.flagHack = mVUsFlagHack ? 1 : 0;
+	t.needFlagFinalize = mVU.needFlagFinalize ? 1 : 0;
+	const auto vf = [](const microVFreg& r) {
+		vuaot::MvuVFRegTrace o;
+		o.reg = r.reg; o.x = r.x; o.y = r.y; o.z = r.z; o.w = r.w;
+		return o;
+	};
+	u32 w = mVUstartPC;
+	for (u32 i = 0; i < mVUcount; i++)
+	{
+		const microOp& o = mVU.prog.IRinfo.info[w / 2];
+		vuaot::MvuOpTrace x;
+		x.pc = (w / 2) * 8;
+		x.stall = o.stall;
+		x.isBadOp = o.isBadOp; x.isEOB = o.isEOB; x.isBdelay = o.isBdelay;
+		x.swapOps = o.swapOps; x.backupVF = o.backupVF;
+		x.doXGKICK = o.doXGKICK; x.doDivFlag = o.doDivFlag; x.XGKICKPC = o.XGKICKPC;
+		x.readQ = o.readQ; x.writeQ = o.writeQ; x.readP = o.readP; x.writeP = o.writeP;
+		x.sFlag = {o.sFlag.doFlag, o.sFlag.doNonSticky, o.sFlag.write, o.sFlag.lastWrite, o.sFlag.read};
+		x.mFlag = {o.mFlag.doFlag, o.mFlag.doNonSticky, o.mFlag.write, o.mFlag.lastWrite, o.mFlag.read};
+		x.cFlag = {o.cFlag.doFlag, o.cFlag.doNonSticky, o.cFlag.write, o.cFlag.lastWrite, o.cFlag.read};
+		x.eBit = o.uOp.eBit; x.iBit = o.uOp.iBit; x.mBit = o.uOp.mBit; x.tBit = o.uOp.tBit; x.dBit = o.uOp.dBit;
+		x.uVFwrite = vf(o.uOp.VF_write); x.uVFread0 = vf(o.uOp.VF_read[0]); x.uVFread1 = vf(o.uOp.VF_read[1]);
+		x.lVFwrite = vf(o.lOp.VF_write); x.lVFread0 = vf(o.lOp.VF_read[0]); x.lVFread1 = vf(o.lOp.VF_read[1]);
+		x.VIwriteReg = o.lOp.VI_write.reg; x.VIwriteUsed = o.lOp.VI_write.used;
+		x.VIread0Reg = o.lOp.VI_read[0].reg; x.VIread0Used = o.lOp.VI_read[0].used;
+		x.VIread1Reg = o.lOp.VI_read[1].reg; x.VIread1Used = o.lOp.VI_read[1].used;
+		x.constJumpValid = o.lOp.constJump.isValid; x.constJumpValue = o.lOp.constJump.regValue;
+		x.branch = o.lOp.branch; x.kickcycles = o.lOp.kickcycles;
+		x.badBranch = o.lOp.badBranch; x.evilBranch = o.lOp.evilBranch; x.isNOP = o.lOp.isNOP;
+		x.isFSSET = o.lOp.isFSSET; x.noWriteVF = o.lOp.noWriteVF; x.backupVI = o.lOp.backupVI;
+		x.memReadIs = o.lOp.memReadIs; x.memReadIt = o.lOp.memReadIt; x.readFlags = o.lOp.readFlags;
+		x.isMemWrite = o.lOp.isMemWrite; x.isKick = o.lOp.isKick;
+		t.ops.push_back(x);
+		w = (w + 2) & mVU.progMemMask;
+	}
+}
+
+// vu-aot region callbacks: microVU's block manager and compile entry, for a
+// region that registers its nodes as microVU blocks and leaves through
+// microVU blocks.
+static microVU& mVUbyIndex(u32 vu) { return vu ? microVU1 : microVU0; }
+
+static void* vuAotSearchBlock(u32 vu, u32 pc, const u8* key)
+{
+	microVU& mVU = mVUbyIndex(vu);
+	pc &= mVU.microMemSize - 8;
+	if (!mVUblocks[pc / 8])
+		return nullptr;
+	alignas(16) microRegInfo k;
+	std::memcpy(&k, key, sizeof(k));
+	return mVUblocks[pc / 8]->search(mVU, &k);
+}
+
+static void* vuAotAddBlock(u32 vu, u32 pc, const u8* key)
+{
+	microVU& mVU = mVUbyIndex(vu);
+	pc &= mVU.microMemSize - 8;
+	alignas(16) microBlock b;
+	std::memset(&b, 0, sizeof(b));
+	std::memcpy(&b.pState, key, sizeof(b.pState));
+	blockCreate(pc / 8);
+	return mVUblocks[pc / 8]->add(mVU, &b);
+}
+
+static void vuAotSetBlockEntry(void* block, void* entry)
+{
+	microBlock* b = static_cast<microBlock*>(block);
+	b->x86ptrStart = static_cast<u8*>(entry);
+	b->hostEntry = entry;
+}
+
+static void* vuAotBlockEntry(void* block) { return static_cast<microBlock*>(block)->hostEntry; }
+
+static void* vuAotFetchBlock(u32 vu, u32 pc, const u8* key)
+{
+	microVU& mVU = mVUbyIndex(vu);
+	alignas(16) microRegInfo k;
+	std::memcpy(&k, key, sizeof(k));
+	return mVUblockFetch(mVU, pc & (mVU.microMemSize - 8), reinterpret_cast<uptr>(&k));
+}
+
+static void vuAotAddRange(u32 vu, u32 startPC, u32 lastPC)
+{
+	microVU& mVU = mVUbyIndex(vu);
+	// mVUcompile's own calls for a block: the start, a wrap past the end of
+	// micro memory, the end after the last pair.
+	mVUsetupRange(mVU, startPC, true);
+	for (u32 pc = startPC; pc != lastPC; pc = (pc + 8) & (mVU.microMemSize - 8))
+	{
+		if (pc + 8 == mVU.microMemSize)
+		{
+			mVUsetupRange(mVU, mVU.microMemSize, false);
+			mVUsetupRange(mVU, 0, true);
+		}
+	}
+	mVUsetupRange(mVU, (lastPC + 8) & (mVU.microMemSize - 8), false);
+}
+
+// normJumpCompile from after its mVUsetupBranch, for a vu-aot region's block:
+// the region has already left microVU's boundary state in place and the
+// target in mVU.branch. Mirrors normJumpCompile's non-evil, non-E-bit path.
+static void vuAotEmitJumpTail(u32 vu, void* block, const u8* endKey)
+{
+	microVU& mVU = mVUbyIndex(vu);
+	microBlock* blk = static_cast<microBlock*>(block);
+	std::memcpy(&blk->pStateEnd, endKey, sizeof(microRegInfo));
+	if (!blk->jumpCache)
+		blk->jumpCache = new microJumpCache[mProgSize / 2];
+
+	mVUldrField(mVU, RWARG1, &mVU.branch);
+	if (doJumpCaching)
+		armMoveAddressToReg(RXARG2, blk);
+	else
+		armMoveAddressToReg(RXARG2, &blk->pStateEnd);
+
+	if (doJumpCaching && !doJumpAsSameProgram)
+	{
+		a64::Label slowPath;
+		armAsm->Str(RWARG1, mVUstateMem(offsetof(VURegs, start_pc)));
+		armAsm->Ldr(a64::x8, a64::MemOperand(RXARG2, offsetof(microBlock, jumpCache)));
+		armAsm->Add(a64::x9, a64::x0, a64::Operand(a64::x0, a64::LSL, 1));
+		armAsm->Add(a64::x8, a64::x8, a64::x9);
+		armAsm->Ldr(a64::x10, a64::MemOperand(a64::x8, offsetof(microJumpCache, prog)));
+		armMoveAddressToReg(a64::x11, &mVU.prog.quick[0].prog);
+		armAsm->Lsl(a64::x12, a64::x0, 1);
+		armAsm->Ldr(a64::x11, a64::MemOperand(a64::x11, a64::x12));
+		armAsm->Cmp(a64::x10, a64::x11);
+		armAsm->B(&slowPath, a64::ne);
+		armAsm->Ldr(a64::x10, a64::MemOperand(a64::x8, offsetof(microJumpCache, hostEntry)));
+		armAsm->Cbz(a64::x10, &slowPath);
+		armAsm->Br(a64::x10);
+		armAsm->Bind(&slowPath);
+	}
+
+	mVUbackupRegs(mVU);
+	if (!mVU.index)
+		armEmitCall((void*)(void (*)())mVUcompileJIT<0>);
+	else
+		armEmitCall((void*)(void (*)())mVUcompileJIT<1>);
+	mVUrestoreRegs(mVU);
+
+	a64::Label validBlock;
+	armAsm->Cbnz(a64::x0, &validBlock);
+	mVUcompileFailedFlagBackup(mVU);
+	armEmitJmp(mVU.exitFunct);
+	armAsm->Bind(&validBlock);
+	armAsm->Br(a64::x0);
+}
+
+// vu-aot milestone 8: microVU's own code for a block a region holds (the
+// block manager keeps the region's entry; mVUcompile finds that block and
+// compiles into it without replacing the entry). The record's slot keeps the
+// code for the next bail.
+static void* vuAotBailTarget(u32 vu, u8* rec)
+{
+	microVU& mVU = mVUbyIndex(vu);
+	void** slot = reinterpret_cast<void**>(rec + 16);
+	if (*slot)
+		return *slot;
+	u32 pc;
+	std::memcpy(&pc, rec, sizeof(pc));
+	microBlock* blk;
+	std::memcpy(&blk, rec + 8, sizeof(blk));
+	s32 progWord;
+	std::memcpy(&progWord, rec + 4, sizeof(progWord));
+	microProgram* prog;
+	std::memcpy(&prog, rec + progWord, sizeof(prog));
+	mVUvuAotOnBail();
+	alignas(16) microRegInfo k;
+	std::memcpy(&k, &blk->pState, sizeof(k));
+	// The region's code can be running under a program that is not
+	// mVU.prog.cur (a jump cache hit enters another program's blocks without
+	// updating it), and mVUcompile files the block, its range and its
+	// successors under mVU.prog.cur.
+	microProgram* const savedCur = mVU.prog.cur;
+	mVU.prog.cur = prog;
+	mVUopenCodeCache(mVU);
+	vuaot::g_vuAotShadowCompile = true;
+	void* v = mVUcompile(mVU, pc & (mVU.microMemSize - 8), reinterpret_cast<uptr>(&k));
+	vuaot::g_vuAotShadowCompile = false;
+	*reinterpret_cast<void**>(armGetWritableCodePtr(reinterpret_cast<u8*>(slot))) = v;
+	mVUcloseCodeCache(mVU);
+	mVU.prog.cur = savedCur;
+	return v;
+}
+
+static vuaot::MvuEmitEnv mVUbuildEmitEnv(microVU& mVU)
+{
+	vuaot::MvuEmitEnv e;
+	const u8* base = reinterpret_cast<const u8*>(&mVU.macFlag[0]);
+	e.vuIndex = mVU.index;
+	e.offDivFlag = static_cast<s32>(reinterpret_cast<const u8*>(&mVU.divFlag) - base);
+	e.offVIbackup = static_cast<s32>(reinterpret_cast<const u8*>(&mVU.VIbackup) - base);
+	e.offVIxgkick = static_cast<s32>(reinterpret_cast<const u8*>(&mVU.VIxgkick) - base);
+	e.offBranch = static_cast<s32>(reinterpret_cast<const u8*>(&mVU.branch) - base);
+	e.offNeonBackup = static_cast<s32>(reinterpret_cast<const u8*>(&mVU.neonBackup[0][0]) - base);
+	e.xgkickFn = reinterpret_cast<const void*>(&mVU_XGKICK_);
+	e.vifTop = &mVU.getVifRegs().top;
+	e.vifItop = &mVU.getVifRegs().itop;
+	e.clampOverflow = CHECK_VU_OVERFLOW(mVU.index);
+	e.clampExtra = CHECK_VU_EXTRA_OVERFLOW(mVU.index);
+	e.clampSign = CHECK_VU_SIGN_OVERFLOW(mVU.index);
+	e.clampExact = CHECK_VU_EXACT(mVU.index);
+	e.softwareFlush = mVUneedsSoftwareFlush(mVU);
+	e.xgkickHack = CHECK_XGKICKHACK;
+	e.ibitHack = EmuConfig.Gamefixes.IbitHack;
+	e.overflowHack = CHECK_VUOVERFLOWHACK;
+	e.addSubHack = CHECK_VUADDSUBHACK;
+	e.flagHack = mVUsFlagHack;
+	e.vuSyncHack = EmuConfig.Gamefixes.VUSyncHack || EmuConfig.Gamefixes.FullVU0SyncHack;
+	e.offCycles = static_cast<s32>(reinterpret_cast<const u8*>(&mVU.cycles) - base);
+	e.cycleBreak = mVU.cycleBreak;
+	e.rootBlock = mVUpBlock;
+	e.program = mVU.prog.cur;
+	e.offProgBails = static_cast<s32>(offsetof(microProgram, vuAotBails));
+	e.searchBlock = &vuAotSearchBlock;
+	e.addBlock = &vuAotAddBlock;
+	e.setBlockEntry = &vuAotSetBlockEntry;
+	e.blockEntry = &vuAotBlockEntry;
+	e.fetchBlock = &vuAotFetchBlock;
+	e.addRange = &vuAotAddRange;
+	e.clearLpState = mVU.index ? reinterpret_cast<const void*>(&mVU1clearlpStateJIT) : reinterpret_cast<const void*>(&mVU0clearlpStateJIT);
+	e.endFlagsB = mVU.endProgramFlagsB;
+	e.exitEBit = mVUexitEBit(mVU);
+	e.vpuStat = &VU0.VI[REG_VPU_STAT].UL;
+	e.threadVU1 = THREAD_VU1;
+	e.emitJumpTail = &vuAotEmitJumpTail;
+	e.bailTarget = &vuAotBailTarget;
+	e.vuMemPinned = !mVU.cop2;
+	return e;
+}
+
 //------------------------------------------------------------------
 // Main Compile Function
 //------------------------------------------------------------------
+
+// Marks a compile of VU1 code for the vu-aot live tier, which drops its
+// per-compile analysis state when the outermost one returns. Inert (two
+// branches at compile time, nothing emitted) with the tier off.
+struct mVUvuAotCompileScope
+{
+	microVU& mVU;
+	explicit mVUvuAotCompileScope(microVU& m) : mVU(m) { mVUvuAotCompileBegin(mVU); }
+	~mVUvuAotCompileScope() { mVUvuAotCompileEnd(mVU); }
+};
 
 void* mVUcompile(microVU& mVU, u32 startPC, uptr pState)
 {
 	microFlagCycles mFC;
 	// armAsm is managed by mVUexecute/mVUcompileJIT — must be active here.
 	pxAssert(armAsm);
+	const mVUvuAotCompileScope vuAotScope(mVU);
 	u8* thisPtr = armGetCurrentCodePointer();
 
 	const u32 endCount = (((microRegInfo*)pState)->blockType) ? 1 : (mVU.microMemSize / 8);
@@ -1169,6 +1428,35 @@ void* mVUcompile(microVU& mVU, u32 startPC, uptr pState)
 	mVUregs.vi15v = 0;
 	mVUsetFlags(mVU, mFC);
 	mVUoptimizePipeState(mVU);
+	// vu-aot: a test installs its hooks through the vuaot:: globals; otherwise
+	// the live tier hands out its own, for a program it has tiered up (and
+	// for VU1 only). With neither, nothing below runs and microVU compiles the
+	// block exactly as it always has.
+	vuaot::VuAotRegionHook vuAotRegionHook = vuaot::g_vuAotRegionHook;
+	void* vuAotRegionUser = vuaot::g_vuAotRegionHookUser;
+	vuaot::VuAotBodyHook vuAotBodyHook = vuaot::g_vuAotBodyHook;
+	void* vuAotBodyUser = vuaot::g_vuAotBodyHookUser;
+	if (!vuAotRegionHook && !vuAotBodyHook)
+		mVUvuAotLiveHooks(mVU, vuAotRegionHook, vuAotRegionUser, vuAotBodyHook, vuAotBodyUser);
+	vuaot::MvuBlockTrace vuAotTrace;
+	// A region's bail target is microVU's own code for the block.
+	const bool vuAotShadow = vuaot::g_vuAotShadowCompile;
+	vuaot::g_vuAotShadowCompile = false;
+#ifdef PCSX2_RECOMPILER_TESTS
+	const bool vuAotTraceWanted = vuaot::g_mvuBlockHook || vuAotRegionHook || vuAotBodyHook;
+#else
+	const bool vuAotTraceWanted = vuAotRegionHook || vuAotBodyHook;
+#endif
+	if (vuAotTraceWanted)
+		mVUbuildBlockTrace(mVU, startPC, vuAotTrace);
+#ifdef PCSX2_RECOMPILER_TESTS
+	if (vuaot::g_mvuBlockHook)
+		vuaot::g_mvuBlockHook(vuAotTrace, vuaot::g_mvuBlockHookUser);
+#endif
+	// vu-aot milestone 4: a hook may compile a whole region rooted at this
+	// block in its place; microVU then emits nothing for it.
+	if (vuAotRegionHook && !vuAotShadow && vuAotRegionHook(vuAotTrace, mVUbuildEmitEnv(mVU), vuAotRegionUser))
+		return thisPtr;
 	{
 		const mVUSpinLoop spin = mVUdetectSpinLoop(mVU, startPC);
 		if (spin.found)
@@ -1183,12 +1471,25 @@ void* mVUcompile(microVU& mVU, u32 startPC, uptr pState)
 	u32 x = 0;
 
 	mVUemitClampConsts(mVU);
-	mvuPreloadRegisters(mVU, endCount);
+	// vu-aot milestone 2: a hook may emit this block's whole body from vu-aot's
+	// IR; microVU then emits only its framing below.
+	const bool vuAotBody = vuAotBodyHook && !vuAotShadow &&
+		vuAotBodyHook(vuAotTrace, mVUbuildEmitEnv(mVU), vuAotBodyUser);
+	if (!vuAotBody)
+		mvuPreloadRegisters(mVU, endCount);
 	mVU.regAlloc->accInRange = false;
 
 	for (; x < endCount; x++)
 	{
 		if (mVUinfo.isEOB) { x = 0xffff; }
+
+		if (vuAotBody)
+		{
+			// The body is already emitted; keep the walk's PC in step with
+			// mVUexecuteInstruction, which leaves iPC on the upper word.
+			incPC(1);
+			goto vuAotAfterBody;
+		}
 
 		// M-bit: signal the EE-visible M-flag so VU0 micro-mode can break/sync
 		// to the EE (VU0.cpp gates the M-bit Break on VURegs.flags & MFLAGSET).
@@ -1254,6 +1555,7 @@ void* mVUcompile(microVU& mVU, u32 startPC, uptr pState)
 		}
 #endif
 
+	vuAotAfterBody:
 		// T/D/M-bit per-instruction handling (excluding branch delay slots;
 		// those are handled after the branch itself emits). Mirrors x86
 		// microVU_Compile.inl:901-923.
@@ -1304,7 +1606,7 @@ void* mVUcompile(microVU& mVU, u32 startPC, uptr pState)
 			}
 		}
 
-		if (mVUinfo.doXGKICK)
+		if (mVUinfo.doXGKICK && !vuAotBody)
 			mVU_XGKICK_DELAY(mVU);
 
 		if (isEvilBlock)

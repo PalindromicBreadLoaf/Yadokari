@@ -14,7 +14,8 @@
 //
 // The digest (mVUPersist::TestComputeEmitDigest) masks every operand that
 // may legitimately differ between correct emissions — 64-bit mov-chain
-// immediates, B/BL displacements, ADRP pages, fixup address payloads — and
+// immediates, B/BL displacements, ADRP pages, recorded B.cond displacements,
+// image and data-arena offsets in fixup records — and
 // hashes what remains: opcode selection, register allocation, instruction
 // order, block/chunk/fixup structure. That is deterministic across runs,
 // machines, and PIE/ASLR.
@@ -32,8 +33,8 @@
 //   are in.
 //
 // Recording is enabled during compilation because the cache only ever
-// stores recording-enabled forms (canonical movs, forced-long cond
-// branches) — those are the shapes worth pinning.
+// stores recording-enabled forms (fixed-shape MOVZ/MOVK runs for recorded
+// addresses) — those are the shapes worth pinning.
 
 #include "harness/VuTestHarness.h"
 #include "harness/RecompilerTestEnvironment.h"
@@ -45,6 +46,8 @@
 #include "Config.h"
 #include "arm64/microVU_Persist-arm64.h"
 #include "arm64/microVU_ProgCache-arm64.h"
+
+extern bool mVUvuAotVU0WindowHook(); // (microVU_VuAot-arm64.inl)
 
 #include <gtest/gtest.h>
 
@@ -69,7 +72,7 @@ inline VuOp LowerOnly(u32 lower)
 
 // One digest per probe program. The set mirrors the round-trip suite's
 // coverage axes: FMAC straight-line (upper pipeline + clamp emitters),
-// conditional branch both-arms (block linking, SelfBlockAbs fixups), and
+// conditional branch both-arms (block linking, block-object fixups), and
 // indirect jump (two emission episodes, jump-cache path, stub calls).
 struct DigestSet
 {
@@ -168,6 +171,15 @@ struct DigestSet
 	// 0 in a pin row = probe absent.
 	u64 clampEPartialAcc;
 	u64 signClampPartialAcc;
+	// The default-mode shapes the probes above do not reach, on VU1: MAX
+	// against VF0, a broadcast multiply by VF0.w behind the operand clamp, the
+	// OP ops at a w-less field, FCOR, Q into a single-lane MADD and a single-lane
+	// ADD (both computed in place at this mode), IBEQ between two live VIs, and
+	// LQ/SQ off a live VI. And VU0's load/store path, which reaches its memory
+	// through a pointer VU1's does not need. Added at abi 57.
+	// 0 in a pin row = probe absent.
+	u64 vu1DefaultShapes;
+	u64 vu0LoadStore;
 };
 
 struct AbiPin
@@ -419,6 +431,84 @@ constexpr AbiPin kPins[] = {
 	// instead of loading them. The probes that compile at vuClampMode 3 and 4
 	// move; the single-lane forms keep their Ldp, and modes 0 to 2 never emit it.
 	{39, {0x1b6417d39088c445, 0x4fb21f7df2e0eba1, 0x5b22843577880a34, 0x367caabd4ce98b70, 0x931e4ce41aaddfee, 0x528f4bc3805ce760, 0x474ca3bc38053234, 0xf3c90aa7361cb856, 0x97abca8e1e797c8e, 0x3a85dc8fbf46e675, 0xa1e2f7d5c83033f5, 0x28d99b6d7e13c0c8, 0x191cc45df004b45c, 0x008451d3443b1898, 0xb4d7293333bb33b9, 0x22851a1d6e1da4f7, 0x218d866b851d4396, 0xf59d5b3e255ec796, 0x205545fc7b500ddb, 0xfd15d794fe441fbf, 0x51aad4123c80fc0f, 0xc4b3d7d6d8249b94, 0x742e2538da750e4d, 0xebe95cc4b6a325c2, 0x025ba9f9ef343b1c, 0x7b59f4d79964c4b3}},
+	// abi 40: the single-lane clone-write rotation reads the cached register. Every
+	// probe with a y, z or w single-lane FMAC or div-unit operand moves.
+	{40, {0x1b6417d39088c445, 0x4fb21f7df2e0eba1, 0x5b22843577880a34, 0x367caabd4ce98b70, 0x931e4ce41aaddfee, 0x528f4bc3805ce760, 0x474ca3bc38053234, 0xc97e9916ce78f2c0, 0x97abca8e1e797c8e, 0x3a85dc8fbf46e675, 0xa1e2f7d5c83033f5, 0xe2b98245075f607d, 0x191cc45df004b45c, 0xe5bcbd769f0cc83d, 0xb7e746b32d5eb2ab, 0xf22bf72b61864a31, 0x415b885932416527, 0xcdc6cfb5fea6f42e, 0x205545fc7b500ddb, 0xfd15d794fe441fbf, 0x8ca5c650154688b7, 0xc4b3d7d6d8249b94, 0x742e2538da750e4d, 0xff2b4b6d7bf2a662, 0xf05dcc1e61ded6ec, 0xc20855db43aa02ee}},
+	// abi 41: the arithmetic step folds the clone-write copy in front of it, as the
+	// operand clamp already did. Every probe whose FMAC reads a cached VF moves.
+	{41, {0x30a4b851f584d87b, 0x4fb21f7df2e0eba1, 0x7be4a67c17a34d58, 0x42cdb6c017ffbcb7, 0xdc148443ac907bfd, 0xd53e1c6f0ab93994, 0x474ca3bc38053234, 0x08508bd89801b6f3, 0x97abca8e1e797c8e, 0x3a85dc8fbf46e675, 0xa1e2f7d5c83033f5, 0xe2b98245075f607d, 0x191cc45df004b45c, 0xe5bcbd769f0cc83d, 0xb7e746b32d5eb2ab, 0xf22bf72b61864a31, 0x415b885932416527, 0xcdc6cfb5fea6f42e, 0xd9b404bd2887a881, 0xfd15d794fe441fbf, 0x285938277c630ba8, 0xc0f07710fba14955, 0xca2ddace4f03527c, 0xff2b4b6d7bf2a662, 0xf05dcc1e61ded6ec, 0xc20855db43aa02ee}},
+	// abi 42: MAX/MINI against VF0 compile to one integer max or min. No probe
+	// issues one, so the row repeats abi 41's.
+	{42, {0x30a4b851f584d87b, 0x4fb21f7df2e0eba1, 0x7be4a67c17a34d58, 0x42cdb6c017ffbcb7, 0xdc148443ac907bfd, 0xd53e1c6f0ab93994, 0x474ca3bc38053234, 0x08508bd89801b6f3, 0x97abca8e1e797c8e, 0x3a85dc8fbf46e675, 0xa1e2f7d5c83033f5, 0xe2b98245075f607d, 0x191cc45df004b45c, 0xe5bcbd769f0cc83d, 0xb7e746b32d5eb2ab, 0xf22bf72b61864a31, 0x415b885932416527, 0xcdc6cfb5fea6f42e, 0xd9b404bd2887a881, 0xfd15d794fe441fbf, 0x285938277c630ba8, 0xc0f07710fba14955, 0xca2ddace4f03527c, 0xff2b4b6d7bf2a662, 0xf05dcc1e61ded6ec, 0xc20855db43aa02ee}},
+	// abi 43: VI arithmetic reads the cached source and folds its immediate. No
+	// probe adds to a cached VI, so the row repeats abi 42's.
+	{43, {0x30a4b851f584d87b, 0x4fb21f7df2e0eba1, 0x7be4a67c17a34d58, 0x42cdb6c017ffbcb7, 0xdc148443ac907bfd, 0xd53e1c6f0ab93994, 0x474ca3bc38053234, 0x08508bd89801b6f3, 0x97abca8e1e797c8e, 0x3a85dc8fbf46e675, 0xa1e2f7d5c83033f5, 0xe2b98245075f607d, 0x191cc45df004b45c, 0xe5bcbd769f0cc83d, 0xb7e746b32d5eb2ab, 0xf22bf72b61864a31, 0x415b885932416527, 0xcdc6cfb5fea6f42e, 0xd9b404bd2887a881, 0xfd15d794fe441fbf, 0x285938277c630ba8, 0xc0f07710fba14955, 0xca2ddace4f03527c, 0xff2b4b6d7bf2a662, 0xf05dcc1e61ded6ec, 0xc20855db43aa02ee}},
+	// abi 44: the status non-sticky clear reads the previous instance in place.
+	// Every probe ends in a flag-writing FMAC whose status the end forces.
+	{44, {0xcc5d8ed2aff67456, 0xf22354557ba8d4ba, 0x49140181ed6daa6d, 0x321e1e6abe00ab51, 0xb261732330cbb6c5, 0x59776b355a957571, 0x6bc6dc459520c9da, 0x6dcbc8ee9c41c950, 0x01e61f64bdbc1a38, 0x01c604cf32776547, 0x024ff6cd7fabd2c8, 0xb7ef7494b89aa3d8, 0x021b1d8ea47dc8e8, 0x47545cdb987b6602, 0x3a7def77c71d10af, 0x9fbf8b955489dc19, 0x8775d22d00a22275, 0xd304c548206d672b, 0xba027c76c09e3d5f, 0xf6775d1893001ca3, 0xb1e0cfecf4302713, 0x029663d8580ead20, 0x72a4cdceb608619f, 0xc3952268061ca731, 0x1e28c18d2d06b66a, 0xb492272d123efd35}},
+	// abi 45: VU1 address formation reads the base VI in place. Only the VU1
+	// load/store probe moves.
+	{45, {0xcc5d8ed2aff67456, 0xf22354557ba8d4ba, 0x49140181ed6daa6d, 0x321e1e6abe00ab51, 0xb261732330cbb6c5, 0x59776b355a957571, 0x6bc6dc459520c9da, 0x6dcbc8ee9c41c950, 0x01e61f64bdbc1a38, 0x01c604cf32776547, 0x024ff6cd7fabd2c8, 0xb7ef7494b89aa3d8, 0x021b1d8ea47dc8e8, 0x47545cdb987b6602, 0x3a7def77c71d10af, 0x9fbf8b955489dc19, 0x8775d22d00a22275, 0xd304c548206d672b, 0x9d323643d87a1b0a, 0xf6775d1893001ca3, 0xb1e0cfecf4302713, 0x029663d8580ead20, 0x72a4cdceb608619f, 0xc3952268061ca731, 0x1e28c18d2d06b66a, 0xb492272d123efd35}},
+	// abi 46: IBEQ/IBNE fold a vi00 operand and test the carried condition's low
+	// halfword. The probes whose branch is an IBNE against vi00 move.
+	{46, {0xcc5d8ed2aff67456, 0x3740d9d84d609b95, 0x49140181ed6daa6d, 0x321e1e6abe00ab51, 0x30d527dd8fe4d10c, 0x1a887bba90ef1a41, 0x51df58673dbf1b10, 0x6dcbc8ee9c41c950, 0x01e61f64bdbc1a38, 0x01c604cf32776547, 0x024ff6cd7fabd2c8, 0xb7ef7494b89aa3d8, 0x021b1d8ea47dc8e8, 0x47545cdb987b6602, 0x3a7def77c71d10af, 0x9fbf8b955489dc19, 0x8775d22d00a22275, 0xd304c548206d672b, 0x9d323643d87a1b0a, 0x43b9ebeda584952a, 0xb1e0cfecf4302713, 0x029663d8580ead20, 0x72a4cdceb608619f, 0xc3952268061ca731, 0x1e28c18d2d06b66a, 0xb492272d123efd35}},
+	// abi 47: FCOR is a BICS of the bits its immediate leaves clear. No probe
+	// issues one, so the row repeats abi 46's.
+	{47, {0xcc5d8ed2aff67456, 0x3740d9d84d609b95, 0x49140181ed6daa6d, 0x321e1e6abe00ab51, 0x30d527dd8fe4d10c, 0x1a887bba90ef1a41, 0x51df58673dbf1b10, 0x6dcbc8ee9c41c950, 0x01e61f64bdbc1a38, 0x01c604cf32776547, 0x024ff6cd7fabd2c8, 0xb7ef7494b89aa3d8, 0x021b1d8ea47dc8e8, 0x47545cdb987b6602, 0x3a7def77c71d10af, 0x9fbf8b955489dc19, 0x8775d22d00a22275, 0xd304c548206d672b, 0x9d323643d87a1b0a, 0x43b9ebeda584952a, 0xb1e0cfecf4302713, 0x029663d8580ead20, 0x72a4cdceb608619f, 0xc3952268061ca731, 0x1e28c18d2d06b66a, 0xb492272d123efd35}},
+	// abi 48: single-lane and Q multiplies take the by-element fold. No probe
+	// multiplies by Q or broadcasts into a single lane, so the row repeats 47's.
+	{48, {0xcc5d8ed2aff67456, 0x3740d9d84d609b95, 0x49140181ed6daa6d, 0x321e1e6abe00ab51, 0x30d527dd8fe4d10c, 0x1a887bba90ef1a41, 0x51df58673dbf1b10, 0x6dcbc8ee9c41c950, 0x01e61f64bdbc1a38, 0x01c604cf32776547, 0x024ff6cd7fabd2c8, 0xb7ef7494b89aa3d8, 0x021b1d8ea47dc8e8, 0x47545cdb987b6602, 0x3a7def77c71d10af, 0x9fbf8b955489dc19, 0x8775d22d00a22275, 0xd304c548206d672b, 0x9d323643d87a1b0a, 0x43b9ebeda584952a, 0xb1e0cfecf4302713, 0x029663d8580ead20, 0x72a4cdceb608619f, 0xc3952268061ca731, 0x1e28c18d2d06b66a, 0xb492272d123efd35}},
+	// abi 49: the OP ops permute from the cached multiplicands. No probe issues
+	// one, so the row repeats abi 48's.
+	{49, {0xcc5d8ed2aff67456, 0x3740d9d84d609b95, 0x49140181ed6daa6d, 0x321e1e6abe00ab51, 0x30d527dd8fe4d10c, 0x1a887bba90ef1a41, 0x51df58673dbf1b10, 0x6dcbc8ee9c41c950, 0x01e61f64bdbc1a38, 0x01c604cf32776547, 0x024ff6cd7fabd2c8, 0xb7ef7494b89aa3d8, 0x021b1d8ea47dc8e8, 0x47545cdb987b6602, 0x3a7def77c71d10af, 0x9fbf8b955489dc19, 0x8775d22d00a22275, 0xd304c548206d672b, 0x9d323643d87a1b0a, 0x43b9ebeda584952a, 0xb1e0cfecf4302713, 0x029663d8580ead20, 0x72a4cdceb608619f, 0xc3952268061ca731, 0x1e28c18d2d06b66a, 0xb492272d123efd35}},
+	// abi 50: a single-lane op clamps its scalar destination full width. The
+	// single-lane probes at clamp modes 2-4 and the EFU at mode 3 move.
+	{50, {0xcc5d8ed2aff67456, 0x3740d9d84d609b95, 0x49140181ed6daa6d, 0x321e1e6abe00ab51, 0x30d527dd8fe4d10c, 0x1a887bba90ef1a41, 0x51df58673dbf1b10, 0x6dcbc8ee9c41c950, 0x01e61f64bdbc1a38, 0x01c604cf32776547, 0x024ff6cd7fabd2c8, 0xace1f4023f0e8bf8, 0x021b1d8ea47dc8e8, 0xc8c50b58f3f9badd, 0x3a7def77c71d10af, 0x9fbf8b955489dc19, 0xd91488a73ad2068a, 0xd304c548206d672b, 0x9d323643d87a1b0a, 0x43b9ebeda584952a, 0xb1e0cfecf4302713, 0x029663d8580ead20, 0x72a4cdceb608619f, 0xe34a4dda6a35b3df, 0xf9c3d13580d762e9, 0x2c012558a97e0052}},
+	// abi 51: CLIP reads its operands in place. Only the CLIP probe moves.
+	{51, {0xcc5d8ed2aff67456, 0x3740d9d84d609b95, 0x49140181ed6daa6d, 0x321e1e6abe00ab51, 0x30d527dd8fe4d10c, 0x1a887bba90ef1a41, 0x51df58673dbf1b10, 0x6dcbc8ee9c41c950, 0x01e61f64bdbc1a38, 0x01c604cf32776547, 0x024ff6cd7fabd2c8, 0xace1f4023f0e8bf8, 0x021b1d8ea47dc8e8, 0xc8c50b58f3f9badd, 0x3a7def77c71d10af, 0x9fbf8b955489dc19, 0xd91488a73ad2068a, 0xd304c548206d672b, 0x9d323643d87a1b0a, 0x43b9ebeda584952a, 0xed424f10e0661fdf, 0x029663d8580ead20, 0x72a4cdceb608619f, 0xe34a4dda6a35b3df, 0xf9c3d13580d762e9, 0x2c012558a97e0052}},
+	// abi 52: DIV tests its operands for zero with FCMP under FZ. The three
+	// div-unit probes move.
+	{52, {0xcc5d8ed2aff67456, 0x3740d9d84d609b95, 0x49140181ed6daa6d, 0x321e1e6abe00ab51, 0x30d527dd8fe4d10c, 0x1a887bba90ef1a41, 0x51df58673dbf1b10, 0x929029ca42ca98c1, 0x01e61f64bdbc1a38, 0x01c604cf32776547, 0x024ff6cd7fabd2c8, 0xace1f4023f0e8bf8, 0x021b1d8ea47dc8e8, 0xc8c50b58f3f9badd, 0x530cf428707c7f11, 0x0be3b676bc50b217, 0xd91488a73ad2068a, 0xd304c548206d672b, 0x9d323643d87a1b0a, 0x43b9ebeda584952a, 0xed424f10e0661fdf, 0x029663d8580ead20, 0x72a4cdceb608619f, 0xe34a4dda6a35b3df, 0xf9c3d13580d762e9, 0x2c012558a97e0052}},
+	// abi 53: micro mode addresses VU memory off the x29 pin. Only the VU1
+	// load/store probe moves; the pin itself is set in the dispatcher.
+	{53, {0xcc5d8ed2aff67456, 0x3740d9d84d609b95, 0x49140181ed6daa6d, 0x321e1e6abe00ab51, 0x30d527dd8fe4d10c, 0x1a887bba90ef1a41, 0x51df58673dbf1b10, 0x929029ca42ca98c1, 0x01e61f64bdbc1a38, 0x01c604cf32776547, 0x024ff6cd7fabd2c8, 0xace1f4023f0e8bf8, 0x021b1d8ea47dc8e8, 0xc8c50b58f3f9badd, 0x530cf428707c7f11, 0x0be3b676bc50b217, 0xd91488a73ad2068a, 0xd304c548206d672b, 0x0cc9eeeb40bf56e4, 0x43b9ebeda584952a, 0xed424f10e0661fdf, 0x029663d8580ead20, 0x72a4cdceb608619f, 0xe34a4dda6a35b3df, 0xf9c3d13580d762e9, 0x2c012558a97e0052}},
+	// abi 54: a full-width ACC write keeps its result where it was computed.
+	// Only broadcastChain, which opens with an xyzw MULAx, moves.
+	{54, {0xcc5d8ed2aff67456, 0x3740d9d84d609b95, 0x49140181ed6daa6d, 0x8cd5553cb2a8daba, 0x30d527dd8fe4d10c, 0x1a887bba90ef1a41, 0x51df58673dbf1b10, 0x929029ca42ca98c1, 0x01e61f64bdbc1a38, 0x01c604cf32776547, 0x024ff6cd7fabd2c8, 0xace1f4023f0e8bf8, 0x021b1d8ea47dc8e8, 0xc8c50b58f3f9badd, 0x530cf428707c7f11, 0x0be3b676bc50b217, 0xd91488a73ad2068a, 0xd304c548206d672b, 0x0cc9eeeb40bf56e4, 0x43b9ebeda584952a, 0xed424f10e0661fdf, 0x029663d8580ead20, 0x72a4cdceb608619f, 0xe34a4dda6a35b3df, 0xf9c3d13580d762e9, 0x2c012558a97e0052}},
+	// abi 55: the identity multiply by VF0.w behind a clamp is dropped. No probe
+	// multiplies by VF0.w, so the row repeats abi 54's.
+	{55, {0xcc5d8ed2aff67456, 0x3740d9d84d609b95, 0x49140181ed6daa6d, 0x8cd5553cb2a8daba, 0x30d527dd8fe4d10c, 0x1a887bba90ef1a41, 0x51df58673dbf1b10, 0x929029ca42ca98c1, 0x01e61f64bdbc1a38, 0x01c604cf32776547, 0x024ff6cd7fabd2c8, 0xace1f4023f0e8bf8, 0x021b1d8ea47dc8e8, 0xc8c50b58f3f9badd, 0x530cf428707c7f11, 0x0be3b676bc50b217, 0xd91488a73ad2068a, 0xd304c548206d672b, 0x0cc9eeeb40bf56e4, 0x43b9ebeda584952a, 0xed424f10e0661fdf, 0x029663d8580ead20, 0x72a4cdceb608619f, 0xe34a4dda6a35b3df, 0xf9c3d13580d762e9, 0x2c012558a97e0052}},
+	// abi 56: IBEQ/IBNE XOR the cached Is in place. No probe compares two live
+	// VIs, so the row repeats abi 55's.
+	{56, {0xcc5d8ed2aff67456, 0x3740d9d84d609b95, 0x49140181ed6daa6d, 0x8cd5553cb2a8daba, 0x30d527dd8fe4d10c, 0x1a887bba90ef1a41, 0x51df58673dbf1b10, 0x929029ca42ca98c1, 0x01e61f64bdbc1a38, 0x01c604cf32776547, 0x024ff6cd7fabd2c8, 0xace1f4023f0e8bf8, 0x021b1d8ea47dc8e8, 0xc8c50b58f3f9badd, 0x530cf428707c7f11, 0x0be3b676bc50b217, 0xd91488a73ad2068a, 0xd304c548206d672b, 0x0cc9eeeb40bf56e4, 0x43b9ebeda584952a, 0xed424f10e0661fdf, 0x029663d8580ead20, 0x72a4cdceb608619f, 0xe34a4dda6a35b3df, 0xf9c3d13580d762e9, 0x2c012558a97e0052}},
+	// abi 57: single-lane y/z/w FMACs compute in place below clampE. Every
+	// single-lane probe runs at clampE or above, so the row repeats abi 56's.
+	// It also pins vu1DefaultShapes and vu0LoadStore, added at this version.
+	{57, {0xcc5d8ed2aff67456, 0x3740d9d84d609b95, 0x49140181ed6daa6d, 0x8cd5553cb2a8daba, 0x30d527dd8fe4d10c, 0x1a887bba90ef1a41, 0x51df58673dbf1b10, 0x929029ca42ca98c1, 0x01e61f64bdbc1a38, 0x01c604cf32776547, 0x024ff6cd7fabd2c8, 0xace1f4023f0e8bf8, 0x021b1d8ea47dc8e8, 0xc8c50b58f3f9badd, 0x530cf428707c7f11, 0x0be3b676bc50b217, 0xd91488a73ad2068a, 0xd304c548206d672b, 0x0cc9eeeb40bf56e4, 0x43b9ebeda584952a, 0xed424f10e0661fdf, 0x029663d8580ead20, 0x72a4cdceb608619f, 0xe34a4dda6a35b3df, 0xf9c3d13580d762e9, 0x2c012558a97e0052, 0xdb4ba733afd41dec, 0x0e5205525af143af}},
+	// abi 58: single-lane MOVE/MR32 insert into a cached destination. No probe
+	// issues one, so the row repeats abi 57's.
+	{58, {0xcc5d8ed2aff67456, 0x3740d9d84d609b95, 0x49140181ed6daa6d, 0x8cd5553cb2a8daba, 0x30d527dd8fe4d10c, 0x1a887bba90ef1a41, 0x51df58673dbf1b10, 0x929029ca42ca98c1, 0x01e61f64bdbc1a38, 0x01c604cf32776547, 0x024ff6cd7fabd2c8, 0xace1f4023f0e8bf8, 0x021b1d8ea47dc8e8, 0xc8c50b58f3f9badd, 0x530cf428707c7f11, 0x0be3b676bc50b217, 0xd91488a73ad2068a, 0xd304c548206d672b, 0x0cc9eeeb40bf56e4, 0x43b9ebeda584952a, 0xed424f10e0661fdf, 0x029663d8580ead20, 0x72a4cdceb608619f, 0xe34a4dda6a35b3df, 0xf9c3d13580d762e9, 0x2c012558a97e0052, 0xdb4ba733afd41dec, 0x0e5205525af143af}},
+	// abi 59: an E-bit conditional branch keeps its flag instances in place. Only
+	// shapes whose branch target reads flags early move; no probe has one.
+	{59, {0xcc5d8ed2aff67456, 0x3740d9d84d609b95, 0x49140181ed6daa6d, 0x8cd5553cb2a8daba, 0x30d527dd8fe4d10c, 0x1a887bba90ef1a41, 0x51df58673dbf1b10, 0x929029ca42ca98c1, 0x01e61f64bdbc1a38, 0x01c604cf32776547, 0x024ff6cd7fabd2c8, 0xace1f4023f0e8bf8, 0x021b1d8ea47dc8e8, 0xc8c50b58f3f9badd, 0x530cf428707c7f11, 0x0be3b676bc50b217, 0xd91488a73ad2068a, 0xd304c548206d672b, 0x0cc9eeeb40bf56e4, 0x43b9ebeda584952a, 0xed424f10e0661fdf, 0x029663d8580ead20, 0x72a4cdceb608619f, 0xe34a4dda6a35b3df, 0xf9c3d13580d762e9, 0x2c012558a97e0052, 0xdb4ba733afd41dec, 0x0e5205525af143af}},
+	// abi 60: VU0's window onto VU1's registers calls the transfer thunk for the STATUS quadword
+	// without MTVU too (vu0LoadStore only).
+	{60, {0xcc5d8ed2aff67456, 0x3740d9d84d609b95, 0x49140181ed6daa6d, 0x8cd5553cb2a8daba, 0x30d527dd8fe4d10c, 0x1a887bba90ef1a41, 0x51df58673dbf1b10, 0x929029ca42ca98c1, 0x01e61f64bdbc1a38, 0x01c604cf32776547, 0x024ff6cd7fabd2c8, 0xace1f4023f0e8bf8, 0x021b1d8ea47dc8e8, 0xc8c50b58f3f9badd, 0x530cf428707c7f11, 0x0be3b676bc50b217, 0xd91488a73ad2068a, 0xd304c548206d672b, 0x0cc9eeeb40bf56e4, 0x43b9ebeda584952a, 0xed424f10e0661fdf, 0x029663d8580ead20, 0x72a4cdceb608619f, 0xe34a4dda6a35b3df, 0xf9c3d13580d762e9, 0x2c012558a97e0052, 0xdb4ba733afd41dec, 0x48975533172d5ce5}},
+	// abi 61: that hook only while the vu-aot tier is wanted. The digests run with the setting off,
+	// so vu0LoadStore is abi 59's again.
+	{61, {0xcc5d8ed2aff67456, 0x3740d9d84d609b95, 0x49140181ed6daa6d, 0x8cd5553cb2a8daba, 0x30d527dd8fe4d10c, 0x1a887bba90ef1a41, 0x51df58673dbf1b10, 0x929029ca42ca98c1, 0x01e61f64bdbc1a38, 0x01c604cf32776547, 0x024ff6cd7fabd2c8, 0xace1f4023f0e8bf8, 0x021b1d8ea47dc8e8, 0xc8c50b58f3f9badd, 0x530cf428707c7f11, 0x0be3b676bc50b217, 0xd91488a73ad2068a, 0xd304c548206d672b, 0x0cc9eeeb40bf56e4, 0x43b9ebeda584952a, 0xed424f10e0661fdf, 0x029663d8580ead20, 0x72a4cdceb608619f, 0xe34a4dda6a35b3df, 0xf9c3d13580d762e9, 0x2c012558a97e0052, 0xdb4ba733afd41dec, 0x0e5205525af143af}},
+	// abi 62: a write allocated with an empty field leaves a temp (the vu-aot branch took this from
+	// mvu-local-rules, where it is abi 60). Only the two EFU probes move: ESUM is encoded with a zero
+	// field, which for it is not a destination mask, and its Fs slot is no longer recorded as VF0.
+	// Every other column is abi 61's. Pinned from the merged code.
+	{62, {0xcc5d8ed2aff67456, 0x3740d9d84d609b95, 0x49140181ed6daa6d, 0x8cd5553cb2a8daba, 0x30d527dd8fe4d10c, 0x1a887bba90ef1a41, 0x51df58673dbf1b10, 0x929029ca42ca98c1, 0x01e61f64bdbc1a38, 0x01c604cf32776547, 0x024ff6cd7fabd2c8, 0xace1f4023f0e8bf8, 0x021b1d8ea47dc8e8, 0xc8c50b58f3f9badd, 0x530cf428707c7f11, 0x0be3b676bc50b217, 0x791e61d19068a3bd, 0x14765f7c645b4aee, 0x0cc9eeeb40bf56e4, 0x43b9ebeda584952a, 0xed424f10e0661fdf, 0x029663d8580ead20, 0x72a4cdceb608619f, 0xe34a4dda6a35b3df, 0xf9c3d13580d762e9, 0x2c012558a97e0052, 0xdb4ba733afd41dec, 0x0e5205525af143af}},
+	// abi 63: recorded programs become relocatable across processes (the vu-progcache-aslr branch,
+	// numbered 40 there). Block pointers are runs as wide as the pointer (were four), the fixup
+	// records change shape, and a recorded cross-chunk B.cond keeps its short form. The digest also
+	// changed with it (it masks recorded B.cond displacements and the image and data-arena offsets
+	// in fixup records), so every column moves and none of the rows above is comparable to this one.
+	// Pinned from the merged code, stable across shuffled runs.
+	{63, {0xa48aa35478a78bdc, 0xd2cd8a66fb118db3, 0x3eb36a9cd84f76c7, 0x9cdcaa9d4fbe4aed, 0xac9ba26d82b481cf, 0x15c7e07ec93fdeb, 0x5dfd36d8bf388956, 0x2f39a76f7c0463d, 0xd6505b9f58da0e3d, 0xb167cadfd82d572a, 0xcff9c1f9cf303b6f, 0x20c6e112f962a426, 0x85ca05f33a95303a, 0x4fb1bf9c5361c248, 0xfcd572c1c3cd38fb, 0x48a8cdab505c6ae3, 0x9f82581ec2b20523, 0xbe0aaa4977c08f5a, 0x1d33ada241458b9a, 0x586a9035b7d90693, 0xe03d34d038f6e0a9, 0x4a888cdf933e9c1a, 0xc3d6512831b59ba7, 0x3a4c8b9888d132b1, 0xb391e1e028a4ecbd, 0x424df76350b0cc50, 0xacc16ea21944cbbd, 0x326f8e96526c9b16}},
 };
 
 u64 CompileAndDigest(std::initializer_list<vu::VuOp> pairs,
@@ -688,6 +778,38 @@ TEST(MvuAbiDigest, EmittedShapePinnedPerAbiVersion)
 	actual.clampEPartialAcc = CompileAndDigestClampE(partialAccProgram);
 	actual.signClampPartialAcc = CompileAndDigestSignClamp(partialAccProgram);
 
+	actual.vu1DefaultShapes = CompileAndDigestVu1({
+		LowerOnly(VIADDIU_L(vi::vi2, vi::vi0, 5)),
+		LowerOnly(VIADDIU_L(vi::vi3, vi::vi0, 5)),
+		LowerOnly(VDIV_L(vf::vf1, /*fsf=*/0, vf::vf2, /*ftf=*/1)),
+		UpperOnly(VMAX_U(mask::xyzw, vf::vf3, vf::vf1, vf::vf0)),
+		UpperOnly(VMULw_U(mask::y, vf::vf4, vf::vf1, vf::vf0)),
+		UpperOnly(VOPMULA_U(mask::xyz, vf::vf1, vf::vf2)),
+		UpperOnly(VOPMSUB_U(mask::xyz, vf::vf5, vf::vf1, vf::vf2)),
+		LowerOnly(VFCOR_L(0xFBEFBEu)),
+		LowerOnly(VLQ_L(mask::xyzw, vf::vf6, vi::vi2, 1)),
+		LowerOnly(VSQ_L(mask::xyzw, vf::vf1, vi::vi3, 2)),
+		VuOp{VWAITQ_L(), VNOP_U()},
+		UpperOnly(VMADDq_U(mask::w, vf::vf7, vf::vf1)),
+		UpperOnly(VADDw_U(mask::y, vf::vf8, vf::vf1, vf::vf2)),
+		LowerOnly(VIBEQ_L(vi::vi3, vi::vi2, 3)),
+		UpperOnly(VADD_U(mask::xyzw, vf::vf9, vf::vf1, vf::vf2)),
+		UpperOnly(bits::E | VSUB_U(mask::xyzw, vf::vf10, vf::vf1, vf::vf2)),
+		NopPair(),
+		UpperOnly(bits::E | VMUL_U(mask::xyzw, vf::vf11, vf::vf1, vf::vf2)),
+	},
+		// More than four flag writers ahead of the end: the forced flag hack
+		// leaves a zero's sticky bit out of the recompiler's status that the
+		// interpreter keeps.
+		"the flag hack drops a sticky zero the interpreter keeps");
+	actual.vu0LoadStore = CompileAndDigest({
+		LowerOnly(VLQ_L(mask::xyzw, vf::vf4, vi::vi0, 3)),
+		LowerOnly(VSQ_L(mask::xyzw, vf::vf4, vi::vi1, 2)),
+		LowerOnly(VILW_L(mask::x, vi::vi2, vi::vi1, 4)),
+		LowerOnly(VISWR_L(mask::x, vi::vi2, vi::vi1)),
+		UpperOnly(bits::E | VADD_U(mask::xyzw, vf::vf6, vf::vf4, vf::vf1)),
+	});
+
 	// The divUnit program under the same mode. Its three ops keep the host
 	// divide everywhere below it, so the arm that calls the model is emitted
 	// only here.
@@ -818,6 +940,8 @@ TEST(MvuAbiDigest, EmittedShapePinnedPerAbiVersion)
 	ASSERT_NE(actual.clampESS, 0u);
 	ASSERT_NE(actual.clampEPartialAcc, 0u);
 	ASSERT_NE(actual.signClampPartialAcc, 0u);
+	ASSERT_NE(actual.vu1DefaultShapes, 0u);
+	ASSERT_NE(actual.vu0LoadStore, 0u);
 	// MTVU is the only thing between the two, and it has to reach the emitter:
 	// equal digests mean the same exit was emitted either way and the probe
 	// above pins nothing.
@@ -872,7 +996,9 @@ TEST(MvuAbiDigest, EmittedShapePinnedPerAbiVersion)
 		<< ", 0x" << actual.mergeFold
 		<< ", 0x" << actual.clampESS
 		<< ", 0x" << actual.clampEPartialAcc
-		<< ", 0x" << actual.signClampPartialAcc << "}";
+		<< ", 0x" << actual.signClampPartialAcc
+		<< ", 0x" << actual.vu1DefaultShapes
+		<< ", 0x" << actual.vu0LoadStore << "}";
 
 	const auto explain = [&](const char* which, u64 got, u64 want) {
 		char buf[256];
@@ -995,6 +1121,13 @@ TEST(MvuAbiDigest, EmittedShapePinnedPerAbiVersion)
 		EXPECT_EQ(actual.signClampPartialAcc, pin->digests.signClampPartialAcc)
 			<< explain("signClampPartialAcc", actual.signClampPartialAcc, pin->digests.signClampPartialAcc);
 	}
+	if (pin->digests.vu1DefaultShapes != 0) // probes added at abi 57; older rows unpinned
+	{
+		EXPECT_EQ(actual.vu1DefaultShapes, pin->digests.vu1DefaultShapes)
+			<< explain("vu1DefaultShapes", actual.vu1DefaultShapes, pin->digests.vu1DefaultShapes);
+		EXPECT_EQ(actual.vu0LoadStore, pin->digests.vu0LoadStore)
+			<< explain("vu0LoadStore", actual.vu0LoadStore, pin->digests.vu0LoadStore);
+	}
 	if (pin->digests.vu1LoadStore != 0) // probe added at abi 24; older rows unpinned
 	{
 		EXPECT_EQ(actual.vu1LoadStore, pin->digests.vu1LoadStore)
@@ -1060,6 +1193,55 @@ TEST(MvuAbiDigest, EmittedShapeIndependentOfPriorCompile)
 		<< afterLow << " after VIADD vi5,vi6 vs 0x" << afterHigh
 		<< " after VIADD vi9,vi10) — mvuPreloadRegisters over-ran the block end "
 		   "into stale IRinfo.info[]. Emitted shape must be history-independent.";
+}
+
+// The vu-aot tripwire's hook on VU1's STATUS quadword of VU0's register window is emitted only while
+// the tier is wanted (section 9ad, ABI 61): with EnableVUAot off VU0's load/store shape is the one
+// from before the hook (the current pin, vu0LoadStore), and with it on it is the hook's shape. Rows
+// 59 to 62 of the table were computed before the digest changed with ABI 63 and no longer compare
+// with anything; the hook-on shape is pinned here instead. VU0's reset (the harness resets before
+// each compile) is where the choice is taken, as VMManager's settings change resets both VUs.
+TEST(MvuAbiDigest, Vu0WindowHookOnlyWhileVuAotIsWanted)
+{
+	ASSERT_TRUE(RecompilerTestEnvironment::IsReady());
+	mVUPersist::SetRecordingEnabled(true);
+	const auto findPin = [](u32 abi) -> u64 {
+		for (const AbiPin& p : kPins)
+			if (p.abi == abi)
+				return p.digests.vu0LoadStore;
+		return 0;
+	};
+	const auto probe = {
+		LowerOnly(VLQ_L(mask::xyzw, vf::vf4, vi::vi0, 3)),
+		LowerOnly(VSQ_L(mask::xyzw, vf::vf4, vi::vi1, 2)),
+		LowerOnly(VILW_L(mask::x, vi::vi2, vi::vi1, 4)),
+		LowerOnly(VISWR_L(mask::x, vi::vi2, vi::vi1)),
+		UpperOnly(bits::E | VADD_U(mask::xyzw, vf::vf6, vf::vf4, vf::vf1)),
+	};
+	const bool savedOpt = EmuConfig.Cpu.Recompiler.EnableVUAot;
+	EmuConfig.Cpu.Recompiler.EnableVUAot = false;
+	const u64 off = CompileAndDigest(probe);
+	const bool hookOff = mVUvuAotVU0WindowHook();
+	EmuConfig.Cpu.Recompiler.EnableVUAot = true;
+	const u64 on = CompileAndDigest(probe);
+	const bool hookOn = mVUvuAotVU0WindowHook();
+	EmuConfig.Cpu.Recompiler.EnableVUAot = savedOpt;
+	RecompilerTestEnvironment::ResetVuBlockCache(0);
+	mVUPersist::SetRecordingEnabled(false);
+
+	EXPECT_FALSE(hookOff);
+	EXPECT_TRUE(hookOn);
+	EXPECT_NE(on, off) << "the hook changed nothing";
+#if !(defined(__linux__) && !defined(__ANDROID__) && defined(__GLIBCXX__))
+	// The pins are harvested on Linux/libstdc++ (see the skip in the pinned-digest test above).
+	GTEST_SKIP() << "digest pins are harvested on Linux/libstdc++; the hook's presence is checked above";
+#endif
+	const u32 abi = mVUProgCache::GetCompilerAbiVersion();
+	EXPECT_EQ(off, findPin(abi)) << std::hex << "setting off: 0x" << off << ", abi " << std::dec << abi << " pinned 0x" << std::hex << findPin(abi);
+	// Pinned from the merged code at abi 63. Re-pin it with the table when an emitter change moves it.
+	constexpr u64 kHookOnDigestAbi63 = 0xccc45e874390054b;
+	EXPECT_EQ(abi, 63u) << "the hook-on pin is for abi 63: re-pin kHookOnDigestAbi63";
+	EXPECT_EQ(on, kHookOnDigestAbi63) << std::hex << "setting on: 0x" << on << ", pinned 0x" << kHookOnDigestAbi63;
 }
 
 } // namespace recompiler_tests

@@ -18,6 +18,7 @@ option(ENABLE_QT_UI "Enables building the PCSX2 Qt interface." ON)
 option(ENABLE_GSRUNNER "Enables building the GSRunner by default.  It can still be built with `make pcsx2-gsrunner` otherwise." OFF)
 option(LTO_PCSX2_CORE "Enable LTO/IPO/LTCG on the subset of pcsx2 that benefits most from it but not anything else")
 option(USE_VTUNE "Plug VTUNE to profile GS JIT.")
+option(USE_PERF_JITDUMP "Emit Linux perf jitdump (jit-<pid>.dump) for recompiled JIT blocks; use with perf record/inject. Diagnostic builds only." OFF)
 option(PACKAGE_MODE "Use this option to ease packaging of PCSX2 (developer/distribution option)")
 option(BUNDLE_EMOJI_FONT "Bundles Noto Color Emoji for systems whose system emoji font isn't usable by freetype" ON)
 option(POSITION_INDEPENDENT_CODE "Generate position-independent code. It is recommended that you leave this on." ON)
@@ -263,6 +264,11 @@ if(USE_VTUNE)
 	list(APPEND PCSX2_DEFS ENABLE_VTUNE)
 endif()
 
+# common/Perf.cpp writes the jitdump on __linux__, which Android defines.
+if(USE_PERF_JITDUMP)
+	list(APPEND PCSX2_DEFS ENABLE_PERF_JITDUMP)
+endif()
+
 if(USE_OPENGL)
 	list(APPEND PCSX2_DEFS ENABLE_OPENGL)
 endif()
@@ -291,6 +297,12 @@ endif()
 
 if (USE_PGO_GENERATE OR USE_PGO_OPTIMIZE)
 	add_compile_options("-fprofile-dir=${CMAKE_SOURCE_DIR}/profile")
+	# An internal-linkage function (static, anonymous namespace) is recorded under
+	# the source path exactly as the compiler was given it, so a profile applies to
+	# those functions only from the path that made it. With this, only the file's
+	# base name is recorded. It is needed on both sides: a profile made without it
+	# is keyed by path, and a build that has it will not find them.
+	add_compile_options("SHELL:-mllvm -static-func-full-module-prefix=false")
 endif()
 
 if (USE_PGO_GENERATE)

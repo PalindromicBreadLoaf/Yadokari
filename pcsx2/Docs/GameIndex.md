@@ -199,6 +199,7 @@ The clamp modes are also numerically based.
 * halfPixelOffset            [`0` or `1` or `2` or `3` or `4` or `5`] {Off, Normal Vertex, Special (Texture), Special (Texture Aggressive), Align to Native, Align to Native with Texture Offsets} Default: Off (`0`)
 * nativeScaling              [`0` or `1` or `2` or `3` or `4`]    {Off, Normal, Aggressive, Normal (Maintain Upscale) or Aggressive (Maintain Upscale)  }             Default: Normal (`0`)
 * nativePaletteDraw          [`0` or `1`]           {Off, On}                               Default: Off (`0`)
+* nativeCounterDraws         [`0` or `1`]           {Off, On}                               Default: Off (`0`)
 * roundSprite                [`0` or `1` or `2`]    {Off, Half or Full}                     Default: Off (`0`)
 
 ## Game Fixes
@@ -275,6 +276,9 @@ These values are in a key-value format, where the value is assumed to be an inte
 * Games such as PaRappa the Rapper 2 need VU1 to sync, so you can force sync with this parameter.
 * `eeCycleRate`
 * Accepted Values - `-3` / `3`
+* `iopThread`
+* Accepted Values - `0` / `1`
+* Runs the IOP on its own thread. This is off unless the player turns it on. `0` keeps a title on the single-threaded IOP even when the player has it on, for a title that needs the IOP in step with the EE.
 
 ## Memory Card Filter Override
 

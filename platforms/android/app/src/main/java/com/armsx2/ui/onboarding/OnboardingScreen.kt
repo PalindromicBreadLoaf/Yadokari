@@ -37,6 +37,7 @@ import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -60,14 +61,6 @@ import com.armsx2.ui.common.ArmsLogo
 import com.armsx2.ui.common.StatusChip
 import com.armsx2.ui.common.padFocusRing
 import com.armsx2.ui.theme.Success
-
-private val setupStepKeys = listOf(
-    "setup.page.welcome.title",
-    "setup.step.appData.title",
-    "setup.page.bios.title",
-    "setup.page.roms.title",
-    "setup.button.applyFinish",
-)
 
 @Composable
 fun OnboardingScreen(viewModel: OnboardingViewModel = viewModel()) {
@@ -147,7 +140,7 @@ fun OnboardingScreen(viewModel: OnboardingViewModel = viewModel()) {
                             val threshold = size.width * 0.16f
                             when {
                                 swipeDistance > threshold && state.page > 0 && !state.busy -> viewModel.previous()
-                                swipeDistance < -threshold && state.page < setupStepKeys.lastIndex && canContinue && !state.busy -> viewModel.next()
+                                swipeDistance < -threshold && state.page < state.steps.lastIndex && canContinue && !state.busy -> viewModel.next()
                             }
                             swipeDistance = 0f
                         },
@@ -159,12 +152,12 @@ fun OnboardingScreen(viewModel: OnboardingViewModel = viewModel()) {
             if (landscape) {
                 Row(Modifier.fillMaxSize(), horizontalArrangement = Arrangement.spacedBy(16.dp)) {
                     LandscapeHero(
-                        page = state.page,
+                        step = state.step,
                         modifier = Modifier.weight(0.92f).fillMaxHeight().padding(start = 8.dp, top = 16.dp, bottom = 16.dp),
                     )
                     Column(Modifier.weight(1.08f).fillMaxHeight().padding(end = 8.dp)) {
                         Spacer(Modifier.height(18.dp))
-                        PageIndicator(state.page, Modifier.align(Alignment.CenterHorizontally))
+                        PageIndicator(state.page, state.steps.size, Modifier.align(Alignment.CenterHorizontally))
                         Spacer(Modifier.height(8.dp))
                         AnimatedContent(
                             targetState = state.page,
@@ -188,11 +181,12 @@ fun OnboardingScreen(viewModel: OnboardingViewModel = viewModel()) {
                         }
                         NavigationBar(
                             page = state.page,
+                            isLast = state.page == state.steps.lastIndex,
                             canContinue = viewModel.canContinue(),
                             busy = state.busy,
                             compact = false,
                             onBack = viewModel::previous,
-                            onNext = if (state.page == setupStepKeys.lastIndex) viewModel::finish else viewModel::next,
+                            onNext = if (state.page == state.steps.lastIndex) viewModel::finish else viewModel::next,
                         )
                     }
                 }
@@ -204,7 +198,7 @@ fun OnboardingScreen(viewModel: OnboardingViewModel = viewModel()) {
                     ) {
                         ArmsLogo()
                         Spacer(Modifier.weight(1f))
-                        PageIndicator(state.page)
+                        PageIndicator(state.page, state.steps.size)
                     }
                     AnimatedContent(
                         targetState = state.page,
@@ -228,11 +222,12 @@ fun OnboardingScreen(viewModel: OnboardingViewModel = viewModel()) {
                     }
                     NavigationBar(
                         page = state.page,
+                        isLast = state.page == state.steps.lastIndex,
                         canContinue = viewModel.canContinue(),
                         busy = state.busy,
                         compact = true,
                         onBack = viewModel::previous,
-                        onNext = if (state.page == setupStepKeys.lastIndex) viewModel::finish else viewModel::next,
+                        onNext = if (state.page == state.steps.lastIndex) viewModel::finish else viewModel::next,
                     )
                 }
             }
@@ -258,17 +253,20 @@ private fun WizardPage(
     folderPicker: () -> Unit,
     onCustomStorage: () -> Unit,
 ) {
-    when (page) {
-        0 -> WelcomePage(compact = true)
-        1 -> StoragePage(state, compact = true, viewModel::selectStorage, onCustomStorage)
-        2 -> BiosPage(state, compact = true, onPick = biosPicker, onSelectBios = viewModel::selectBiosCandidate)
-        3 -> GamesPage(state, folderPicker, viewModel::removeGameFolder)
+    // The page that is animating out was drawn for its own index, so map through the list rather than state.step.
+    when (state.steps.getOrNull(page)) {
+        SetupStep.Welcome -> WelcomePage(compact = true)
+        SetupStep.Storage -> StoragePage(state, compact = true, viewModel::selectStorage, onCustomStorage)
+        SetupStep.Bios -> BiosPage(state, compact = true, onPick = biosPicker, onSelectBios = viewModel::selectBiosCandidate)
+        SetupStep.Games -> GamesPage(state, folderPicker, viewModel::removeGameFolder, viewModel::setFolderSubfolders)
+        SetupStep.Performance -> PerformancePage(state, viewModel::setAutoTune)
+        SetupStep.Driver -> DriverPage(state, viewModel::installDriver, viewModel::retryDriverOffer)
         else -> ReadyPage(state, compact = true)
     }
 }
 
 @Composable
-private fun LandscapeHero(page: Int, modifier: Modifier = Modifier) {
+private fun LandscapeHero(step: SetupStep, modifier: Modifier = Modifier) {
     Column(modifier, verticalArrangement = Arrangement.Center, horizontalAlignment = Alignment.CenterHorizontally) {
         Surface(
             modifier = Modifier.size(82.dp),
@@ -278,14 +276,14 @@ private fun LandscapeHero(page: Int, modifier: Modifier = Modifier) {
         ) { Box(contentAlignment = Alignment.Center) { ArmsLogo(showWordmark = false) } }
         Spacer(Modifier.height(24.dp))
         Text(
-            str(setupStepKeys[page]),
+            str(step.titleKey),
             style = MaterialTheme.typography.displaySmall,
             color = MaterialTheme.colorScheme.onBackground,
             textAlign = TextAlign.Center,
         )
         Spacer(Modifier.height(10.dp))
         Text(
-            str(if (page == 0) "setup.welcome.subheading" else "setup.recommended.subtitle"),
+            str(if (step == SetupStep.Welcome) "setup.welcome.subheading" else "setup.recommended.subtitle"),
             style = MaterialTheme.typography.bodyLarge,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
             textAlign = TextAlign.Center,
@@ -294,9 +292,9 @@ private fun LandscapeHero(page: Int, modifier: Modifier = Modifier) {
 }
 
 @Composable
-private fun PageIndicator(page: Int, modifier: Modifier = Modifier) {
+private fun PageIndicator(page: Int, count: Int, modifier: Modifier = Modifier) {
     Row(modifier, horizontalArrangement = Arrangement.spacedBy(7.dp)) {
-        setupStepKeys.indices.forEach { index ->
+        (0 until count).forEach { index ->
             Surface(
                 modifier = Modifier.width(if (index == page) 26.dp else 8.dp).height(8.dp),
                 shape = CircleShape,
@@ -582,9 +580,15 @@ private fun BiosDetails(state: OnboardingUiState, modifier: Modifier = Modifier)
 }
 
 @Composable
-private fun GamesPage(state: OnboardingUiState, onAdd: () -> Unit, onRemove: (String) -> Unit) {
+private fun GamesPage(
+    state: OnboardingUiState,
+    onAdd: () -> Unit,
+    onRemove: (String) -> Unit,
+    onSubfolders: (String, Boolean) -> Unit,
+) {
     SetupPage(str("setup.page.roms.title"), str("setup.step.rom.description")) {
         Column(verticalArrangement = Arrangement.spacedBy(9.dp)) {
+            val withoutSubfolders = com.armsx2.runtime.MainActivityRuntime.romsDirsWithoutSubfolders.value
             state.gameFolders.forEach { raw ->
                 val label = Uri.parse(raw).lastPathSegment?.substringAfterLast(':')?.ifBlank { null } ?: raw
                 Surface(
@@ -596,13 +600,131 @@ private fun GamesPage(state: OnboardingUiState, onAdd: () -> Unit, onRemove: (St
                     Row(Modifier.padding(14.dp), verticalAlignment = Alignment.CenterVertically) {
                         Text("▦", color = MaterialTheme.colorScheme.primary, fontSize = 20.sp)
                         Spacer(Modifier.width(12.dp))
-                        Text(label, modifier = Modifier.weight(1f), maxLines = 1, overflow = TextOverflow.Ellipsis)
+                        Column(Modifier.weight(1f)) {
+                            Text(label, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                            // Off: only the files directly in this folder are games, so a folder of
+                            // other things inside it (another console's, say) stays out of the library.
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Text(
+                                    str("setup.folder.subfolders"),
+                                    modifier = Modifier.weight(1f, fill = false),
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                                Spacer(Modifier.width(8.dp))
+                                Switch(
+                                    checked = raw !in withoutSubfolders,
+                                    onCheckedChange = { onSubfolders(raw, it) },
+                                    modifier = Modifier.padFocusRing(RoundedCornerShape(16.dp)),
+                                )
+                            }
+                        }
                         TextButton(onClick = { onRemove(raw) }) { Text(str("setup.button.remove"), color = MaterialTheme.colorScheme.error) }
                     }
                 }
             }
             OutlinedButton(onClick = onAdd, modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(14.dp)) {
                 Text(if (state.gameFolders.isEmpty()) str("setup.button.pickRomsFolder") else str("setup.button.addAnotherFolder"))
+            }
+        }
+    }
+}
+
+/** Asks whether the emulator may tune a game's performance settings by itself. On by default; the answer is saved when setup finishes. */
+@Composable
+private fun PerformancePage(state: OnboardingUiState, onAutoTune: (Boolean) -> Unit) {
+    SetupPage(str("setup.page.performance.title"), str("setup.step.performance.description")) {
+        Surface(
+            onClick = { onAutoTune(!state.autoTune) },
+            modifier = Modifier.fillMaxWidth().padFocusRing(RoundedCornerShape(20.dp)),
+            shape = RoundedCornerShape(20.dp),
+            color = if (state.autoTune) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceVariant,
+            border = BorderStroke(
+                if (state.autoTune) 2.dp else 1.dp,
+                if (state.autoTune) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outline.copy(alpha = 0.42f),
+            ),
+        ) {
+            Row(Modifier.padding(horizontal = 18.dp, vertical = 16.dp), verticalAlignment = Alignment.CenterVertically) {
+                Column(Modifier.weight(1f)) {
+                    Text(str("perf.autoTune.label"), style = MaterialTheme.typography.titleMedium, color = MaterialTheme.colorScheme.onSurface)
+                    Spacer(Modifier.height(4.dp))
+                    Text(
+                        str("setup.performance.autoTune.detail"),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                Spacer(Modifier.width(12.dp))
+                Switch(checked = state.autoTune, onCheckedChange = null)
+            }
+        }
+    }
+}
+
+/** Offers the ARMSX2 GPU driver built for this device (malisx2 on Mali, our Turnip on Adreno 6xx and 7xx).
+ *  Skipping costs nothing: the same download is in the GPU driver settings. */
+@Composable
+private fun DriverPage(state: OnboardingUiState, onInstall: () -> Unit, onRetry: () -> Unit) {
+    SetupPage(str("setup.page.driver.title"), str("setup.step.driver.description")) {
+        Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+            val pack = state.driverPack
+            if (pack != null) {
+                val megabytes = pack.sizeBytes / (1024.0 * 1024.0)
+                DriverPackCard(
+                    pack.releaseName.ifBlank { pack.assetName },
+                    listOf(state.driverSource, pack.tagName, if (pack.sizeBytes > 0) "%.0f MB".format(megabytes) else "")
+                        .filter(String::isNotBlank).joinToString(" · "),
+                )
+            }
+            when (state.driverStage) {
+                DriverStage.Loading -> Row(verticalAlignment = Alignment.CenterVertically) {
+                    CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp)
+                    Spacer(Modifier.width(10.dp))
+                    Text(str("backend.driver.fetching"), color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+                DriverStage.Unreachable -> {
+                    Text(str("setup.driver.unreachable"), color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    OutlinedButton(onClick = onRetry, modifier = Modifier.padFocusRing(RoundedCornerShape(14.dp))) { Text(str("setup.driver.retry")) }
+                }
+                DriverStage.Ready, DriverStage.Failed -> {
+                    if (state.driverStage == DriverStage.Failed) {
+                        Text(str("setup.driver.failed"), color = MaterialTheme.colorScheme.error)
+                    }
+                    Button(
+                        onClick = onInstall,
+                        modifier = Modifier.defaultMinSize(minHeight = 56.dp).padFocusRing(RoundedCornerShape(14.dp)),
+                        shape = RoundedCornerShape(14.dp),
+                    ) { Text(str("setup.driver.download"), fontWeight = FontWeight.Bold) }
+                }
+                DriverStage.Installing -> Row(verticalAlignment = Alignment.CenterVertically) {
+                    CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp)
+                    Spacer(Modifier.width(10.dp))
+                    Text(str("setup.driver.installing"), color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+                DriverStage.Installed -> StatusChip(str("setup.driver.installed"), Success)
+            }
+            if (state.driverIsMali) {
+                Text(str("setup.driver.mali.note"), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+            Text(str("setup.driver.skipHint"), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
+    }
+}
+
+/** The release name and its details stacked, each at full width. SummaryCard puts a short label beside a
+ *  short value, and a release name is long enough that the value would squeeze it into a narrow column. */
+@Composable
+private fun DriverPackCard(name: String, detail: String) {
+    Surface(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(18.dp),
+        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.74f),
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.36f)),
+    ) {
+        Column(Modifier.padding(17.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+            Text(name, style = MaterialTheme.typography.titleMedium, color = MaterialTheme.colorScheme.onSurface)
+            if (detail.isNotBlank()) {
+                Text(detail, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
         }
     }
@@ -700,6 +822,7 @@ private fun SummaryCard(title: String, value: String, modifier: Modifier = Modif
 @Composable
 private fun NavigationBar(
     page: Int,
+    isLast: Boolean,
     canContinue: Boolean,
     busy: Boolean,
     compact: Boolean,
@@ -745,7 +868,7 @@ private fun NavigationBar(
             }
             // "Next", not "Confirm": the welcome page literally says "Hit Next to get started", and
             // these steps advance a wizard rather than commit anything. Reported by Rei Ayanami.
-            Text(if (page == setupStepKeys.lastIndex) str("setup.button.letsGo") else str("setup.button.next"), fontWeight = FontWeight.Bold)
+            Text(if (isLast) str("setup.button.letsGo") else str("setup.button.next"), fontWeight = FontWeight.Bold)
         }
     }
 }

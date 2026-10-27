@@ -89,6 +89,12 @@ import androidx.core.content.edit
  * white text, transparent borders. Each row is 24dp tall to keep the
  * tab content fitting in the same 75% screen height the Playing-Now
  * tab uses.
+ *
+ * A row that edits a [com.armsx2.config.Settings] field names it with `field`, the key
+ * Settings.toJson uses. That is what tints the row (see [OverrideMarks]): green where the game
+ * database sets it for the game, soft red where it is not at a default. Each also gets a small marker,
+ * a diamond for the database and a circle for the player, so it does not rest on colour alone. A row with no
+ * `field` (an app preference, a preset, a picker over several fields) is never tinted.
  */
 
 private val focusBlue = Color(0xFF3DA5FF)
@@ -141,7 +147,8 @@ internal object SettingsControllerNav {
     // sibling subtrees dispose in the order Compose happens to pick: the survivor is left
     // holding a layer that is no longer active, so it looks fine and answers nothing.
     //
-    // Written only by PadModal, via pushLayer/popLayer. Everything else reads.
+    // Written only via pushLayer/popLayer: by PadModal, and by the in-game menu's Friends panel.
+    // Everything else reads.
     private val layers = mutableStateListOf<Layer>()
 
     /** The layer that currently owns input; null when the base screen does. */
@@ -278,12 +285,13 @@ internal object SettingsControllerNav {
      *  content it belongs to comes a moment later (the Icon Museum's panel, once its icons have
      *  loaded). The modal opens on [fallback] meanwhile, and [id] takes over when it registers,
      *  as long as the selection is still on [fallback]. */
-    private class LateFocus(val layer: String, val id: String, val fallback: String?)
+    private class LateFocus(val layer: String?, val id: String, val fallback: String?)
     private var lateFocus: LateFocus? = null
 
     /** For PadModal: [id], the focus [layer] asked for on open, is not there yet. Select it when
-     *  it registers, unless the pad has moved by then. */
-    fun focusWhenRegistered(layer: String, id: String) {
+     *  it registers, unless the pad has moved by then. A null [layer] is the base screen's (the
+     *  in-game menu reopening on the control it was left on). */
+    fun focusWhenRegistered(layer: String?, id: String) {
         lateFocus = LateFocus(layer, id, selectedId.value)
     }
 
@@ -291,8 +299,11 @@ internal object SettingsControllerNav {
         registry.remove(id)
         positions.remove(id)
         widths.remove(id)
+        // Handing the selection to the first control scrolls the page there. With the pad driving
+        // that keeps it somewhere reachable; under touch it only flung the page to the top when a
+        // tapped row went away, so the selection is dropped instead.
         if (selectedId.value == id)
-            selectedId.value = orderedIds().firstOrNull()
+            selectedId.value = if (com.armsx2.ui.common.PadInput.active.value) orderedIds().firstOrNull() else null
         selectedIndex.intValue = orderedIds().indexOf(selectedId.value)
     }
 
@@ -634,7 +645,10 @@ internal fun Modifier.controllerFocusable(
             }
         }
         .then(
-            if (focused || selected) {
+            // Only while the pad drives the UI: Compose focus lands on controls by itself (the
+            // first focusable one when the game surface lets go), and under touch a ring there is
+            // a selection nobody made.
+            if ((focused || selected) && com.armsx2.ui.common.PadInput.active.value) {
                 // Driver-safe selection ring: solid inner + translucent outer border. We
                 // deliberately avoid Modifier.shadow with a custom ambient/spot color here —
                 // Adreno / Mali / Turnip drivers frequently ignore the tint and render the
@@ -748,8 +762,10 @@ fun ToggleRow(
     label: String,
     value: Boolean,
     description: String? = null,
+    field: String? = null,
     onChange: (Boolean) -> Unit,
 ) {
+    val tint = rowTint(field)
     // Menu SFX: a distinct on/off blip on every flip. Touch, the switch, and the controller's A
     // all route through this, so one wrapper covers every input path.
     val emit: (Boolean) -> Unit = {
@@ -768,11 +784,8 @@ fun ToggleRow(
                 onConfirm = { emit(!value) },
             ),
         shape = RoundedCornerShape(22.dp),
-        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.72f),
-        border = androidx.compose.foundation.BorderStroke(
-            1.dp,
-            MaterialTheme.colorScheme.outline.copy(alpha = 0.46f),
-        ),
+        color = tint.container,
+        border = androidx.compose.foundation.BorderStroke(1.dp, tint.border),
     ) {
         Row(
             verticalAlignment = Alignment.CenterVertically,
@@ -783,7 +796,7 @@ fun ToggleRow(
         ) {
             Column(modifier = Modifier.weight(1f)) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
-                    Text(label, color = MaterialTheme.colorScheme.onSurface, fontSize = 18.sp, lineHeight = 23.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f))
+                    Text(label, color = MaterialTheme.colorScheme.onSurface, fontSize = 18.sp, lineHeight = 23.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f).overrideMarker(tint, 23.sp))
                     if (description != null) InfoHint(label, description)
                 }
                 if (description != null) {
@@ -825,8 +838,10 @@ fun IntSliderRow(
     description: String? = null,
     valueFormatter: (Int) -> String = { it.toString() },
     onReset: (() -> Unit)? = null,
+    field: String? = null,
     onChange: (Int) -> Unit,
 ) {
+    val tint = rowTint(field)
     // Include the call-site composite-key hash so two sliders that happen to share a
     // label (e.g. the OSD-scale and border-scale rows both labelled "UI Size") get
     // DISTINCT registry ids — otherwise one overwrites the other and the controller
@@ -848,11 +863,8 @@ fun IntSliderRow(
                 onRight = { onChangeSfx((value + 1).coerceAtMost(max)) },
             ),
         shape = RoundedCornerShape(22.dp),
-        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.72f),
-        border = androidx.compose.foundation.BorderStroke(
-            1.dp,
-            MaterialTheme.colorScheme.outline.copy(alpha = 0.46f),
-        ),
+        color = tint.container,
+        border = androidx.compose.foundation.BorderStroke(1.dp, tint.border),
     ) {
         Column(
             modifier = Modifier
@@ -863,7 +875,7 @@ fun IntSliderRow(
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Column(modifier = Modifier.weight(1f)) {
                     Row(verticalAlignment = Alignment.CenterVertically) {
-                        Text(label, color = MaterialTheme.colorScheme.onSurface, fontSize = 18.sp, lineHeight = 23.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f))
+                        Text(label, color = MaterialTheme.colorScheme.onSurface, fontSize = 18.sp, lineHeight = 23.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f).overrideMarker(tint, 23.sp))
                         if (description != null) InfoHint(label, description)
                     }
                     if (description != null) {
@@ -1125,8 +1137,10 @@ fun SegmentedRow(
     options: List<String>,
     selectedIndex: Int,
     description: String? = null,
+    field: String? = null,
     onChange: (Int) -> Unit,
 ) {
+    val tint = rowTint(field)
     // Menu SFX: a select blip when the chosen option changes — covers the chip tap and the
     // controller's confirm/left/right, which all route through onChange.
     val emit: (Int) -> Unit = { com.armsx2.MenuSfx.play(com.armsx2.MenuSfx.Event.SELECT); onChange(it) }
@@ -1135,8 +1149,8 @@ fun SegmentedRow(
             .fillMaxWidth()
             .padding(vertical = 5.dp)
             .clip(RoundedCornerShape(22.dp))
-            .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.72f))
-            .border(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.46f), RoundedCornerShape(22.dp))
+            .background(tint.container)
+            .border(1.dp, tint.border, RoundedCornerShape(22.dp))
             .controllerFocusable(
                 controllerId = "segmented:$label",
                 onConfirm = {
@@ -1160,7 +1174,7 @@ fun SegmentedRow(
                 modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
-                Text(label, color = MaterialTheme.colorScheme.onSurface, fontSize = 18.sp, lineHeight = 23.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f))
+                Text(label, color = MaterialTheme.colorScheme.onSurface, fontSize = 18.sp, lineHeight = 23.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f).overrideMarker(tint, 23.sp))
                 if (description != null) InfoHint(label, description)
             }
             if (description != null) {
@@ -1218,15 +1232,17 @@ fun SegmentedGridRow(
     selectedIndex: Int,
     columns: Int = 3,
     description: String? = null,
+    field: String? = null,
     onChange: (Int) -> Unit,
 ) {
+    val tint = rowTint(field)
     Box(
         Modifier
             .fillMaxWidth()
             .padding(vertical = 5.dp)
             .clip(RoundedCornerShape(22.dp))
-            .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.72f))
-            .border(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.46f), RoundedCornerShape(22.dp))
+            .background(tint.container)
+            .border(1.dp, tint.border, RoundedCornerShape(22.dp))
             .controllerFocusable(
                 controllerId = "segmented-grid:$label",
                 onConfirm = {
@@ -1247,7 +1263,7 @@ fun SegmentedGridRow(
     ) {
         Column {
             Row(verticalAlignment = Alignment.CenterVertically) {
-                Text(label, color = MaterialTheme.colorScheme.onSurface, fontSize = 18.sp, lineHeight = 23.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f))
+                Text(label, color = MaterialTheme.colorScheme.onSurface, fontSize = 18.sp, lineHeight = 23.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f).overrideMarker(tint, 23.sp))
                 if (description != null) InfoHint(label, description)
             }
             if (description != null) {

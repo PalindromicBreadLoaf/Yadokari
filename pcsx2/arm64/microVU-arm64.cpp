@@ -1,6 +1,14 @@
 // SPDX-FileCopyrightText: 2026 yaps2 Dev Team
 // SPDX-License-Identifier: GPL-3.0+
 
+// The vu-aot headers name things (Ft, Fs, X, Y ...) microVU's headers define as
+// macros, so they come first.
+#include "vuaot/VuAotBackground.h"
+#include "vuaot/VuAotLive.h"
+#include "vuaot/VuAotPersist.h"
+#include "vuaot/VuAotRegion.h"
+#include "vuaot/VuAotTier.h"
+
 #include "microVU-arm64.h"
 
 #include "microVU_ProgCache-arm64.h"
@@ -20,6 +28,7 @@
 //#define mVUcacheTrace
 
 #include <atomic>
+#include <bit>
 #include <cfloat>
 #include <cstdio>
 #include <cstdlib>
@@ -41,34 +50,9 @@
 alignas(16) microVU microVU0;
 alignas(16) microVU microVU1;
 
-//------------------------------------------------------------------
-// Micro VU - Observed-entry-PC tracking on microProgram. Single-
-// threaded per VU; the dispatcher records each `startPC` it hands
-// off into the resolved program so additional entry trampolines
-// can be emitted for previously-unseen PCs.
-//------------------------------------------------------------------
-
-bool MvuObservedEntries::record(u32 startPC_bytes)
-{
-	for (u32 i = 0; i < count; ++i)
-	{
-		if (pcs[i] == startPC_bytes)
-			return false;
-	}
-	if (count >= kMax)
-		return false;
-	pcs[count++] = startPC_bytes;
-	++version;
-	return true;
-}
-
-void MvuObservedEntries::clear()
-{
-	count   = 0;
-	version = 0;
-	for (u32 i = 0; i < kMax; ++i)
-		pcs[i] = 0;
-}
+// See iR5900-arm64.h. Written on the EE thread only: every VU0 path that arms
+// or disarms it runs there.
+u32 mVU0ParkedSpin = 0;
 
 //------------------------------------------------------------------
 // Micro VU - Program-cache range overlap helper
@@ -320,8 +304,8 @@ void mVUbuildOptionsSentinel(microVU& mVU)
 		u32 vu0Fpcr;
 		u32 vu1Fpcr;
 		// mVUPersist emit-time recording (the persisted-JIT program cache).
-		// Recording changes emitted code forms — canonical movz+movk×3 for
-		// self-block pointers, forced-long cross-chunk cond branches — so a
+		// Recording changes emitted code forms — fixed-shape MOVZ/MOVK runs
+		// for recorded addresses (block pointers, image addresses) — so a
 		// recording-enabled cache must never be matched against a recording-
 		// disabled run. This field reclaims a zeroed reserved byte, so the
 		// recording-OFF sentinel is bit-identical to the pre-recording one.
@@ -333,13 +317,16 @@ void mVUbuildOptionsSentinel(microVU& mVU)
 		// XgKickHack, which swaps a VI store for a whole cycle-by-cycle
 		// XGKICK sync at each kick and at every program end.
 		u8  xgKickHack;
+		// VU0 only: the vu-aot tripwire's hook in VU0's register-window access (mVUaddrFix). 0 when
+		// the tier is not wanted, which emits what version 59 emitted.
+		u8  vu0WindowHook;
 		// Reserved tail so adding a future option byte doesn't shift downstream
 		// fields. Reclaim bytes with 0 == "feature off / old behavior" so the
 		// off-state sentinel stays bit-identical (no wholesale eviction for
 		// users who never enable the feature); a reclaimed byte whose zero
 		// state is NOT emission-identical needs a kMvuCompilerAbiVersion bump
 		// in the same commit.
-		u8  reserved[9];
+		u8  reserved[8];
 	};
 	static_assert(sizeof(Snapshot) == 64, "options sentinel layout drifted — bump kMvuCompilerAbiVersion");
 
@@ -369,7 +356,14 @@ void mVUbuildOptionsSentinel(microVU& mVU)
 	s.vu1ExactMode     = EmuConfig.Cpu.Recompiler.vu1ExactMode     ? 1 : 0;
 
 	s.vuFlagHack      = EmuConfig.Speedhacks.vuFlagHack ? 1 : 0;
-	s.EECycleRate     = static_cast<s8>(EmuConfig.Speedhacks.EECycleRate);
+	// VU0 only. mVUtestCycles applies the EE nominal-rate adjustment for VU0
+	// alone, so VU1 generated code has never depended on this selector; baking
+	// it for both indices made every VU1 program identity churn on an EE
+	// speedhack change, and would make the dynamic governor evict the on-disk
+	// VU1 cache on every transition. Zero for VU1 is emission-identical to what
+	// VU1 emitted before, so no kMvuCompilerAbiVersion bump is needed; existing
+	// on-disk VU1 caches built at a nonzero rate evict once and rebuild.
+	s.EECycleRate     = (mVU.index == 0) ? static_cast<s8>(EECycleRate::GetEffective()) : 0;
 	s.EECycleSkip     = static_cast<u8>(EmuConfig.Speedhacks.EECycleSkip);
 	s.IbitHack        = EmuConfig.Gamefixes.IbitHack         ? 1 : 0;
 	s.VUSyncHack      = EmuConfig.Gamefixes.VUSyncHack       ? 1 : 0;
@@ -384,6 +378,7 @@ void mVUbuildOptionsSentinel(microVU& mVU)
 	s.progCacheRecording = mVUPersist::IsRecordingEnabled() ? 1 : 0;
 	s.threadVU1          = THREAD_VU1 ? 1 : 0;
 	s.xgKickHack         = EmuConfig.Gamefixes.XgKickHack ? 1 : 0;
+	s.vu0WindowHook      = (mVU.index == 0 && mVUvuAotVU0WindowHook()) ? 1 : 0;
 
 	mVU.optionsSentinel      = XXH3_128bits(&s, sizeof(s));
 	mVU.optionsSentinelValid = true;
@@ -467,20 +462,26 @@ void mVUinit(microVU& mVU, uint vuIndex)
 
 	mVU.regAlloc.reset(new microRegAlloc(mVU.index));
 
-	// Persisted-JIT recording follows the config bool — established before the
-	// sentinel (which bakes the recording byte). At boot this runs before
-	// settings finish loading, so it typically latches off and the first
-	// mVUreset corrects it. No-op under the test-manual override. See mVUreset.
-	mVUPersist::SyncRecordingFromConfig(EmuConfig.Cpu.Recompiler.EnableVUProgramCache);
+	// Persisted-JIT recording follows the config (EnableVUProgramCache or
+	// EnableVUAot: UseVUProgramCache) — established before the sentinel (which
+	// bakes the recording byte). At boot this runs before settings finish
+	// loading, so it typically latches off and the first mVUreset corrects it.
+	// No-op under the test-manual override. See mVUreset.
+	mVUPersist::SyncRecordingFromConfig(EmuConfig.Cpu.Recompiler.UseVUProgramCache());
+
+	// vu-aot live tier: whether it runs follows the config (VU1 only). Re-synced
+	// at every reset, before the dispatchers are emitted.
+	mVUvuAotSyncConfig(mVU);
 
 	// Seed options sentinel from current config snapshot. Reset will rebuild it
 	// in case the user toggled clamp / FPCR / speedhack settings since init.
 	mVUbuildOptionsSentinel(mVU);
 
-	// Open the on-disk program cache for this VU. Must run after
-	// mVUbuildOptionsSentinel because the VERSION-header handshake mixes the
-	// sentinel; a cache built with a different options layout is evicted here.
-	mVUProgCache::Init(mVU);
+	// The on-disk program cache is not opened here. At boot this runs before the settings are loaded, so
+	// it would open (or leave closed) a cache for the default configuration: with vu-aot on by default,
+	// a user who turned it off would get the cache's directories, its preload thread and a VERSION
+	// handshake against a sentinel built from the defaults. The first mVUreset opens it, with the loaded
+	// settings and the sentinel built from them, and every reset after it re-checks the settings.
 }
 
 //------------------------------------------------------------------
@@ -565,7 +566,10 @@ static void mVUdispatcherAB(mV)
 	armAsm->Mov(a64::w26, a64::w0);  // stash startPC
 	armAsm->Mov(a64::w27, a64::w1);  // stash cycles
 
-	armEmitCall(isVU1 ? (void*)mVUlookupProg_VU1 : (void*)mVUlookupProg_VU0);
+	// With the vu-aot live tier on, VU1 dispatches through the counting variant
+	// of the lookup; with it off the dispatcher is exactly what it was.
+	armEmitCall(isVU1 ? (mVUvuAotEnabled() ? (void*)mVUlookupProgTier_VU1 : (void*)mVUlookupProg_VU1)
+	                  : (void*)mVUlookupProg_VU0);
 
 	a64::Label gotHostEntry;
 	armAsm->Cbnz(a64::x0, &gotHostEntry);
@@ -610,6 +614,12 @@ static void mVUdispatcherAB(mV)
 	// SQRT et al. constant load goes via [gprMVUglob, #imm12] instead of
 	// materializing the global's absolute address.
 	armAsm->Ldr(gprMVUglob, reinterpret_cast<u64>(&mVUglob));
+
+	// Pin gprVUMem (x29) = VU.Mem, the data memory every LQ/SQ/ILW/ISW
+	// addresses, so a load or store with its byte index in hand is one
+	// [x29, index] access. The prolog saved the caller's x29; C calls out of
+	// a block preserve it (callee-saved).
+	armAsm->Ldr(gprVUMem, mVUstateMem(offsetof(VURegs, Mem)));
 
 	// Load VU-specific FPCR (round-toward-zero + FZ/DaZ) — only when needed.
 	// PS2 VU float ops require this rounding mode; the gating skips the
@@ -899,45 +909,52 @@ static void mVUGenerateWaitMTVU(mV)
 	// Sync the async VU1 worker before VU0/COP2 reads VU1's register space (the
 	// `addr & 0x400` seam in mVUaddrFix, reached under MTVU). x86's stub does the
 	// same save-call-restore around mVUwaitMTVU (microVU_Execute.inl); a bare Ret
-	// here silently skipped vu1Thread.WaitVU(), racing the VU1 thread.
+	// here silently skipped vu1Thread.WaitVU(), racing the VU1 thread. The same
+	// thunk is also what mVUaddrFix calls, without MTVU, for an access to VU1's
+	// STATUS quadword: mVUwaitMTVU tells the vu-aot tier about it. The address
+	// (gprT1, x9) goes to the C function in w0.
 	//
 	// This thunk is reached via BL from inside a compiled VU/COP2 block whose
 	// register allocator is NOT flushed at the seam, so it must be transparent:
 	// preserve everything the AAPCS call to mVUwaitMTVU can clobber that may be
-	// live there. Callee-saved state survives the C call automatically (x19-x28 =
-	// gprVUState/flags/mVUglob + the VI pool's x26-x28; x29). What we must save:
+	// live there, which is every caller-saved register but x18. Callee-saved
+	// state survives the C call automatically (x19-x28 = gprVUState/flags/mVUglob
+	// + the VI pool's x26-x28; x29). What we must save:
 	//   * q0-q27  — the full VF allocation pool; any subset may be live, and the
 	//               C call only preserves the low 64 bits of q8-q15 (d8-d15), so
 	//               those must be spilled in full to keep the VF upper lanes.
 	//   * q28     — PQ (mVUbackupRegs treats it as live across every C call).
-	//   * x9      — gprT1, holds the fixed-up address, consumed after the call.
-	//   * x14/x15 — the caller-saved half of the VI GPR pool.
-	//   * x10-x13 — saved only to keep a clean contiguous window (harmless; in
-	//               COP2 macro mode x11-x13 are EE pins the seam flush/reloads).
+	//   * x0-x17  — x9 is gprT1 and holds the fixed-up address, consumed after
+	//               the call; x14/x15 are the caller-saved half of the VI GPR pool;
+	//               x11-x13 are EE pins in COP2 macro mode; x0-x7 are cached EE GPRs
+	//               there (a macro op that cannot reach this call evicts only the
+	//               slice of the cache it can touch, so they must survive it);
+	//               x8, x10, x16 and x17 are scratch, saved to keep one contiguous
+	//               window.
 	//   * x30     — the inner BL overwrites LR; without restoring it, ret returns
 	//               into this thunk and walks sp into the thread's guard page.
-	// The COP2 EE-pin flush/reload brackets this call at the seam, so the
-	// clobbered tier-2 EE pins are handled there, not here.
-	constexpr int kGprBytes  = 8 * 8;                  // x9-x15 + x30
+	// The COP2 EE-pin flush/reload brackets the MTVU call at the seam; it is no
+	// longer needed for the pins (x11-x13 are saved here) but costs nothing next
+	// to the wait it brackets.
+	constexpr int kGprBytes  = 20 * 8;                 // x0-x17, x30, one pad word
 	constexpr int kNeonBytes = 29 * 16;                // q0-q28
-	constexpr int kFrame     = kGprBytes + kNeonBytes; // 0x210, 16-byte aligned
+	constexpr int kFrame     = kGprBytes + kNeonBytes; // 0x270, 16-byte aligned
 
 	armAsm->Sub(a64::sp, a64::sp, kFrame);
 	// GPRs first (STP x has a ±504 signed offset limit; keep it near sp).
-	armAsm->Stp(a64::x9,  a64::x10, a64::MemOperand(a64::sp, 0));
-	armAsm->Stp(a64::x11, a64::x12, a64::MemOperand(a64::sp, 16));
-	armAsm->Stp(a64::x13, a64::x14, a64::MemOperand(a64::sp, 32));
-	armAsm->Stp(a64::x15, a64::x30, a64::MemOperand(a64::sp, 48));
+	for (int i = 0; i < 18; i += 2)
+		armAsm->Stp(armXRegister(i), armXRegister(i + 1), a64::MemOperand(a64::sp, i * 8));
+	armAsm->Str(a64::x30, a64::MemOperand(a64::sp, 18 * 8));
 	for (int i = 0; i < 28; i += 2)
 		armAsm->Stp(armQRegister(i), armQRegister(i + 1), a64::MemOperand(a64::sp, kGprBytes + i * 16));
 	armAsm->Str(qmmPQ, a64::MemOperand(a64::sp, kGprBytes + 28 * 16));
 
+	armAsm->Mov(a64::w0, a64::w9);
 	armEmitCall((void*)mVUwaitMTVU);
 
-	armAsm->Ldp(a64::x9,  a64::x10, a64::MemOperand(a64::sp, 0));
-	armAsm->Ldp(a64::x11, a64::x12, a64::MemOperand(a64::sp, 16));
-	armAsm->Ldp(a64::x13, a64::x14, a64::MemOperand(a64::sp, 32));
-	armAsm->Ldp(a64::x15, a64::x30, a64::MemOperand(a64::sp, 48));
+	for (int i = 0; i < 18; i += 2)
+		armAsm->Ldp(armXRegister(i), armXRegister(i + 1), a64::MemOperand(a64::sp, i * 8));
+	armAsm->Ldr(a64::x30, a64::MemOperand(a64::sp, 18 * 8));
 	for (int i = 0; i < 28; i += 2)
 		armAsm->Ldp(armQRegister(i), armQRegister(i + 1), a64::MemOperand(a64::sp, kGprBytes + i * 16));
 	armAsm->Ldr(qmmPQ, a64::MemOperand(a64::sp, kGprBytes + 28 * 16));
@@ -1163,23 +1180,32 @@ void mVUGenerateModelStubs(mV)
 }
 
 // Resets Rec Data
-void mVUreset(microVU& mVU, bool resetReserve)
+void mVUreset(microVU& mVU, bool resetReserve, bool vu1Idle)
 {
+	EECycleRate::NoteVuReset(mVU.index);
+
 #ifdef mVUcacheTrace
 	mVUCacheTraceDump(mVU, "pre-reset");
 	++g_mVUCacheTrace[mVU.index & 1].reset_calls;
 #endif
 
-	// Persisted-JIT recording follows the EnableVUProgramCache config bool, and
-	// MUST be established here — before mVUbuildOptionsSentinel bakes the
-	// recording byte and before any gameplay program compiles. This is the
-	// authoritative sync point: InitializeCPUProviders runs before settings
-	// load the bool, so a one-shot enable there would latch the default (off)
-	// and never correct, leaving the disk cache writing telemetry-only entries
-	// with no payloads. The disk Init below is re-synced on the same reset, so
-	// recording and the cache move in lockstep. No-op under the test-manual
-	// override (the recompiler-test harness drives recording itself).
-	mVUPersist::SyncRecordingFromConfig(EmuConfig.Cpu.Recompiler.EnableVUProgramCache);
+	// Persisted-JIT recording follows the program cache setting (EnableVUProgramCache,
+	// or EnableVUAot, which turns the cache on: UseVUProgramCache), and MUST be
+	// established here — before mVUbuildOptionsSentinel bakes the recording byte
+	// and before any gameplay program compiles. This is the authoritative sync
+	// point: InitializeCPUProviders runs before settings load the bool, so a
+	// one-shot enable there would latch the default (off) and never correct,
+	// leaving the disk cache writing telemetry-only entries with no payloads.
+	// The disk Init below is re-synced on the same reset, so recording and the
+	// cache move in lockstep. No-op under the test-manual override (the
+	// recompiler-test harness drives recording itself).
+	mVUPersist::SyncRecordingFromConfig(EmuConfig.Cpu.Recompiler.UseVUProgramCache());
+
+	// vu-aot live tier (EnableVUAot): re-read the config now, because the VU1
+	// dispatcher emitted below calls the counting lookup only while it is on.
+	// Settings changes, savestate loads and cache exhaustion all come through
+	// this reset, which also frees every program (and so the tier's state for it).
+	mVUvuAotSyncConfig(mVU);
 
 	// Rebuild options sentinel before any program rebuilds — config may have
 	// changed since the last init/reset (clamp flips, FPCR edits, speedhack
@@ -1188,12 +1214,12 @@ void mVUreset(microVU& mVU, bool resetReserve)
 	mVUbuildOptionsSentinel(mVU);
 
 	// Re-enter the disk-cache init: a no-op when already up (or when the
-	// EnableVUProgramCache config bool is off), but the activation point when
-	// the user toggled the cache on — settings changes funnel through
-	// ClearCPUExecutionCaches → this reset.
+	// cache is off: neither EnableVUProgramCache nor EnableVUAot is set), but the
+	// activation point when the user toggled the cache or vu-aot on — settings
+	// changes funnel through ClearCPUExecutionCaches → this reset.
 	mVUProgCache::Init(mVU);
 
-	if (THREAD_VU1)
+	if (THREAD_VU1 && !vu1Idle)
 	{
 		DevCon.Warning("mVU Reset");
 		if (VU0.VI[REG_VPU_STAT].UL & 0x100)
@@ -1232,7 +1258,10 @@ void mVUreset(microVU& mVU, bool resetReserve)
 	// tail) AFTER the exiting block armed it — this null must win (VE-07).
 	mVU.resumeEntry = nullptr;
 	mVU.resumeBlock = nullptr;
+	if (!mVU.index)
+		mVU0ParkedSpin = 0;
 	mVU.branchCondCarryGpr = -1;
+	mVU.branchCondCarryLow16 = false;
 	mVU.profiler.Reset(mVU.index);
 
 	// Program Variables
@@ -1271,8 +1300,19 @@ void mVUreset(microVU& mVU, bool resetReserve)
 	// Checkpoint the live programs to the on-disk program cache before we
 	// free them. Subsequent process boots can hit this VU image without
 	// re-emitting. SaveAllPrograms is idempotent (no-op on hashes already
-	// in the on-disk INDEX) so calling on every reset is cheap.
-	mVUProgCache::SaveAllPrograms(mVU);
+	// in the on-disk INDEX) so calling on every reset is cheap. The vu-aot
+	// tier hands its programs' plans to the cache's writer first.
+	//
+	// A cache that is up but no longer wanted (the setting was turned off, or it came up at boot under the
+	// default configuration before the settings were read) is closed instead, and nothing is saved: its
+	// writer and preload threads stop, so a settings change that deletes its files finds nothing using them.
+	if (EmuConfig.Cpu.Recompiler.UseVUProgramCache())
+	{
+		mVUvuAotSaveAll(mVU);
+		mVUProgCache::SaveAllPrograms(mVU);
+	}
+	else
+		mVUProgCache::Close(mVU);
 
 	// Single ownership lives in mVU.mvuContentMap. Free each program
 	// exactly once via the map iteration; per-PC deques and quick slots are
@@ -1299,6 +1339,7 @@ void mVUreset(microVU& mVU, bool resetReserve)
 		mVU.prog.quick[i].block = NULL;
 		mVU.prog.quick[i].prog = NULL;
 	}
+	std::memset(mVU.prog.quickOcc, 0, sizeof(mVU.prog.quickOcc));
 
 #ifdef mVUcacheTrace
 	mVUCacheTraceResetWindow(mVU.index);
@@ -1314,9 +1355,12 @@ void mVUclose(microVU& mVU)
 
 	// Final checkpoint of live programs to the on-disk cache before we let
 	// the contentMap go. Mirrors the mVUreset path; harmless if nothing
-	// new has been added since the last reset.
+	// new has been added since the last reset. The vu-aot tier's plans go to the
+	// cache's writer first; Close writes them before it returns.
+	mVUvuAotSaveAll(mVU);
 	mVUProgCache::SaveAllPrograms(mVU);
 	mVUProgCache::Close(mVU);
+	mVUvuAotOnClose(mVU);
 
 	// Same ownership rule as mVUreset: free via contentMap (plus the
 	// drift-evicted orphans), then drop the per-PC deque shells.
@@ -1338,6 +1382,15 @@ void mVUclose(microVU& mVU)
 	}
 }
 
+// quick[slot] takes a program. The one place a slot goes from empty to
+// occupied: it also sets the slot's bit in prog.quickOcc, which mVUclear walks
+// in place of the whole array.
+static __fi void mVUquickInstall(microVU& mVU, u32 slot, microProgram* prog)
+{
+	mVU.prog.quick[slot].prog = prog;
+	mVU.prog.quickOcc[slot >> 6] |= u64(1) << (slot & 63);
+}
+
 // Clears Block Data in specified range
 __fi void mVUclear(mV, u32 addr, u32 size)
 {
@@ -1350,8 +1403,11 @@ __fi void mVUclear(mV, u32 addr, u32 size)
 	// contract as the lpState zero below. A mid-run write to the running
 	// program's code must force the next dispatch through the full
 	// search-resolve (program identity may have changed); the resume
-	// shortcut would re-enter stale code (VE-07).
+	// shortcut would re-enter stale code (VE-07). The parked spin rides the
+	// same resume, so it goes with it.
 	mVU.resumeEntry = nullptr;
+	if (!mVU.index)
+		mVU0ParkedSpin = 0;
 
 #ifdef mVUcacheTrace
 	mVUCacheTraceObserveClear(mVU, addr, size, /*wasRealClear=*/!mVU.prog.cleared);
@@ -1366,10 +1422,15 @@ __fi void mVUclear(mV, u32 addr, u32 size)
 		{
 			mVU.prog.cleared = 1;
 			std::memset(&mVU.prog.lpState, 0, sizeof(mVU.prog.lpState));
-			for (u32 i = 0; i < (mVU.progSize / 2); i++)
+			for (u32 w = 0; w < (mVU.progSize / 2 + 63) / 64; w++)
 			{
-				mVU.prog.quick[i].block = NULL;
-				mVU.prog.quick[i].prog  = NULL;
+				for (u64 bits = mVU.prog.quickOcc[w]; bits; bits &= bits - 1)
+				{
+					microProgramQuick& q = mVU.prog.quick[w * 64 + std::countr_zero(bits)];
+					q.block = NULL;
+					q.prog  = NULL;
+				}
+				mVU.prog.quickOcc[w] = 0;
 			}
 		}
 		return;
@@ -1379,16 +1440,28 @@ __fi void mVUclear(mV, u32 addr, u32 size)
 	// compiled range overlapping [addr, addr+size). Programs whose ranges are
 	// disjoint from the touched bytes stay quick-cached, skipping the per-PC
 	// deque walk on the next dispatch.
-	for (u32 i = 0; i < (mVU.progSize / 2); i++)
+	//
+	// Only occupied slots are visited (prog.quickOcc): a game holds a handful
+	// out of 2048, and this runs on every micro-memory write, so a scan of the
+	// whole array was the dominant cost of the call. A bit with no program
+	// behind it (not reachable while every installer goes through
+	// mVUquickInstall) reads as "overlaps" in mVUProgRangesOverlap and is
+	// dropped here.
+	for (u32 w = 0; w < (mVU.progSize / 2 + 63) / 64; w++)
 	{
-		const microProgram* p = mVU.prog.quick[i].prog;
-		if (!p)
-			continue;
-		if (mVUProgRangesOverlap(p, addr, size))
+		u64 keep = mVU.prog.quickOcc[w];
+		for (u64 bits = keep; bits; bits &= bits - 1)
 		{
-			mVU.prog.quick[i].block = NULL;
-			mVU.prog.quick[i].prog  = NULL;
+			const u32 bit = std::countr_zero(bits);
+			microProgramQuick& q = mVU.prog.quick[w * 64 + bit];
+			if (mVUProgRangesOverlap(q.prog, addr, size))
+			{
+				q.block = NULL;
+				q.prog  = NULL;
+				keep &= ~(u64(1) << bit);
+			}
 		}
+		mVU.prog.quickOcc[w] = keep;
 	}
 
 	// Drop the carried entry-search key on ANY micro-mem write — x86's
@@ -1434,6 +1507,7 @@ __ri void mVUdeleteProg(microVU& mVU, microProgram*& prog)
 	}
 	safe_delete(prog->ranges);
 	mVUPersist::OnProgramDeleted(*prog);
+	mVUvuAotOnProgramDeleted(*prog);
 	safe_aligned_free(prog);
 }
 
@@ -1449,11 +1523,6 @@ __ri microProgram* mVUcreateProg(microVU& mVU, int startPC, const XXH128_hash_t&
 	prog->ranges = new std::deque<microRange>();
 	prog->startPC = startPC;
 	prog->refcount = 0; // Caller increments when pushing into a per-PC deque.
-	// Record the creator's startPC (microMem byte offset) as the first
-	// observed entry. mVUsearchProg appends any additional PCs seen
-	// during the program's lifetime.
-	prog->observed.clear();
-	prog->observed.record(static_cast<u32>(startPC) * 8u);
 	if(doWholeProgCompare)
 		mVUcacheProg(mVU, *prog);
 
@@ -1598,8 +1667,9 @@ __fi bool mVUcmpProg(microVU& mVU, microProgram& prog)
 _mVUt __fi void* mVUsearchProg(u32 startPC, uptr pState)
 {
 	microVU& mVU = mVUx;
-	microProgramQuick& quick = mVU.prog.quick[mVU.regs().start_pc / 8];
-	microProgramList*  list  = mVU.prog.prog [mVU.regs().start_pc / 8];
+	const u32 slot = mVU.regs().start_pc / 8;
+	microProgramQuick& quick = mVU.prog.quick[slot];
+	microProgramList*  list  = mVU.prog.prog [slot];
 
 	if (!quick.prog)
 	{
@@ -1625,12 +1695,9 @@ _mVUt __fi void* mVUsearchProg(u32 startPC, uptr pState)
 				mVUCacheTraceObserveWalk(mVU.index, walkIters, /*matched=*/true, /*matchPos=*/walkIters - 1);
 #endif
 				quick.block = it[0]->block[startPC / 8];
-				quick.prog  = it[0];
+				mVUquickInstall(mVU, slot, it[0]);
 				list->erase(it);
 				list->push_front(quick.prog);
-				// Per-PC deque match resolved to this program;
-				// record the dispatched entry.
-				quick.prog->observed.record(startPC);
 
 				if (quick.block == nullptr)
 				{
@@ -1659,12 +1726,8 @@ _mVUt __fi void* mVUsearchProg(u32 startPC, uptr pState)
 			mVU.prog.cleared = 0;
 			mVU.prog.isSame  = 1;
 			mVU.prog.cur     = shared;
-			quick.prog       = shared;
+			mVUquickInstall(mVU, slot, shared);
 			quick.block      = shared->block[startPC / 8];
-			// Record the dispatched entry on the resolved program.
-			// Idempotent on duplicates; bumps `observed.version` only
-			// when this PC is new for the program.
-			shared->observed.record(startPC);
 			if (quick.block == nullptr)
 			{
 				// First time this startPC is compiled for the shared program
@@ -1679,6 +1742,10 @@ _mVUt __fi void* mVUsearchProg(u32 startPC, uptr pState)
 		// program. Try hydrating the block graph from the on-disk cache
 		// before compiling from scratch.
 		mVUProgCache::ObserveDispatchHash(mVU, liveHash, startPC);
+		// A program is about to be made or loaded for the image in micro memory now: the vu-aot
+		// tripwire looks it over for a reader of the sticky bits of STATUS.
+		if constexpr (vuIndex == 1)
+			mVUvuAotOnNewProgram(mVU);
 		if (microProgram* hydrated = mVUProgCache::TryLoadProgram(mVU, liveHash))
 		{
 			// Same install sequence as the contentMap-hit path above —
@@ -1688,9 +1755,12 @@ _mVUt __fi void* mVUsearchProg(u32 startPC, uptr pState)
 			mVU.prog.cleared = 0;
 			mVU.prog.isSame  = 1;
 			mVU.prog.cur     = hydrated;
-			quick.prog       = hydrated;
+			// The vu-aot tier reads the program's saved plan, if it has one, before anything can
+			// reach the program: no quick slot or jump cache names it yet.
+			if constexpr (vuIndex == 1)
+				mVUvuAotOnProgramReady(mVU, *hydrated);
+			mVUquickInstall(mVU, slot, hydrated);
 			quick.block      = hydrated->block[startPC / 8];
-			hydrated->observed.record(startPC);
 			if (quick.block == nullptr)
 			{
 				// The image carried no block for this entry PC — compile it
@@ -1705,13 +1775,11 @@ _mVUt __fi void* mVUsearchProg(u32 startPC, uptr pState)
 		mVU.prog.cleared = 0;
 		mVU.prog.isSame  = 1;
 		mVU.prog.cur     = mVUcreateProg(mVU, mVU.regs().start_pc/8, liveHash);
-		// createProg seeded `observed` with its own startPC; record
-		// the dispatcher's `startPC` too (idempotent if they match,
-		// which is the common case).
-		mVU.prog.cur->observed.record(startPC);
+		if constexpr (vuIndex == 1)
+			mVUvuAotOnProgramReady(mVU, *mVU.prog.cur);
 		void* entryPoint = mVUblockFetch(mVU,  startPC, pState);
 		quick.block      = mVU.prog.cur->block[startPC/8];
-		quick.prog       = mVU.prog.cur;
+		mVUquickInstall(mVU, slot, mVU.prog.cur);
 		// Count this deque insertion in the program's refcount.
 		// contentMap owns the program; per-PC deques are non-owning refs.
 		list->push_front(mVU.prog.cur);
@@ -1722,9 +1790,6 @@ _mVUt __fi void* mVUsearchProg(u32 startPC, uptr pState)
 	mVU.prog.isSame = -1;
 	mVU.prog.cur = quick.prog;
 	quick.block = mVU.prog.cur->block[startPC / 8];
-	// Quick-slot hit; record the dispatched entry on the resolved
-	// program (idempotent if already observed).
-	mVU.prog.cur->observed.record(startPC);
 
 	if (quick.block == nullptr)
 	{
@@ -1761,15 +1826,6 @@ _mVUt __fi void* mVUlookupProg(u32 startPC, uptr pState)
 	mVU.prog.isSame = -1;
 	mVU.prog.cur = quick.prog;
 	quick.block = block;
-	// Fast-path also resolves to a program; record the dispatched entry
-	// (idempotent on duplicates). observed.pcs is consumed ONLY by the
-	// on-disk program-cache persistence path, which is inactive unless
-	// recording is enabled — so skip the per-dispatch linear scan on the
-	// hot path when recording is off (the default). IsRecordingEnabled()
-	// inlines to a TU-local bool read here. If recording flips on later,
-	// createProg's slow-path seed keeps observed valid going forward.
-	if (mVUPersist::IsRecordingEnabled())
-		quick.prog->observed.record(startPC);
 	return pBlock->hostEntry;
 }
 
@@ -1802,11 +1858,16 @@ _mVUt void* mVUexecute(u32 startPC, u32 cycles)
 	const u32 maskedPC = startPC & vuLimit;
 	const uptr pState = (uptr)&mVU.prog.lpState;
 
-	void* result = mVUlookupProg<vuIndex>(maskedPC, pState);
+	// A VU1 dispatch the vu-aot tier asked to look at (it returned null from its
+	// counting lookup) goes to the full search without a second lookup that
+	// would hit.
+	void* result = (vuIndex == 1 && mVUvuAotPending()) ? nullptr : mVUlookupProg<vuIndex>(maskedPC, pState);
 	if (!result)
 	{
 		mVUopenCodeCache(mVU);
 		result = mVUsearchProg<vuIndex>(maskedPC, pState);
+		if constexpr (vuIndex == 1)
+			result = mVUvuAotAfterSearch(mVU, maskedPC, pState, result);
 		mVUcloseCodeCache(mVU);
 	}
 
@@ -1986,6 +2047,48 @@ namespace mvu_test_hooks
 		return mVU.prog.quick[(start_pc_bytes / 8) % (mVU.progSize / 2)].prog != nullptr;
 	}
 
+	// The per-slot rule the original full-scan mVUclear applied: the slot is
+	// dropped iff it holds a program and that program's compiled ranges
+	// overlap [addr, addr+size). mvu_clear_occupied_tests.cpp compares what
+	// mVUclear actually dropped against this, slot by slot.
+	bool QuickSlotWouldDrop(int vu_index, u32 start_pc_bytes, u32 addr, u32 size)
+	{
+		const microVU& mVU = vu_index ? microVU1 : microVU0;
+		const microProgram* p = mVU.prog.quick[(start_pc_bytes / 8) % (mVU.progSize / 2)].prog;
+		return p && mVUProgRangesOverlap(p, addr, size);
+	}
+
+	// Number of non-null quick slots, by full scan.
+	u32 QuickSlotCount(int vu_index)
+	{
+		const microVU& mVU = vu_index ? microVU1 : microVU0;
+		u32 n = 0;
+		for (u32 i = 0; i < (mVU.progSize / 2); i++)
+			n += mVU.prog.quick[i].prog != nullptr;
+		return n;
+	}
+
+	// The occupancy bitmap mVUclear walks (prog.quickOcc) agrees with the
+	// array: bit i is set exactly when quick[i].prog is non-null, for every
+	// slot, and no bit is set past the last slot.
+	bool QuickOccupancyMatchesScan(int vu_index)
+	{
+		const microVU& mVU = vu_index ? microVU1 : microVU0;
+		const u32 slots = mVU.progSize / 2;
+		for (u32 i = 0; i < slots; i++)
+		{
+			const bool bit = (mVU.prog.quickOcc[i >> 6] >> (i & 63)) & 1;
+			if (bit != (mVU.prog.quick[i].prog != nullptr))
+				return false;
+		}
+		for (u32 w = (slots + 63) / 64; w < sizeof(mVU.prog.quickOcc) / sizeof(mVU.prog.quickOcc[0]); w++)
+		{
+			if (mVU.prog.quickOcc[w])
+				return false;
+		}
+		return true;
+	}
+
 	// Offline live-wedge repro knob (vurunner env PCSX2_VU_POISON_LPSTATE_BLOCKTYPE):
 	// plants a nonzero blockType into the carried block-search key right before a
 	// replay dispatch, presenting the entry block the way a live-carried
@@ -2089,6 +2192,7 @@ void recMicroVU0::SetStartPC(u32 startPC)
 	// the quick slot by start_pc and enters at the kicked PC, neither of
 	// which the resume path consults (VE-07).
 	microVU0.resumeEntry = nullptr;
+	mVU0ParkedSpin = 0;
 	VU0.start_pc = startPC;
 }
 
@@ -2096,10 +2200,28 @@ void recMicroVU0::SetStartPC(u32 startPC)
 namespace mvu_test_hooks
 {
 	bool g_spinBounceEnabled = true;
+	bool g_parkedSyncEnabled = true;
 	u64 g_spinBounces[2] = {};
+	u64 g_vu0Executes = 0;
 
-	void SetSpinBounceEnabled(bool enabled) { g_spinBounceEnabled = enabled; }
+	void SetSpinBounceEnabled(bool enabled)
+	{
+		g_spinBounceEnabled = enabled;
+		if (!enabled)
+			mVU0ParkedSpin = 0;
+	}
 	u64 GetSpinBounceCount(int vu_index) { return g_spinBounces[vu_index & 1]; }
+
+	// The run-ahead sync stub's copy of the bounce (mVU0ParkedSpin). Off, the
+	// stub always calls into C++, which is the path master took.
+	void SetParkedSyncEnabled(bool enabled)
+	{
+		g_parkedSyncEnabled = enabled;
+		if (!enabled)
+			mVU0ParkedSpin = 0;
+	}
+	u32 GetParkedSpinWord() { return mVU0ParkedSpin; }
+	u64 GetVu0ExecuteCount() { return g_vu0Executes; }
 
 	// Writes a memo into the IR block the next compile is copied from — a
 	// memo that would bounce every dispatch — so a test can see whether a
@@ -2111,6 +2233,39 @@ namespace mvu_test_hooks
 		mVU.prog.IRinfo.block.spinExitOnEq = 0;
 		mVU.prog.IRinfo.block.spinViA = 0;
 		mVU.prog.IRinfo.block.spinViB = 0;
+	}
+
+	// A standalone microBlockManager for mvu_block_list_tests.cpp. Every
+	// block needs an exact match, so it lives on the full-compare list; `key`
+	// tells blocks apart (it rides in pState, which the exact compare reads).
+	static microBlock BlockListProbeBlock(u32 key)
+	{
+		microBlock b;
+		std::memset(&b, 0, sizeof(b));
+		b.pState.needExactMatch = 1;
+		b.pState.xgkickcycles = key;
+		return b;
+	}
+	void* BlockListCreate() { return new microBlockManager(); }
+	void BlockListDestroy(void* bm) { delete static_cast<microBlockManager*>(bm); }
+	void BlockListReset(void* bm) { static_cast<microBlockManager*>(bm)->reset(); }
+	const void* BlockListAdd(void* bm, u32 key)
+	{
+		microBlock b = BlockListProbeBlock(key);
+		return static_cast<microBlockManager*>(bm)->add(microVU0, &b);
+	}
+	const void* BlockListSearch(void* bm, u32 key)
+	{
+		microBlock b = BlockListProbeBlock(key);
+		return static_cast<microBlockManager*>(bm)->search(microVU0, &b.pState);
+	}
+	u32 BlockListAddedCount(void* bm)
+	{
+		return static_cast<u32>(static_cast<microBlockManager*>(bm)->getFullListCount());
+	}
+	u32 BlockListWalkLength(void* bm, bool* end_is_last)
+	{
+		return static_cast<u32>(static_cast<microBlockManager*>(bm)->testWalkFullList(*end_is_last));
 	}
 } // namespace mvu_test_hooks
 #endif
@@ -2142,7 +2297,7 @@ static bool mVUspinBounce(microVU& mVU, u32 cycles)
 		return false;
 #endif
 	microBlock* const blk = mVU.resumeBlock;
-	if (!mVU.resumeEntry || !blk || mVUPersist::IsRecordingEnabled())
+	if (!mVU.resumeEntry || !blk)
 		return false;
 	if (EmuConfig.Gamefixes.VUSyncHack || EmuConfig.Gamefixes.FullVU0SyncHack)
 		return false;
@@ -2182,8 +2337,55 @@ static bool mVUspinBounce(microVU& mVU, u32 cycles)
 	return true;
 }
 
+// Publishes the parked spin for the EE's run-ahead sync stub, which then
+// answers the next syncs itself while the loop holds: the same test of the
+// two VI registers mVUspinBounce makes, and the same VU0.cycle advance.
+//
+// Armed only when mVUspinBounce would bounce the next dispatch for any VI
+// values: VU0 runs on this recompiler, a resume is parked on a block known
+// to be a spin, recording and the VU sync gamefixes are off, and the EE cycle
+// skip is zero (the stub does not scale the EE clock). Everything here but
+// the VI values is fixed until one of the disarms: the next Execute, a kick,
+// a micro-memory write, a recompiler reset (which every settings change,
+// savestate load and recording toggle goes through).
+//
+// The memo is consulted, never computed, here: the first bounce on a block
+// stays in mVUspinBounce, which runs the detector at the TPC the dispatch
+// sees, as it did before the stub learned to bounce.
+static void mVU0ArmParkedSpin()
+{
+	// The encoding needs every VI offset nonzero (zero means disarmed, and vi0
+	// as the second operand), even (bit 0 is the exit sense) and 16 bits wide.
+	static_assert(offsetof(VURegs, VI) != 0 && offsetof(VURegs, VI) % 2 == 0 && sizeof(REG_VI) % 2 == 0 &&
+					  offsetof(VURegs, VI) + 32 * sizeof(REG_VI) <= 0x10000,
+		"mVU0ParkedSpin packs VI byte offsets into 16-bit fields");
+
+	mVU0ParkedSpin = 0;
+#ifdef PCSX2_RECOMPILER_TESTS
+	if (!mvu_test_hooks::g_spinBounceEnabled || !mvu_test_hooks::g_parkedSyncEnabled)
+		return;
+#endif
+	const microBlock* const blk = microVU0.resumeBlock;
+	if (CpuVU0 != &CpuMicroVU0 || !microVU0.resumeEntry || !blk || blk->spinState != mVUspinYes)
+		return;
+	if (EmuConfig.Speedhacks.EECycleSkip)
+		return;
+	if (EmuConfig.Gamefixes.VUSyncHack || EmuConfig.Gamefixes.FullVU0SyncHack)
+		return;
+
+	const u32 offA = static_cast<u32>(offsetof(VURegs, VI) + blk->spinViA * sizeof(REG_VI));
+	const u32 offB = blk->spinViB ? static_cast<u32>(offsetof(VURegs, VI) + blk->spinViB * sizeof(REG_VI)) : 0u;
+	mVU0ParkedSpin = offA | (blk->spinExitOnEq ? 1u : 0u) | (offB << 16);
+}
+
 void recMicroVU0::Execute(u32 cycles)
 {
+	// Whatever runs below can move the parked block; re-armed on the way out.
+	mVU0ParkedSpin = 0;
+#ifdef PCSX2_RECOMPILER_TESTS
+	mvu_test_hooks::g_vu0Executes++;
+#endif
+
 	VU0.flags &= ~VUFLAG_MFLAGSET;
 
 	if (!(VU0.VI[REG_VPU_STAT].UL & 1))
@@ -2196,10 +2398,9 @@ void recMicroVU0::Execute(u32 cycles)
 		// Resume fast path (VE-07): a preceding cycle-budget break parked the
 		// breaking block's hostEntry (mVU.cycleBreak); re-enter it directly,
 		// skipping mVUlookupProg. Consume-once: every other exit kind (E-bit,
-		// T/D/M-bit) leaves the slot empty and takes the full path. Recording
-		// gets the full path so observed.record keeps seeing resume TPCs.
+		// T/D/M-bit) leaves the slot empty and takes the full path.
 		void* const resume = std::exchange(microVU0.resumeEntry, nullptr);
-		if (resume && !mVUPersist::IsRecordingEnabled())
+		if (resume)
 			((mVUrecCallResume)microVU0.startFunctResume)(resume, cycles);
 		else
 			((mVUrecCall)microVU0.startFunct)(VU0.VI[REG_TPC].UL, cycles);
@@ -2211,6 +2412,8 @@ void recMicroVU0::Execute(u32 cycles)
 		microVU0.regs().flags &= ~0x4;
 		hwIntcIrq(6);
 	}
+
+	mVU0ArmParkedSpin();
 }
 
 void recMicroVU1::SetStartPC(u32 startPC)
@@ -2224,6 +2427,61 @@ void recMicroVU1::Step()
 {
 }
 
+#ifdef PCSX2_RECOMPILER_TESTS
+namespace mvu_test_hooks
+{
+	// Dispatches of VU1 that ended on a cycle-budget break (a program cut short and parked to
+	// resume), counted in every test build.
+	static std::atomic<u64> g_vu1Stops{0};
+	u64 GetVu1Stops() { return g_vu1Stops.load(std::memory_order_relaxed); }
+} // namespace mvu_test_hooks
+#endif
+
+#if defined(PCSX2_RECOMPILER_TESTS) && defined(__linux__)
+#include <linux/perf_event.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+
+namespace mvu_test_hooks
+{
+	// In-game VU1 retired-instruction count (pcsx2-eerunner --count-vu1-ins):
+	// user-mode instructions the thread that runs VU1 retires between entering
+	// recMicroVU1::Execute and leaving it, summed. That is the dispatch, the
+	// program, any compile it triggers (a tier-up included) and the dispatcher's
+	// exit, and none of the MTVU thread's idle spinning. Each dispatch also
+	// carries the cost of the two counter reads' user-side wrappers, the same
+	// in every run. Linux, test builds; a counter that cannot be opened counts 0.
+	static std::atomic<bool> g_vu1InsCount{false};
+	static std::atomic<u64> g_vu1Ins{0}, g_vu1InsDispatches{0};
+
+	void EnableVu1InstructionCount(bool on) { g_vu1InsCount.store(on, std::memory_order_relaxed); }
+	void GetVu1InstructionCount(u64& instructions, u64& dispatches)
+	{
+		instructions = g_vu1Ins.load(std::memory_order_relaxed);
+		dispatches = g_vu1InsDispatches.load(std::memory_order_relaxed);
+	}
+
+	static u64 ReadThreadInstructions()
+	{
+		static thread_local int fd = -2;
+		if (fd == -2)
+		{
+			perf_event_attr attr = {};
+			attr.type = PERF_TYPE_HARDWARE;
+			attr.size = sizeof(attr);
+			attr.config = PERF_COUNT_HW_INSTRUCTIONS;
+			attr.exclude_kernel = 1;
+			attr.exclude_hv = 1;
+			fd = static_cast<int>(syscall(SYS_perf_event_open, &attr, 0, -1, -1, 0));
+		}
+		u64 v = 0;
+		if (fd < 0 || read(fd, &v, sizeof(v)) != static_cast<ssize_t>(sizeof(v)))
+			return 0;
+		return v;
+	}
+} // namespace mvu_test_hooks
+#endif
+
 void recMicroVU1::Execute(u32 cycles)
 {
 	if (!THREAD_VU1)
@@ -2231,21 +2489,37 @@ void recMicroVU1::Execute(u32 cycles)
 		if (!(VU0.VI[REG_VPU_STAT].UL & 0x100))
 			return;
 	}
+	// vu-aot: after the tripwire has gone off, regions built without the sticky byte of STATUS are
+	// rebuilt: nothing of VU1's is running here, on any thread, so the reset is safe.
+	mVUvuAotRebuildIfDue();
 	VU1.VI[REG_TPC].UL <<= 3;
 #ifdef PCSX2_RECOMPILER_TESTS
 	vu1_trace::Entry* trace = vu1_trace::g_enabled.load(std::memory_order_relaxed)
 		? vu1_trace::begin('r', VU1.VI[REG_TPC].UL, cycles)
 		: nullptr;
+#if defined(__linux__)
+	const bool countIns = mvu_test_hooks::g_vu1InsCount.load(std::memory_order_relaxed);
+	const u64 ins0 = countIns ? mvu_test_hooks::ReadThreadInstructions() : 0;
+#endif
 #endif
 	// Resume fast path — see recMicroVU0::Execute (VE-07).
 	void* const resume = std::exchange(microVU1.resumeEntry, nullptr);
-	if (resume && !mVUPersist::IsRecordingEnabled())
+	if (resume)
 		((mVUrecCallResume)microVU1.startFunctResume)(resume, cycles);
 	else
 		((mVUrecCall)microVU1.startFunct)(VU1.VI[REG_TPC].UL, cycles);
 	VU1.VI[REG_TPC].UL >>= 3;
 #ifdef PCSX2_RECOMPILER_TESTS
+	if (microVU1.resumeEntry)
+		mvu_test_hooks::g_vu1Stops.fetch_add(1, std::memory_order_relaxed);
 	vu1_trace::finish(trace);
+#if defined(__linux__)
+	if (countIns)
+	{
+		mvu_test_hooks::g_vu1Ins.fetch_add(mvu_test_hooks::ReadThreadInstructions() - ins0, std::memory_order_relaxed);
+		mvu_test_hooks::g_vu1InsDispatches.fetch_add(1, std::memory_order_relaxed);
+	}
+#endif
 #endif
 
 	if (microVU1.regs().flags & 0x4 && !THREAD_VU1)
@@ -2519,6 +2793,14 @@ MVU_MACRO_EMIT_ADAPTER(RXOR,  false)
 // and the TU-local mVUopenCodeCache / mVUcloseCodeCache).
 //------------------------------------------------------------------
 #include "microVU_Persist-arm64.inl"
+
+//------------------------------------------------------------------
+// vu-aot live tier — tier-up policy and the glue between microVU's
+// program/block manager and vu-aot's regions. Same single-TU inclusion
+// pattern (it needs microVU's program and block types, mVUblockFetch and the
+// code-cache open/close that are TU-local).
+//------------------------------------------------------------------
+#include "vuaot/microVU_VuAot-arm64.inl"
 
 //------------------------------------------------------------------
 // Save State

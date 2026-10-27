@@ -71,6 +71,7 @@
 #include "pcsx2/GSDumpReplayer.h"
 #include "pcsx2/GameList.h"
 #include "pcsx2/Host.h"
+#include "pcsx2/IopThread/OwnerAsserts.h"
 #include "pcsx2/INISettingsInterface.h"
 #include "pcsx2/ImGui/FullscreenUI.h"
 #include "pcsx2/ImGui/ImGuiFullscreen.h"
@@ -140,6 +141,8 @@ namespace GSRunner
 	static bool ParseCommandLineArgs(int argc, char* argv[], VMBootParameters& params);
 	static void DumpStats();
 	static bool ReportHashMemoVerify();
+	static bool ReportBlockHashVerify();
+	static void ReportUnionRetire();
 
 	static bool CreatePlatformWindow();
 	static void DestroyPlatformWindow();
@@ -156,8 +159,8 @@ static MemorySettingsInterface s_settings_interface;
 static s32 s_clear_shader_cache_frame = -1;
 
 static std::string s_output_prefix;
-// -take-gsdump: a one-frame GS dump (and its driver report) written at this base path on the first
-// loop's second presented frame. Empty = off.
+// -take-gsdump: a one-frame GS dump (a zip of the dump, its driver report and its screenshot) written
+// at this base path on the first loop's second presented frame. Empty = off.
 static std::string s_take_gsdump_base;
 static bool s_take_gsdump_queued = false;
 static s32 s_loop_count = 1;
@@ -475,6 +478,7 @@ static double s_last_sw_palette_block_copies = 0;
 static u64 s_total_sw_palette_block_copies = 0;
 static bool s_vm_hash = false;
 static bool s_verify_hash_memo = false;
+static bool s_verify_block_hash = false;
 
 static u64 s_total_prims = 0;
 static u64 s_total_tc_source_hit = 0;
@@ -1011,6 +1015,7 @@ void Host::OnSaveStateSaved(const std::string_view filename)
 
 void Host::RunOnCPUThread(std::function<void()> function, bool block /* = false */)
 {
+	BLOCKING_HOST_CALL_ASSERT(block);
 	// Queued here and drained in PumpMessagesOnCPUThread(). Previously a hard
 	// pxFailRel, which meant any PINE command that marshals to the CPU thread
 	// (settings apply, savestates, frame advance) aborted the whole run.
@@ -1159,9 +1164,9 @@ static void PrintCommandLineHelp(const char* progname)
 						 "run cannot even create an instance under it.\n");
 	std::fprintf(stderr, "  -renderdoc-frame N[,C]: Capture dump frame N (base 0, minimum 1) and the C-1 frames after it, "
 						 "one .rdc each. Defaults to 1,1. Only used if -renderdoc is used.\n");
-	std::fprintf(stderr, "  -take-gsdump <path>: write a one-frame GS dump of the replay, with its driver report, to "
-						 "<path>.gs.zst and <path>.driver.json (plus the dump's screenshot <path>.png), on the first "
-						 "loop's second frame.\n");
+	std::fprintf(stderr, "  -take-gsdump <path>: write a one-frame GS dump of the replay to <path>.gs.zip, on the first "
+						 "loop's second frame. The zip holds the dump (.gs.zst), its driver report (.driver.json) and "
+						 "its screenshot.\n");
 	std::fprintf(stderr, "  -custom-driver <dir> <libname> <hooklibdir>: Android only. Load the Vulkan driver <libname> "
 						 "out of <dir> through libadrenotools instead of the system loader, e.g. a Mesa Turnip pack in "
 						 "/data/local/tmp. <hooklibdir> holds libhook_impl.so, libmain_hook.so and "
@@ -1197,6 +1202,10 @@ static void PrintCommandLineHelp(const char* progname)
 						 "boundary only once n passes are unsubmitted (default 8).\n");
 	std::fprintf(stderr, "  -vertex-ring-no-grow: Vulkan only. The vertex ring keeps its starting size and waits for "
 						 "the GPU when full.\n");
+	std::fprintf(stderr, "  -texture-ring-no-grow: Vulkan only. The texture upload ring keeps its starting size and "
+						 "waits for the GPU when full.\n");
+	std::fprintf(stderr, "  -stream-rings-cached: Vulkan only. Put the stream rings on a cached memory road as if the "
+						 "driver database preferred it on this device.\n");
 	std::fprintf(stderr, "  -swthreads <threads>: Sets the number of threads for the software renderer.\n");
 	std::fprintf(stderr, "  -upscale <multiplier>: Sets the upscale multiplier, e.g. 1 for native or 2 for 2x. Minimum 0.5.\n");
 	std::fprintf(stderr, "  -renderhacks [af|cpufb|dds|dpi|dsf|tinrt|plf]: Enable user hacks -- auto flush, CPU framebuffer "
@@ -1260,6 +1269,22 @@ static void PrintCommandLineHelp(const char* progname)
 						 "it relies on. Every memo hit also hashes the texture afresh and compares, and at every frame "
 						 "boundary each page of local memory is hashed to find stores that were not marked. Prints one "
 						 "HASH-MEMO-VERIFY line at exit and exits non-zero on a mismatch or a missed writer.\n");
+	std::fprintf(stderr, "  -verify-block-hash: Check the hardware renderer's per-block hash cache and the marks it relies on. "
+						 "Every paletted window keyed through the cache has each of its blocks hashed afresh and compared "
+						 "with the cached hash, is keyed again without the cache, and the two keys must agree on which "
+						 "windows are one. Prints one BLOCK-HASH-VERIFY line at exit and exits non-zero on a stale block "
+						 "hash or a disagreement. Slow: the memo of texture hashes is not used.\n");
+	std::fprintf(stderr, "  -union-retire on|off: Retire a render target or depth target when its dirty rectangles together "
+						 "cover its valid area (on, the default), or only when one rectangle does (off). Pixels are the "
+						 "same either way; off is the same-binary control of an A/B.\n");
+	std::fprintf(stderr, "  -block-hash-cache on|off: Key paletted windows through the per-block hash cache (on, the default) "
+						 "or by one hash of their raw blocks with no cache (off). Pixels and hash cache hits are the same "
+						 "either way; off is for checking a suspect title without a rebuild.\n");
+	std::fprintf(stderr, "  -hash-cache-entries <n>: Most entries the hardware renderer's hash cache keeps (0 = no limit; "
+						 "the default is the renderer's own). Entries unused for 30 frames go regardless.\n");
+	std::fprintf(stderr, "  -hash-cache-mb <n>: Most megabytes of textures the hash cache keeps above its floor of 800 "
+						 "entries (0 = no limit; the default is the renderer's own). -hash-cache-entries 800 -hash-cache-mb 0 "
+						 "is the cache as it was before the memory limit.\n");
 	std::fprintf(stderr, "  -stats-json <path>: Write per-frame and run-summary statistics as JSON. Combine with -perf "
 						 "for frame/GPU timing.\n");
 	std::fprintf(stderr, "  -set <Section/Key>=<value>: Override any setting, e.g. -set EmuCore/GS/AccurateBlendingUnit=3. "
@@ -1775,6 +1800,64 @@ bool GSRunner::ParseCommandLineArgs(int argc, char* argv[], VMBootParameters& pa
 				GSTextureCache::SetHashMemoVerify(true);
 				continue;
 			}
+			else if (CHECK_ARG("-verify-block-hash"))
+			{
+				s_verify_block_hash = true;
+				GSTextureCache::SetBlockHashVerify(true);
+				continue;
+			}
+			else if (CHECK_ARG_PARAM("-union-retire"))
+			{
+				const char* const value = argv[++i];
+				if (!std::strcmp(value, "off"))
+					GSTextureCache::SetUnionRetire(false);
+				else if (!std::strcmp(value, "on"))
+					GSTextureCache::SetUnionRetire(true);
+				else
+				{
+					ArgError("-union-retire: expected on or off, got '{}'.", value);
+					return false;
+				}
+				continue;
+			}
+			else if (CHECK_ARG_PARAM("-block-hash-cache"))
+			{
+				const char* const value = argv[++i];
+				if (!std::strcmp(value, "off"))
+				{
+					GSTextureCache::SetBlockHashCacheEnabled(false);
+				}
+				else if (!std::strcmp(value, "on"))
+				{
+					GSTextureCache::SetBlockHashCacheEnabled(true);
+				}
+				else
+				{
+					ArgError("-block-hash-cache: expected on or off, got '{}'.", value);
+					return false;
+				}
+				continue;
+			}
+			else if (CHECK_ARG_PARAM("-hash-cache-entries"))
+			{
+				const std::optional<u32> value = ParseNumericArg<u32>("-hash-cache-entries", argv[++i]);
+				if (!value.has_value())
+					return false;
+				GSTextureCache::HashCacheLimits limits = GSTextureCache::GetHashCacheLimits();
+				limits.max_entries = value.value();
+				GSTextureCache::SetHashCacheLimits(limits);
+				continue;
+			}
+			else if (CHECK_ARG_PARAM("-hash-cache-mb"))
+			{
+				const std::optional<u32> value = ParseNumericArg<u32>("-hash-cache-mb", argv[++i]);
+				if (!value.has_value())
+					return false;
+				GSTextureCache::HashCacheLimits limits = GSTextureCache::GetHashCacheLimits();
+				limits.max_bytes = static_cast<u64>(value.value()) << 20;
+				GSTextureCache::SetHashCacheLimits(limits);
+				continue;
+			}
 			else if (CHECK_ARG_PARAM("-drawlog"))
 			{
 				s_drawlog_path = argv[++i];
@@ -1978,6 +2061,18 @@ bool GSRunner::ParseCommandLineArgs(int argc, char* argv[], VMBootParameters& pa
 				}
 				// Not a setting: what a submit costs is a property of the driver, priced per device.
 				g_gs_measurement_overrides.readback_kick_passes = passes.value();
+				continue;
+			}
+			else if (CHECK_ARG("-texture-ring-no-grow"))
+			{
+				// Not a setting: the texture ring as it was before it could grow, for an A/B on one binary.
+				g_gs_measurement_overrides.texture_ring_no_growth = true;
+				continue;
+			}
+			else if (CHECK_ARG("-stream-rings-cached"))
+			{
+				// Not a setting: which road wins is measured per device and recorded in the driver database.
+				g_gs_measurement_overrides.stream_rings_cached = true;
 				continue;
 			}
 			else if (CHECK_ARG("-vertex-ring-no-grow"))
@@ -2472,10 +2567,17 @@ static void WriteStatsJson(const std::string& path)
 		s_total_tc_target_hit, s_total_tc_target_miss);
 	std::fprintf(fp.get(), "    \"hash_cache_hit\": %" PRIu64 ",\n    \"hash_cache_miss\": %" PRIu64 ",\n",
 		s_total_hash_cache_hit, s_total_hash_cache_miss);
+	std::fprintf(fp.get(), "    \"mark_all_events\": %" PRIu64 ",\n", GSLocalMemory::TotalMarkAllEvents());
 	std::fprintf(fp.get(), "    \"pipeline_switches\": %s,\n", j_u64(s_total_pipeline_switches).c_str());
 	std::fprintf(fp.get(), "    \"native_texel_grid_draws\": %" PRIu64 ",\n", s_total_native_texel_grid_draws);
 	std::fprintf(fp.get(), "    \"sprite_edge_clamp_draws\": %" PRIu64 ",\n", s_total_sprite_edge_clamp_draws);
 	std::fprintf(fp.get(), "    \"sw_palette_block_copies\": %" PRIu64 ",\n", s_total_sw_palette_block_copies);
+	{
+		// Render and depth targets retired because their dirty rectangles together cover them.
+		const GSTextureCache::UnionRetireStats ur = GSTextureCache::GetUnionRetireStats();
+		std::fprintf(fp.get(), "    \"union_retire\": {\"on\": %s, \"tests\": %" PRIu64 ", \"sweeps\": %" PRIu64 ", \"retired\": %" PRIu64 "},\n",
+			GSTextureCache::GetUnionRetire() ? "true" : "false", ur.tests, ur.sweeps, ur.retired);
+	}
 	std::fprintf(fp.get(), "    \"gpu_blocking_waits\": %s,\n", j_u64(s_total_gpu_blocking_waits).c_str());
 	std::fprintf(fp.get(), "    \"gs_cpu_ms\": %.3f,\n    \"gs_cpu_us_per_draw\": %.3f,\n    \"gs_cpu_us_per_draw_call\": %.3f,\n",
 		gs_cpu_ms_total, gs_cpu_us_per_draw, gs_cpu_us_per_draw_call);
@@ -2586,6 +2688,31 @@ bool GSRunner::ReportHashMemoVerify()
 	return report.mismatches == 0 && report.missed_writers == 0;
 }
 
+// The union-retire counters of the run: one UNION-RETIRE line.
+void GSRunner::ReportUnionRetire()
+{
+	const GSTextureCache::UnionRetireStats ur = GSTextureCache::GetUnionRetireStats();
+	const std::string line = fmt::format("UNION-RETIRE on={} tests={} sweeps={} retired={}", GSTextureCache::GetUnionRetire() ? 1 : 0,
+		ur.tests, ur.sweeps, ur.retired);
+	Console.WriteLn(line);
+	std::fprintf(stderr, "%s\n", line.c_str());
+}
+
+// Prints what -verify-block-hash found. False if a cached block hash was stale, which is a store into local
+// memory that nothing marked, or if keying with the cache and without it disagreed on which windows are one.
+bool GSRunner::ReportBlockHashVerify()
+{
+	if (!s_verify_block_hash)
+		return true;
+
+	const GSTextureCache::BlockHashVerifyReport report = GSTextureCache::GetBlockHashVerifyReport();
+	const std::string line = fmt::format("BLOCK-HASH-VERIFY levels={} blocks={} stale_blocks={} lookups={} extra_misses={} false_hits={}",
+		report.levels, report.blocks, report.stale_blocks, report.lookups, report.extra_misses, report.false_hits);
+	Console.WriteLn(line);
+	std::fprintf(stderr, "%s\n", line.c_str());
+	return report.stale_blocks == 0 && report.extra_misses == 0 && report.false_hits == 0;
+}
+
 void GSRunner::DumpStats()
 {
 	std::atomic_thread_fence(std::memory_order_acquire);
@@ -2643,6 +2770,31 @@ void GSRunner::DumpStats()
 		Ratio(s_total_tc_target_hit, s_total_tc_target_hit + s_total_tc_target_miss)));
 	Console.WriteLn(fmt::format("@HWSTAT@ Hash Cache Hit/Miss: {}/{} ({:.1f}% hit)", s_total_hash_cache_hit, s_total_hash_cache_miss,
 		Ratio(s_total_hash_cache_hit, s_total_hash_cache_hit + s_total_hash_cache_miss)));
+	// What the hash cache held at the end of a frame (before the frame's ageing): the peak of the run, and the
+	// mean over the frames; MB are 2^20 bytes. "VRAM" is what the renderer accounts for in all: targets,
+	// sources, hash cache and the device's texture pool.
+	{
+		const GSTextureCache::HashCacheStats hc = GSTextureCache::GetHashCacheStats();
+		const GSTextureCache::HashCacheLimits lim = GSTextureCache::GetHashCacheLimits();
+		Console.WriteLn(fmt::format("@HWSTAT@ Hash Cache Memory: peak {:.1f} MB in {} entries (mean {:.1f} MB over {} frames); "
+									"peak VRAM {:.1f} MB; limits {} entries (floor {}), {} MB",
+			hc.peak_bytes / 1048576.0, hc.peak_entries, hc.frames ? hc.sum_bytes / 1048576.0 / hc.frames : 0.0, hc.frames,
+			hc.peak_total_bytes / 1048576.0, lim.max_entries, lim.floor_entries, lim.max_bytes >> 20));
+	}
+	// The per-block hash cache: the paletted levels keyed through it, their blocks, and the blocks that had to be
+	// hashed (a mark since the last lookup). A block is 256 bytes.
+	{
+		const GSTextureCache::BlockHashStats block_hashes = GSTextureCache::GetBlockHashStats();
+		const double frames = static_cast<double>(std::max<u64>(s_total_drawn_frames, 1));
+		Console.WriteLn(fmt::format("@HWSTAT@ Block Hash Cache: {} levels, {} blocks keyed, {} hashed ({:.1f}% of blocks; {:.2f} MB/frame hashed)",
+			block_hashes.levels, block_hashes.blocks, block_hashes.rehashed,
+			Ratio(block_hashes.rehashed, block_hashes.blocks),
+			block_hashes.rehashed * static_cast<double>(GS_BLOCK_SIZE) / frames / (1024.0 * 1024.0)));
+	}
+	// Marks of all of local memory (GSLocalMemory::MarkAllEvents): each one dirties every block, so a title that
+	// does it every frame rehashes and restages everything. Counted over the whole process.
+	Console.WriteLn(fmt::format("@HWSTAT@ Mark-All Events: {} (avg {:.2f}/frame)", GSLocalMemory::TotalMarkAllEvents(),
+		GSLocalMemory::TotalMarkAllEvents() / static_cast<double>(std::max<u64>(s_total_drawn_frames, 1))));
 	Console.WriteLn(fmt::format("@HWSTAT@ Native Texel Grid Draws: {} (avg {})", s_total_native_texel_grid_draws,
 		static_cast<u64>(std::ceil(s_total_native_texel_grid_draws / static_cast<double>(s_total_drawn_frames)))));
 	Console.WriteLn(fmt::format("@HWSTAT@ Sprite Edge Clamp Draws: {} (avg {})", s_total_sprite_edge_clamp_draws,
@@ -2887,6 +3039,9 @@ static void CPUThreadMain(VMBootParameters* params, std::atomic<int>* ret)
 			// the GS thread itself, to whichever processor its frequency sort ranked next.
 			// Moving this call any earlier means that pin quietly overwrites -gspin, and
 			// the only visible symptom would be that the flag stops doing anything.
+			// A hand placement (-gspin, -gsbackpin) is the experiment; the prime-core arbiter must not move it.
+			if (!s_gs_pin_request.empty() || !s_gs_back_pin_request.empty())
+				VMManager::Internal::DisablePrimeCorePlacement();
 			ApplyGSThreadPin();
 			ApplyGSBackThreadPin();
 
@@ -2925,8 +3080,10 @@ static void CPUThreadMain(VMBootParameters* params, std::atomic<int>* ret)
 				s_extended_stats_snapshot = g_gs_device->GetExtendedStats();
 			VMManager::Shutdown(false);
 			GSRunner::DumpStats();
-			const bool verify_ok = GSRunner::ReportHashMemoVerify();
-			ret->store((ladder_ok && verify_ok) ? EXIT_SUCCESS : EXIT_FAILURE);
+			const bool memo_verify_ok = GSRunner::ReportHashMemoVerify();
+			const bool block_hash_verify_ok = GSRunner::ReportBlockHashVerify();
+			GSRunner::ReportUnionRetire();
+			ret->store((ladder_ok && memo_verify_ok && block_hash_verify_ok) ? EXIT_SUCCESS : EXIT_FAILURE);
 		}
 	}
 

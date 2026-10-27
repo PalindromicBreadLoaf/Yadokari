@@ -4,6 +4,7 @@
 #include <QtWidgets/QMessageBox>
 
 #include "AdvancedSettingsWidget.h"
+#include "IopThread/IopThreadMode.h"
 #include "QtHost.h"
 #include "QtUtils.h"
 #include "SettingWidgetBinder.h"
@@ -29,6 +30,11 @@ AdvancedSettingsWidget::AdvancedSettingsWidget(SettingsWindow* settings_dialog, 
 	SettingWidgetBinder::BindWidgetToBoolSetting(sif, m_ui.vu1Recompiler, "EmuCore/CPU/Recompiler", "EnableVU1", true);
 	SettingWidgetBinder::BindWidgetToBoolSetting(sif, m_ui.vuFlagHack, "EmuCore/Speedhacks", "vuFlagHack", true);
 	SettingWidgetBinder::BindWidgetToBoolSetting(sif, m_ui.instantVU1, "EmuCore/Speedhacks", "vu1Instant", true);
+	// vu-aot only exists in the ARM64 recompilers. The setting is read and written everywhere, and does nothing elsewhere.
+	SettingWidgetBinder::BindWidgetToBoolSetting(sif, m_ui.vuAot, "EmuCore/CPU/Recompiler", "EnableVUAot", true);
+#ifndef ARCH_ARM64
+	m_ui.vuAot->hide();
+#endif
 
 	SettingWidgetBinder::BindWidgetToIntSetting(sif, m_ui.eeRoundingMode, "EmuCore/CPU", "FPU.Roundmode", static_cast<int>(FPRoundMode::ChopZero));
 	SettingWidgetBinder::BindWidgetToIntSetting(sif, m_ui.eeDivRoundingMode, "EmuCore/CPU", "FPUDiv.Roundmode", static_cast<int>(FPRoundMode::Nearest));
@@ -48,6 +54,9 @@ AdvancedSettingsWidget::AdvancedSettingsWidget(SettingsWindow* settings_dialog, 
 	connect(m_ui.vu1ClampMode, &QComboBox::currentIndexChanged, [this](int index) { setClampingMode(1, index); });
 
 	SettingWidgetBinder::BindWidgetToBoolSetting(sif, m_ui.iopRecompiler, "EmuCore/CPU/Recompiler", "EnableIOP", true);
+	// The bounds are the ones the core clamps the setting to, so the box never offers a value that would be changed.
+	m_ui.iopThreadLag->setRange(IopThread::kMinLag, IopThread::kMaxLag);
+	SettingWidgetBinder::BindWidgetToIntSetting(sif, m_ui.iopThreadLag, "EmuCore/Speedhacks", "iopThreadLag", IopThread::kDefaultLag);
 
 	SettingWidgetBinder::BindWidgetToBoolSetting(sif, m_ui.gameFixes, "EmuCore", "EnableGameFixes", true);
 	SettingWidgetBinder::BindWidgetToBoolSetting(sif, m_ui.patches, "EmuCore", "EnablePatches", true);
@@ -63,6 +72,9 @@ AdvancedSettingsWidget::AdvancedSettingsWidget(SettingsWindow* settings_dialog, 
 
 	SettingWidgetBinder::BindWidgetToBoolSetting(sif, m_ui.backupSaveStates, "EmuCore", "BackupSavestate", true);
 	SettingWidgetBinder::BindWidgetToBoolSetting(sif, m_ui.saveStateOnShutdown, "EmuCore", "SaveStateOnShutdown", false);
+	SettingWidgetBinder::BindWidgetToIntSetting(sif, m_ui.autosaveInterval, "EmuCore", "AutosaveIntervalMinutes", 0);
+	SettingWidgetBinder::BindWidgetToIntSetting(sif, m_ui.autosaveKeep, "EmuCore", "AutosaveKeep", 3);
+	SettingWidgetBinder::BindWidgetToBoolSetting(sif, m_ui.autosaveOnShutdown, "EmuCore", "AutosaveOnShutdown", false);
 
 	SettingWidgetBinder::BindWidgetToBoolSetting(sif, m_ui.pineEnable, "EmuCore", "EnablePINE", false);
 	SettingWidgetBinder::BindWidgetToIntSetting(sif, m_ui.pineSlot, "EmuCore", "PINESlot", 28011);
@@ -138,8 +150,18 @@ AdvancedSettingsWidget::AdvancedSettingsWidget(SettingsWindow* settings_dialog, 
 		//: mVU = PCSX2's recompiler for VU (Vector Unit) code (full name: microVU)
 		m_ui.vuFlagHack, tr("mVU Flag Hack"), tr("Checked"), tr("Good speedup and high compatibility, may cause graphical errors."));
 
+	//: VU1 = Vector Unit 1. One of the PS2's processors.
+	dialog()->registerWidgetHelp(m_ui.vuAot, tr("Enable VU1 Ahead-of-Time Compiler"), tr("Checked"),
+		tr("Optimises VU1 programs in the background and keeps the compiled VU code on disk, so later launches start with it. "
+		   "Faster in games that spend much of their time in VU1. Turning it off clears the compiled cache."));
+
 	dialog()->registerWidgetHelp(m_ui.iopRecompiler, tr("Enable Recompiler"), tr("Checked"),
 		tr("Performs just-in-time binary translation of 32-bit MIPS-I machine code to native code."));
+
+	dialog()->registerWidgetHelp(m_ui.iopThreadLag, tr("IOP Thread Lag Bound"), QString::number(IopThread::kDefaultLag),
+		tr("How many EE cycles the main game thread may run ahead of the IOP thread before it waits for it. "
+		   "Larger values wait less often, but let the IOP's answers reach the game later. "
+		   "Only used while the IOP thread is enabled."));
 
 	dialog()->registerWidgetHelp(m_ui.gameFixes, tr("Enable Game Fixes"), tr("Checked"),
 		tr("Automatically loads and applies fixes to known problematic games on game start."));
@@ -156,6 +178,15 @@ AdvancedSettingsWidget::AdvancedSettingsWidget(SettingsWindow* settings_dialog, 
 	dialog()->registerWidgetHelp(m_ui.saveStateOnShutdown, tr("Save State On Shutdown"), tr("Unchecked"),
 		tr("Automatically saves the emulator state when powering down or exiting. You can then "
 		   "resume directly from where you left off next time."));
+
+	dialog()->registerWidgetHelp(m_ui.autosaveInterval, tr("Autosave Interval"), tr("Off"),
+		tr("Saves the game by itself every this many minutes while it runs. Autosaves are kept apart from the numbered slots "
+		   "and are listed in the Load State menu. A save is skipped (and tried again shortly) while the game is writing its memory card."));
+	dialog()->registerWidgetHelp(m_ui.autosaveKeep, tr("Autosaves To Keep"), tr("3"),
+		tr("How many autosaves are kept for each game, from 1 to 5. Each new autosave moves the older ones back one place and drops the oldest."));
+	dialog()->registerWidgetHelp(m_ui.autosaveOnShutdown, tr("Autosave On Shutdown"), tr("Unchecked"),
+		tr("Also writes an autosave when the game is closed. This is separate from Save State On Shutdown, which writes the single resume state "
+		   "offered the next time the game starts; both can be on."));
 
 	dialog()->registerWidgetHelp(m_ui.backupSaveStates, tr("Create Save State Backups"), tr("Checked"),
 		//: Do not translate the ".backup" extension.

@@ -198,6 +198,11 @@
               "minimum": 0,
               "maximum": 1
             },
+            "nativeCounterDraws": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 1
+            },
             "estimateTextureRegion": {
               "type": "integer",
               "minimum": 0,
@@ -371,6 +376,11 @@
               "type": "integer",
               "minimum": -3,
               "maximum": 3
+            },
+            "iopThread": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 1
             }
           },
           "additionalProperties": false

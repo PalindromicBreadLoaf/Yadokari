@@ -5,6 +5,10 @@
 
 #include "common/Pcsx2Defs.h"
 
+#include <functional>
+#include <string>
+#include <vector>
+
 #ifndef XXH_versionNumber
 #define XXH_STATIC_LINKING_ONLY 1
 #define XXH_INLINE_ALL 1
@@ -32,21 +36,23 @@ namespace mVUProgCache
 	// Bumped together with kMvuCompilerAbiVersion when the on-disk layout
 	// changes. Mismatch nukes the cache directory at startup.
 	//
-	// IndexEntry is variable-length: a fixed 64-byte header carrying
-	// `entryCount`, followed by `entryCount` × `u32` entry-PC values
-	// (microMem byte offsets), so multi-entry programs carry every
-	// dispatched PC. Older fixed-layout entries are structurally
-	// incompatible with this format — a version mismatch evicts rather
-	// than silently loading wrong data.
-	static constexpr u32 kProgCacheFormatVersion = 3;
+	// 4: an INDEX record is a fixed 64 bytes (content hash, sizes, flags,
+	//    timestamps). Version 3 followed each record with a list of entry
+	//    PCs; nothing read that list outside tests (hydration looks a
+	//    program up by content hash) and the dispatcher no longer kept it
+	//    complete, so it is gone. A version-3 directory is evicted rather
+	//    than parsed with the wrong record size.
+	static constexpr u32 kProgCacheFormatVersion = 4;
 
 	// Initialize the per-VU on-disk cache. Gated on the
-	// EmuCore/CPU/Recompiler EnableVUProgramCache config bool (off = no disk
-	// side effects at all). Reads VERSION; if it diverges from the running
+	// EmuCore/CPU/Recompiler EnableVUProgramCache config bool or EnableVUAot,
+	// which turns the cache on (UseVUProgramCache; neither = no disk side
+	// effects at all). Reads VERSION; if it diverges from the running
 	// build's (compiler ABI, options sentinel, arch tag), evicts the stale
 	// dir and starts fresh. Loads INDEX into memory. Idempotent — called
-	// from mVUinit AND every mVUreset (the reset call is what activates a
-	// runtime config toggle); only does real work on first effective call.
+	// from every mVUreset (the reset call is what activates a runtime config
+	// toggle), not from mVUinit, which runs before the settings are loaded;
+	// only does real work on first effective call.
 	void Init(microVU& mVU);
 
 	// Same Init logic but takes (vu_index, options_sentinel) directly so
@@ -60,9 +66,9 @@ namespace mVUProgCache
 	void Close(microVU& mVU);
 
 	// Walk mVU.mvuContentMap and save every program whose contentHash is not
-	// already represented in the on-disk INDEX (or whose observed entry-PC
-	// set widened). Called from mVUreset (pre-program-free) and mVUclose so
-	// the next process boot has artifacts.
+	// already represented in the on-disk INDEX (or whose recorded block graph
+	// grew since its payload was written). Called from mVUreset
+	// (pre-program-free) and mVUclose so the next process boot has artifacts.
 	void SaveAllPrograms(microVU& mVU);
 
 	// Save a single program: append an INDEX entry, and — when the program
@@ -70,8 +76,7 @@ namespace mVUProgCache
 	// compiled) — write the serialized block graph as a content-addressed
 	// .vuprog payload (<root>/<hh>/<hash32hex>.vuprog, tmp+rename). The
 	// payload is rewritten when the recorded block graph grew past what is
-	// on disk; the INDEX append still short-circuits when neither the
-	// entry-PC set nor the payload changed.
+	// on disk; the INDEX append short-circuits when the payload is current.
 	void SaveProgram(microVU& mVU, const microProgram& prog);
 
 	// Promote an on-disk program to a live one. On an INDEX hit with a
@@ -84,6 +89,43 @@ namespace mVUProgCache
 	// OPEN; the (empty) emission episode is closed around the hydration and
 	// reopened before returning.
 	microProgram* TryLoadProgram(microVU& mVU, const XXH128_hash_t& contentHash);
+
+	// vu-aot sidecars (VU1): `<root>/<hh>/<hash32hex>.vuaot`, beside the program's payload, written
+	// and read for the vu-aot live tier (vuaot/VuAotPersist.h has the format). The cache's directory
+	// handshake covers them like the payloads: an options change renames them aside with the rest.
+	//
+	// Whether the cache is up for this VU (sidecars can be read and written).
+	bool SidecarsEnabled(u32 vu_index);
+	// The sidecar for `hash`: from the preload (consumed), else from disk. False when there is none.
+	bool ReadSidecar(u32 vu_index, const XXH128_hash_t& hash, std::vector<u8>& out);
+	// Hands a sidecar to the cache's writer thread: `build` runs there and returns the bytes to write
+	// (tmp + rename), or nothing to skip the write. A newer request for a hash replaces an older one
+	// still queued. The caller's thread never touches the disk.
+	void QueueSidecar(u32 vu_index, const XXH128_hash_t& hash, std::function<std::vector<u8>()> build);
+	// Waits until every queued sidecar has been written (Close does this too).
+	void FlushSidecars(u32 vu_index);
+
+	// What ClearVuAot removed.
+	struct ClearResult
+	{
+		u64 files = 0;
+		u64 bytes = 0;
+	};
+
+	// Removes the vu-aot cache from disk, for both VUs: the sidecars (`.vuaot`), and with `wholeCache` the
+	// rest of the program cache too (the `.vuprog` payloads, INDEX and VERSION, and the `.stale.*`
+	// directories an options change set aside). The tripwire's memory (`vu_jit/vuaot_tripped.txt`) is
+	// kept: it is a safety record, a few bytes. The writer and preload threads are stopped first, so nothing
+	// writes back what is deleted and nothing reads what is gone, and what they held is dropped (a sidecar
+	// still queued for writing is not written). With `wholeCache` the cache in memory is closed as well, so
+	// the next Init starts a fresh one. Safe when the directories do not exist. CPU thread, with the VU
+	// recompilers idle (a settings change has just reset them). Logs one line when it removed anything.
+	ClearResult ClearVuAot(bool wholeCache);
+
+	// What a change of the EnableVUAot setting owes the disk cache: nothing, unless it went from on to
+	// off. Then the sidecars go, and the whole cache with them when nothing else keeps it
+	// (`programCacheStillOn` is EnableVUProgramCache after the change).
+	ClearResult OnVuAotSettingChanged(bool wasOn, bool isOn, bool programCacheStillOn);
 
 	// Dispatch-time probe used by mVUsearchProg on the in-process-miss
 	// path. Tracks whether the INDEX already knows the (program, startPC)
@@ -123,29 +165,46 @@ namespace mVUProgCache
 	// versa).
 	bool TestGetLiveSentinel(u32 vu_index, XXH128_hash_t* out_sentinel);
 
+	// Test-only: the preload's byte budget for the next Init of this VU (0: the default). ResetForTest
+	// puts the default back.
+	void TestSetPreloadBudget(u32 vu_index, size_t bytes);
+	// Test-only: the preload holds the payload (or, with `sidecar`, the vu-aot sidecar) of `hash` in RAM.
+	bool TestIsPreloaded(u32 vu_index, const XXH128_hash_t& hash, bool sidecar);
+	// Test-only: while held, the preload thread has read each file it is going to keep but does not put it in
+	// the map (a preload slower than the first loads of the session, which on a loaded machine or a slow
+	// disk it can be). Set before Init; released with false. ResetForTest releases it.
+	void TestHoldPreload(u32 vu_index, bool hold);
+	// Test-only: write a payload the way SaveProgram does (tmp + rename), and so supersede any copy of it the
+	// preload holds or is about to put in memory.
+	bool TestWritePayload(u32 vu_index, const XXH128_hash_t& hash, const std::vector<u8>& image);
+	// Test-only: the preload thread is waiting in the hold, with a file read and not yet in the map.
+	bool TestPreloadIsHeld(u32 vu_index);
+	// Test-only: the options sentinel the given VU hashes against, rebuilt from
+	// the live config rather than trusting the cached one. Unlike
+	// TestGetLiveSentinel it also does not require the microVU object to have
+	// been through mVUinit — it stamps the VU index itself — so a test TU with
+	// no VM behind it can still compare the two VUs' program identities.
+	bool TestBuildSentinelForIndex(u32 vu_index, XXH128_hash_t* out_sentinel);
+
 	// Test-only: block until the background payload preload spawned by Init
 	// (if any) has finished. Lets tests deterministically assert the RAM-
 	// served hydration path (e.g. by deleting the on-disk payload after the
 	// preload and proving hydration still succeeds).
 	void TestWaitForPreload(u32 vu_index);
+	// Test-only: the path a sidecar for `hash` is written to.
+	std::string TestSidecarPath(u32 vu_index, const XXH128_hash_t& hash);
 
-	// Test-only: append an INDEX entry for `hash` carrying the given
-	// entry-PC list, applying the same persistence path SaveProgram uses
-	// (single atomic append + in-memory registration; dedupe on existing
-	// hash). Returns true iff the entry was written. Lets format tests
-	// drive the variable-length serializer without constructing a
-	// microVU/microProgram.
-	bool TestAppendIndexEntry(u32 vu_index, const XXH128_hash_t& hash,
-	                          const u32* entry_pcs, size_t entry_pc_count);
+	// Test-only: append an INDEX entry for `hash`, applying the same
+	// persistence path SaveProgram uses (single atomic append + in-memory
+	// registration; dedupe on existing hash). Returns true iff the entry was
+	// written. Lets format tests drive the record serializer without
+	// constructing a microVU/microProgram.
+	bool TestAppendIndexEntry(u32 vu_index, const XXH128_hash_t& hash);
 
-	// Test-only: read back the entry-PC list the cache holds for a given
-	// content hash. Returns true if the hash is in the in-memory entries
-	// map and writes the entry_pcs (microMem byte offsets) into `out_pcs`;
-	// false otherwise. Used by the IndexFormat tests to pin the
-	// variable-length serializer's round-trip behavior.
-	bool TestGetEntryPcs(u32 vu_index, const XXH128_hash_t& hash,
-	                      u32* out_pcs, size_t out_pcs_cap,
-	                      size_t* out_count);
+	// Test-only: true if the in-memory INDEX of the given VU holds a live
+	// entry for `hash`. Used by the IndexFormat tests to pin the record
+	// serializer's round-trip behavior.
+	bool TestHasIndexEntry(u32 vu_index, const XXH128_hash_t& hash);
 
 	// Test-only: read back the per-VU counters DumpStats would log. Used by
 	// the versioning tests to assert that eviction fired (staleEvictions++)
@@ -172,6 +231,18 @@ namespace mVUProgCache
 		                             // map (consumed buffers are released)
 		u64  preloadHits        = 0; // hydrations served from RAM instead of
 		                             // a dispatch-thread disk read
+		u64  sidecarReads       = 0; // ReadSidecar calls that found one
+		u64  sidecarPreloadHits = 0; // ... of them, served from the preload
+		u64  sidecarsPreloaded  = 0; // .vuaot files the preload read
+		u64  sidecarPreloadBytes = 0; // ... and their bytes (inside the preload budget)
+		u64  sidecarWrites      = 0; // .vuaot files written
+		u64  sidecarWriteBytes  = 0; // ... and their bytes
+		u64  sidecarSkips       = 0; // requests whose build returned nothing
+		u64  preloadBudgetHit   = 0; // 1 when the preload stopped at its budget
+		u64  preloadWantedBytes = 0; // payload + sidecar bytes the preload would have read without one
+		u64  preloadReadBytes   = 0; // payload + sidecar bytes the preload did read
+		u64  ageOutFiles        = 0; // payload and sidecar files deleted for being unused too long
+		u64  ageOutBytes        = 0;
 	};
 	Stats GetStats(u32 vu_index);
 }

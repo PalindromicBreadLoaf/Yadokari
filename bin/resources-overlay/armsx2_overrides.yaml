@@ -605,6 +605,125 @@ SLUS-20686:
     autoFlush: 1
     copyRoadMaximumBlendingLevel: 0
 
+# Gran Turismo 4 -- asynchronous GS download mode (5).
+# Source: PR #797 by Richpol99 (2026-10-04), which asked for Unsynchronized (3); changed to 5 and
+# the serial list corrected by bmdhacks, 2026-10-08.
+# The cost it saves: once a frame the game sums a 64x64 image into one row of a 64x8 target at
+# block 0x35e0 with additive sprites, then reads that row back to the CPU. Probably a brightness
+# measurement for auto-exposure. At the default mode every such read makes the EE wait for the GPU
+# to finish the frame so far. The PR reports frame drops on Mali and Adreno at night and in
+# bumper/cockpit view.
+# Why 5 and not 3: Unsynchronized never downloads, so the game would read stale memory every frame
+# and whatever the value drives would stop changing. Asynchronous downloads the real data and serves
+# it a frame or two late, without waiting; an exposure loop that eases over many frames should not
+# notice. To check in play: entering and leaving a tunnel, brightness should still adapt as it does
+# at the default mode.
+# Verified: the PR's dump (SCUS-97328, Mali-G615, a race in a tunnel) replayed with pcsx2-gsrunner
+# on master e717185597, Vulkan on an Apple M2 at 1x: GPU blocking waits 6 -> 2 over the dump and all
+# frames byte-identical to the default mode. A replay cannot show the game's reaction to the value,
+# and the speed on a Mali or Adreno device is not measured.
+# Retail GT4 serials only. Prologue, the demos, Tourist Trophy and the Nike editions are left out:
+# nobody has checked they make the same readback.
+# gsHWFixes replaces upstream's block, so upstream's GT4 fixes are restated beside it.
+SCUS-97328:            # Gran Turismo 4 (NTSC-U)
+  gsHWFixes:
+    autoFlush: 1
+    getSkipCount: "GSC_PolyphonyDigitalGames"
+    halfPixelOffset: 4
+    hwDownloadMode: 5
+    recommendedBlendingLevel: 3
+SCUS-97563:            # Gran Turismo 4 (NTSC-U, later release)
+  gsHWFixes:
+    autoFlush: 1
+    getSkipCount: "GSC_PolyphonyDigitalGames"
+    halfPixelOffset: 4
+    hwDownloadMode: 5
+    recommendedBlendingLevel: 3
+SCUS-90682:            # Gran Turismo 4 (NTSC-U)
+  gsHWFixes:
+    autoFlush: 1
+    getSkipCount: "GSC_PolyphonyDigitalGames"
+    halfPixelOffset: 4
+    hwDownloadMode: 5
+    recommendedBlendingLevel: 3
+SCUS-97436:            # Gran Turismo 4 (NTSC-U, Online Public Beta)
+  gsHWFixes:
+    autoFlush: 1
+    getSkipCount: "GSC_PolyphonyDigitalGames"
+    halfPixelOffset: 4
+    hwDownloadMode: 5
+    recommendedBlendingLevel: 3
+SCES-51719:            # Gran Turismo 4 (PAL)
+  gsHWFixes:
+    autoFlush: 1
+    getSkipCount: "GSC_PolyphonyDigitalGames"
+    halfPixelOffset: 4
+    hwDownloadMode: 5
+    recommendedBlendingLevel: 3
+SCPS-17001:            # Gran Turismo 4 (NTSC-J)
+  gsHWFixes:
+    autoFlush: 1
+    getSkipCount: "GSC_PolyphonyDigitalGames"
+    halfPixelOffset: 4
+    hwDownloadMode: 5
+    recommendedBlendingLevel: 3
+SCPS-19252:            # Gran Turismo 4 (NTSC-J, PlayStation2 the Best)
+  gsHWFixes:
+    autoFlush: 1
+    getSkipCount: "GSC_PolyphonyDigitalGames"
+    halfPixelOffset: 4
+    hwDownloadMode: 5
+    recommendedBlendingLevel: 3
+SCAJ-30006:            # Gran Turismo 4 (NTSC-C)
+  gsHWFixes:
+    autoFlush: 1
+    getSkipCount: "GSC_PolyphonyDigitalGames"
+    halfPixelOffset: 4
+    hwDownloadMode: 5
+    recommendedBlendingLevel: 3
+SCAJ-30007:            # Gran Turismo 4 (NTSC-C)
+  gsHWFixes:
+    autoFlush: 1
+    getSkipCount: "GSC_PolyphonyDigitalGames"
+    halfPixelOffset: 4
+    hwDownloadMode: 5
+    recommendedBlendingLevel: 3
+SCAJ-30008:            # Gran Turismo 4 (NTSC-C, PlayStation2 the Best)
+  gsHWFixes:
+    autoFlush: 1
+    getSkipCount: "GSC_PolyphonyDigitalGames"
+    halfPixelOffset: 4
+    hwDownloadMode: 5
+    recommendedBlendingLevel: 3
+SCCS-60002:            # Gran Turismo 4 (NTSC-C, Chinese)
+  gsHWFixes:
+    autoFlush: 1
+    getSkipCount: "GSC_PolyphonyDigitalGames"
+    halfPixelOffset: 4
+    hwDownloadMode: 5
+    recommendedBlendingLevel: 3
+SCKA-30001:            # Gran Turismo 4 (NTSC-K)
+  gsHWFixes:
+    autoFlush: 1
+    getSkipCount: "GSC_PolyphonyDigitalGames"
+    halfPixelOffset: 4
+    hwDownloadMode: 5
+    recommendedBlendingLevel: 3
+SCKA-30004:            # Gran Turismo 4 (NTSC-K, BigHit Series)
+  gsHWFixes:
+    autoFlush: 1
+    getSkipCount: "GSC_PolyphonyDigitalGames"
+    halfPixelOffset: 4
+    hwDownloadMode: 5
+    recommendedBlendingLevel: 3
+PBPX-95601:            # Gran Turismo 4 (NTSC-J, console bundle)
+  gsHWFixes:
+    autoFlush: 1
+    getSkipCount: "GSC_PolyphonyDigitalGames"
+    halfPixelOffset: 4
+    hwDownloadMode: 5
+    recommendedBlendingLevel: 3
+
 # ---------------------------------------------------------------------------------------------
 # Namco System 246/256 arcade games. Added 2026-10-01 by jpolo1224 with the arcade port (branch
 # namco-arcade), copied verbatim from PCSX2x6's GameIndex.yaml at 583f0e9090 (2026-09-09,
@@ -1079,3 +1198,441 @@ NM00057:
   input: drum
   gsHWFixes:
     alignSprite: 1 # Fixes vertical lines.
+
+# Baldur's Gate: Dark Alliance (NTSC-U) — keep textures resident in the game's own
+# VRAM texture cache. bmdhacks, 2026-10-14; found by the BGDA texture-upload study
+# (ARMSX2 umbrella, devs/bmdhacks/campaigns/g57-bgda-slowdown/PATCH-STUDY.md).
+#
+# The game sweeps out every texture whose stamp is older than its render-frame
+# counter, but the function that queues an already-resident texture (0x1350a8)
+# refreshes the stamp from the game-time counter, which resets at level start and
+# stops while paused, so it is always behind. Every texture drawn two frames running
+# is evicted and uploaded again, to a different place each frame. The patch makes
+# that refresh read the render-frame counter (the one the allocator at 0x1405a8 and
+# the sweep at 0x140840 use).
+#
+# Cost it saves: on the M2, the hash cache hits 55-74% -> 66-90% across four scenes
+# of the water area and the bytes ARMSX2 uploads fall 43-60%; on the RG 476H
+# (Mali-G57) that area was upload-bound. Pixels: up to 53 px a frame differ by at
+# most 14 levels while walking, none of it visible on the owner's flips (2026-10-14).
+#
+# Verified: savestate replays on the M2 (EE JIT, MTVU off, Vulkan and software
+# renderers) at master f7c764dd9d; not run on a console. patches only:
+# upstream's gameFixes and gsHWFixes for this serial stay in force.
+SLUS-20035:
+  patches:
+    773A8DAB:
+      content: |-
+        author=bmdhacks
+        comment=Keeps textures that are drawn every frame resident in the game's VRAM texture cache instead of evicting and re-uploading them (0x00135180: lw v0,-0x5bb8(gp) -> lw v0,-0x5bb4(gp)).
+        patch=1,EE,00135180,word,8f82a44c
+
+# Baldur's Gate: Dark Alliance II (NTSC-U) — the same VRAM texture-cache stamp fix as
+# Dark Alliance above. bmdhacks, 2026-10-14; ARMSX2 umbrella,
+# devs/bmdhacks/campaigns/g57-bgda-slowdown/PATCH-STUDY.md (BGDA II section).
+#
+# Same engine, same bug: the code that queues an already-resident texture (0x1f7638)
+# refreshes its stamp from the game-time counter (gp-0x654c, 0x3601a4), while the
+# allocator (0x2bc040) and the per-frame sweep (0x2bc2f8) use the render-frame counter
+# (gp-0x6548, 0x3601a8). The patch makes the refresh read the render-frame counter.
+#
+# Cost it saves: over a scripted 3.3-minute session (menus, first map, walking, pause),
+# hash-cache hits 48.7% -> 78.0% and texture uploads -54% (M2, EE JIT, MTVU off).
+# Verified: boot-from-disc sessions on the M2 (probe build on master f7c764dd9d), no hangs or errors,
+# screenshots matching at nine points; no per-pixel comparison and no console run.
+# patches only: upstream's gameFixes and gsHWFixes for this serial stay in force.
+SLUS-20675:
+  patches:
+    B0859096:
+      content: |-
+        author=bmdhacks
+        comment=Keeps textures that are drawn every frame resident in the game's VRAM texture cache instead of evicting and re-uploading them (0x001f7640: lw v0,-0x654c(gp) -> lw v0,-0x6548(gp)).
+        patch=1,EE,001f7640,word,8f829ab8
+
+# Baldur's Gate: Dark Alliance (PAL, En/Fr/De/Es/It) — the same VRAM texture-cache stamp
+# fix as the NTSC-U entry above (SLUS-20035). bmdhacks, 2026-10-14; ARMSX2 umbrella,
+# devs/bmdhacks/campaigns/g57-bgda-slowdown/PATCH-STUDY.md (the NTSC-U analysis this follows).
+#
+# Same code, found in the PAL boot ELF (SLES_506.72) by instruction pattern, not by address.
+# The three functions are the NTSC-U ones word for word except for gp offsets, data addresses
+# and one jump target (gp is 0x329f70 here, 0x328a70 there). The code that queues an
+# already-resident texture (0x135178) refreshes its stamp from the game-time counter
+# (gp-0x5b38, 0x324438), while the allocator (0x1407e0) and the per-frame sweep (0x140a78)
+# use the render-frame counter (gp-0x5b34, 0x32443c). The sweep is called right after the
+# main loop increments the render-frame counter (0x2033e8), and the game-time counter is
+# zeroed at 0x2027cc, 0x20376c and 0x203aa0 and skipped while a flag at gp-0x4334 is set
+# (0x20305c; apparently pause). The patch makes the refresh read the render-frame counter.
+#
+# Cost it saves, from a scripted boot-from-disc session (title, character select, first
+# street) on the M2, seven GS dumps (vsync 3500 to 7000) replayed once each on Vulkan:
+# hash-cache hits 62.2% -> 75.1% and texture uploads 1970 -> 1359 (-31%). Three of the
+# seven points (the later ones, after walking around) go from 49-57% to 89-91% hits and
+# uploads fall 68-71%; the other four are about unchanged (uploads +1% to -15%). The two arms had identical game-time
+# and render-frame counters at every 300-vsync sample, and once in play the game-time counter
+# stayed 1735 behind the render-frame counter.
+# Pixels: software-renderer replays of the same dumps, frames 5-11. Where two unpatched boots
+# are byte-identical (five of the seven points) the patched arm differs by at most 15 px in
+# three frames at one point and by 60-210 px a frame at the other four, at most 23 levels,
+# singly along polygon and character edges. At the other two points the unpatched boots differ from
+# each other too (hundreds of px, at most 2 levels) and the patched arm by 200-4500 px, at
+# most 23 levels, so no clean figure there. Not looked at on the owner's flips.
+# Verified: boot from the PAL disc on the M2 (probe build from g57-slowdown 694e23d0a3, EE
+# JIT, MTVU off, isolated data path) found the entry for SLES-50672 / 4A9D8E01 and read
+# 8f82a4cc at 0x135250 with it, 8f82a4c8 without. Not run: device timing, a console, other
+# levels. patches only: upstream's gsHWFixes for this serial stay in force.
+SLES-50672:
+  patches:
+    4A9D8E01:
+      content: |-
+        author=bmdhacks
+        comment=Keeps textures that are drawn every frame resident in the game's VRAM texture cache instead of evicting and re-uploading them (0x00135250: lw v0,-0x5b38(gp) -> lw v0,-0x5b34(gp)).
+        patch=1,EE,00135250,word,8f82a4cc
+
+# GS multi-threading (backThread) recommended for the titles whose frame is limited by the GS
+# thread. bmdhacks (draw-storm ARCH step 1, Claude session), 2026-10-19; ARMSX2 umbrella,
+# devs/bmdhacks/campaigns/draw-storm/ARCH/STEP1-RESULT.md.
+#
+# What the fix does: backThread: 1 turns the GS back thread on for the game, only where the host
+# has at least four performance-tier cores and a slower tier beside them
+# (VMManager::Internal::CanSplitGS), and never turns it off. A player's own per-game
+# GSBackThreadMode claims the setting and the database stands aside.
+#
+# Why these titles and not every game: the split moves the draw, texture-cache and driver half of
+# the GS work to a second thread. Where the GS thread is the limit that is a large win; where the
+# EE or VU1 thread is the limit it costs 1 to 13 percent, because the two extra threads compete
+# for the same four big cores. Frame time, savestate in a GS-limited scene, native 1x, unlimited
+# speed, median of 6 passes over two rounds, split off against split on (Android: Performance
+# Cores mode, ROCKNIX: threads left to the scheduler, both with the prime-core rule of the same
+# commit): Spider-Man 3 SD865 22.76 -> 20.52 ms, RG 476H 33.01 -> 30.50, RG 477V 20.86 -> 20.02,
+# MQ65 87.34 -> 86.47; Sly 3 SD865 16.72 -> 12.78, RG 476H 25.74 -> 25.42, RG 477V 14.94 -> 12.15,
+# MQ65 67.97 -> 59.73; Ratchet & Clank: Up Your Arsenal SD865 10.02 -> 9.29, RG 476H 16.41 ->
+# 14.56, RG 477V 9.91 -> 9.72, MQ65 40.85 -> 34.96. No cell is slower with the split on.
+# The hint is withheld when the IOP thread is on (VMManager::Internal::CanSplitGS asks for a fifth performance core): with it on, the split was slower
+# than one GS thread on the SD865 and RG 476H in Spider-Man 3 (+4 to +5 percent), and Sly 3 gained only 1 to 4 percent.
+# At 2x on the SD865 Spider-Man 3 is GPU-limited (34.8 ms either way) and Sly 3 gains 7.5 percent.
+# Verified: draw-storm x1-placement build, armsx2-turnip axfl2-002 on the SD865, malisx2 0.1.5 on
+# the RG 476H and RG 477V. Serials: every retail release of each title that the database lists;
+# the measured ones are the NTSC-U discs (SLUS-21552, SCUS-97464, SCUS-97353).
+#
+# gsHWFixes is replaced wholesale, so each entry restates the upstream fixes it keeps.
+
+# Spider-Man 3, six releases (SLUS-21552 measured). bmdhacks, 2026-10-19: backThread added to the upstream fixes.
+SLUS-21552:
+  gsHWFixes:
+    cpuSpriteRenderBW: 2 # Fixes textures.
+    cpuSpriteRenderLevel: 2 # Fixes the sun when using the above.
+    halfPixelOffset: 5 # Fixes bloom alignment.
+    autoFlush: 1 # Fixes bloom intensity.
+    nativeScaling: 2 # Fixes DOF effect.
+    backThread: 1 # GS thread is the limit in the worst scenes; see the block above.
+SLUS-21617:
+  gsHWFixes:
+    cpuSpriteRenderBW: 2 # Fixes textures.
+    cpuSpriteRenderLevel: 2 # Fixes the sun when using the above.
+    halfPixelOffset: 5 # Fixes bloom alignment.
+    autoFlush: 1 # Fixes bloom intensity.
+    nativeScaling: 2 # Fixes DOF effect.
+    backThread: 1 # GS thread is the limit in the worst scenes; see the block above.
+SLES-54723:
+  gsHWFixes:
+    cpuSpriteRenderBW: 2 # Fixes textures.
+    cpuSpriteRenderLevel: 2 # Fixes the sun when using the above.
+    halfPixelOffset: 5 # Fixes bloom alignment.
+    autoFlush: 1 # Fixes bloom intensity.
+    nativeScaling: 2 # Fixes DOF effect.
+    backThread: 1 # GS thread is the limit in the worst scenes; see the block above.
+SLES-54724:
+  gsHWFixes:
+    cpuSpriteRenderBW: 2 # Fixes textures.
+    cpuSpriteRenderLevel: 2 # Fixes the sun when using the above.
+    halfPixelOffset: 5 # Fixes bloom alignment.
+    autoFlush: 1 # Fixes bloom intensity.
+    nativeScaling: 2 # Fixes DOF effect.
+    backThread: 1 # GS thread is the limit in the worst scenes; see the block above.
+SLKA-25385:
+  gsHWFixes:
+    cpuSpriteRenderBW: 2 # Fixes textures.
+    cpuSpriteRenderLevel: 2 # Fixes the sun when using the above.
+    halfPixelOffset: 5 # Fixes bloom alignment.
+    autoFlush: 1 # Fixes bloom intensity.
+    nativeScaling: 2 # Fixes DOF effect.
+    backThread: 1 # GS thread is the limit in the worst scenes; see the block above.
+SLPS-25823:
+  gsHWFixes:
+    cpuSpriteRenderBW: 2 # Fixes textures.
+    cpuSpriteRenderLevel: 2 # Fixes the sun when using the above.
+    halfPixelOffset: 5 # Fixes bloom alignment.
+    autoFlush: 1 # Fixes bloom intensity.
+    nativeScaling: 2 # Fixes DOF effect.
+    backThread: 1 # GS thread is the limit in the worst scenes; see the block above.
+
+# Sly 3: Honor Among Thieves, four releases (SCUS-97464 measured). bmdhacks, 2026-10-19: backThread added to the upstream fixes.
+SCUS-97464:
+  gsHWFixes:
+    halfPixelOffset: 5 # Fixes chromatic effect.
+    backThread: 1 # GS thread is the limit in the busy streets; see the block above.
+SCES-53409:
+  gsHWFixes:
+    halfPixelOffset: 5 # Fixes chromatic effect.
+    backThread: 1 # GS thread is the limit in the busy streets; see the block above.
+SCKA-20063:
+  gsHWFixes:
+    halfPixelOffset: 5 # Fixes chromatic effect.
+    backThread: 1 # GS thread is the limit in the busy streets; see the block above.
+SCKA-20111:
+  gsHWFixes:
+    halfPixelOffset: 5 # Fixes chromatic effect.
+    backThread: 1 # GS thread is the limit in the busy streets; see the block above.
+
+# Ratchet & Clank: Up Your Arsenal, two releases (SCUS-97353 measured). bmdhacks, 2026-10-19: backThread added to the upstream fixes.
+SCUS-97353:
+  gsHWFixes:
+    recommendedBlendingLevel: 3 # Improves color and luminosity of surfaces.
+    disablePartialInvalidation: 1 # Prevents the situation that a level (Aquatos) doesn't render characters and geometry.
+    halfPixelOffset: 4 # Aligns post bloom.
+    nativeScaling: 1 # Fixes light blooms.
+    autoFlush: 2 # Helps fix misaligned bloom.
+    recommendedAccurateAlphaTest: 1 # Fixes shadows and glasses alpha.
+    backThread: 1 # GS thread is the limit in combat scenes; see the block above.
+SCES-52456:
+  gsHWFixes:
+    recommendedBlendingLevel: 3 # Improves color and luminosity of surfaces.
+    disablePartialInvalidation: 1 # Prevents the situation that a level (Aquatos) doesn't render characters and geometry.
+    halfPixelOffset: 4 # Aligns post bloom.
+    nativeScaling: 1 # Fixes light blooms.
+    autoFlush: 2 # Helps fix misaligned bloom.
+    recommendedAccurateAlphaTest: 1 # Fixes shadows and glasses alpha.
+    backThread: 1 # GS thread is the limit in combat scenes; see the block above.
+
+# IOP thread (speedHacks.iopThread) recommended for Shadow of the Colossus, God of War and God of War II.
+#
+# What the fix does: iopThread: 1 runs the PS2's I/O processor (SPU2 audio, disc, controllers, memory
+# cards) on its own host thread, a bounded number of EE cycles behind the EE, which takes that work off the
+# EE thread. It is a setting the game database can turn on, and a player's own per-game IOP Thread setting
+# claims it, so the database stands aside. IopThread::ResolveMode still turns it off by itself where it cannot
+# run: a host that is not ARM64, PS1 and arcade games, an IOP breakpoint, and a CPU without enough
+# performance-tier cores for the EE, GS, IOP and (with MTVU) VU1 threads plus two more cores for everything else.
+#
+# Cost: the thread waits by spinning, and in play on the Duo it used 0.93 to 0.98 of a performance core. That
+# is battery and heat for the gain below, which is why it is a per-title recommendation and not a default.
+#
+# Why these titles: on the two that were measured, the EE thread is saturated (0.98 of a core) on the
+# Retroid Pocket Duo with the thread off. Measured on the Duo (Snapdragon 7 Gen 4 class, Adreno 722,
+# Maximum Performance profile, fan at maximum, Turnip axfl2-003, frame limiter off, the 2026-10-02 benchmark
+# savestates, two visits per setting in a mirrored order, two 20 s passes per visit, passes within 1 percent):
+#   God of War II               1x 88.5 -> 94.0 fps (+6.2%)    2x 65.2 -> 68.9 fps (+5.7%)
+#   Shadow of the Colossus      1x 51.7 -> 57.5 fps (+11.2%)   2x 45.4 -> 46.4 fps (+2.1%)
+# The gain is largest where the CPU is the limit (1x) and smallest where the GPU is (2x, GPU 89 to 94
+# percent busy). It never lost in any of the four cells. Earlier, Shadow of the Colossus on the SD865 and the
+# MQ65 took about 10 and 12 percent fewer EE-thread cycles per frame with the thread on.
+#
+# Not measured: God of War (the first game) on any device. It is included on the owner's decision, on the
+# strength of its being the same engine as God of War II. God of War II on the SD865, RG 476H, RG 477V and
+# MQ65 was not measured either.
+#
+# With the GS back thread (backThread) as well, nothing gained on Shadow of the Colossus and God of War II
+# was 4.7 percent slower at 2x on the Duo, so neither of these entries asks for it.
+#
+# Every retail release the database lists for each title is covered, since the fix is a property of the
+# engine and not of the region. Demos, trials and the PAL Shadow of the Colossus + Ico demo disc are left out:
+# they were not measured.
+#
+# speedHacks is replaced wholesale when an entry lists one, so the God of War II entries restate the one
+# upstream key they have (mvuFlag: 0). gsHWFixes is not named here, so upstream's graphics fixes for all
+# three titles are untouched. Shadow of the Colossus and God of War have no upstream speedHacks.
+
+# nativeCounterDraws for Shadow of the Colossus: draw its shadow volumes at native resolution when upscaling.
+# bmdhacks, 2026-10-22. Investigation, the corpus scan and flip pages: devs/bmdhacks/campaigns/sotc-slow-2026-10-22
+# in the umbrella.
+#
+# Symptom: the game counts its shadow volumes in a separate buffer, adding 1 or 255 per triangle with colour
+# clamping off so 255 wraps to -1. Climbing a colossus, the volumes cover the screen about 47 times. To keep the
+# wrap exact the HW renderer blends them into a 16-bit-per-channel copy of the target, and Adreno blends that
+# format slowly: at 2x on the Retroid Pocket Duo that one draw took about 15 ms of a 37 ms frame.
+#
+# What the fix does: a draw that only adds +1/-1 to the same channels (GSRendererHW::IsColClipCounterDraw()) is
+# drawn at the target's native resolution, against a point-sampled copy of the depth buffer, and stretched back.
+# The game reads the count back only as inside/outside, so only the shadow's edges move, by at most one native
+# pixel. Vulkan only; other backends ignore it.
+#
+# Verified on the Duo (Adreno 722, Turnip axfl2-003, Vulkan, 2x, GS dump replays): today's climbing dump 36.9 ms
+# per frame as shipped, 24.7 with the fix; eleven other SotC dumps 0.2 to 1.4 ms faster. 1.2 to 4.6 percent of
+# a frame's pixels differ, on shadow edges; the owner compared all twelve dumps' flips and accepted the look. A
+# scan of 222 dumps found counter draws in no other game (Spider-Man 3, Sly 3, God of War II and Stuntman use the
+# same 16-bit path with ordinary colours and are not counters).
+#
+# gsHWFixes replaces the upstream map, so each entry below restates upstream's three keys unchanged.
+
+# OPHFlagHack for Shadow of the Colossus: holds the game at a steady 30 fps instead of flipping between 30 and 60.
+# bmdhacks, 2026-10-22. Source: NetherSX2 v2.2n-4248's GameIndex.yaml sets it on all eight releases below
+# ("Improves performance"); upstream PCSX2 never has. Investigation and measurements:
+# devs/bmdhacks/campaigns/sotc-fps-2026-10-22 in the umbrella.
+#
+# Symptom: the game has no fixed frame rate. It runs at 60 whenever a frame's EE work fits in one field and at
+# 30 otherwise, and in many scenes it sits on that line. On the Retroid Pocket Duo it then jumps to 60, cannot
+# hold full speed there (93 to 98 percent), stutters, and falls back to 30. Its game logic uses a variable time
+# step, so 30 is a correct speed for it, not a slowdown.
+#
+# What the fix does: before starting each frame the game waits for a once-per-vblank watchdog to see the GS
+# pipeline idle, and that check reads GIF_STAT's APATH bits. OPHFlagHack makes GIF_STAT reads alternate between
+# busy and idle, so the watchdog releases a frame at most every second vblank: 30 fps.
+#
+# Verified on the Duo (Adreno 722, Turnip axfl2-003, Vulkan, the com.armsx2.a722test build of master with
+# the Adreno 722 commits), SCUS-97472, shrine-stairs savestate, 30 s per arm, counting the game's own
+# frame and vblank counters over PINE: hack off 56.9 and 57.1 game fps (55 to 56 of 59 half-seconds at 60,
+# emulator under full speed); hack on 30.0 fps (0 of 60 half-seconds at 60, full speed). The on-screen FPS
+# counter reads about 60 either way, because this game writes the GS display registers every field.
+#
+# Not checked: a heavy colossus fight. The hack's busy/idle alternation is shared with about 18 other GIF_STAT
+# reads in the game, so a scene that cannot make 30 might drop to 15 rather than 20.
+#
+# gameFixes replaces the upstream list, and upstream has none for any of these entries. The five retail
+# releases that already carry iopThread keep it below.
+
+# Shadow of the Colossus, five releases (SCUS-97472 measured). bmdhacks, 2026-10-21: iopThread added; upstream has no speedHacks here.
+# bmdhacks, 2026-10-22: OPHFlagHack added (see the block above); SCUS-97472 measured.
+# bmdhacks, 2026-10-22: nativeCounterDraws added (see its block above); SCUS-97472 measured.
+SCUS-97472:
+  gameFixes:
+    - OPHFlagHack # Holds a steady 30 fps; see the OPHFlagHack block above.
+  gsHWFixes:
+    recommendedBlendingLevel: 4 # Upstream: fixes water color.
+    halfPixelOffset: 5 # Upstream: fixes misalignments and borders on side.
+    nativeScaling: 3 # Upstream: fixes post effects shadows and DOF effects.
+    nativeCounterDraws: 1 # Shadow volumes at native resolution; see the nativeCounterDraws block above.
+  speedHacks:
+    iopThread: 1 # EE thread is the limit; see the block above.
+SCES-53326:
+  gameFixes:
+    - OPHFlagHack # Holds a steady 30 fps; see the OPHFlagHack block above.
+  gsHWFixes:
+    recommendedBlendingLevel: 4 # Upstream: fixes water color.
+    halfPixelOffset: 5 # Upstream: fixes misalignments and borders on side.
+    nativeScaling: 3 # Upstream: fixes post effects shadows and DOF effects.
+    nativeCounterDraws: 1 # Shadow volumes at native resolution; see the nativeCounterDraws block above.
+  speedHacks:
+    iopThread: 1 # EE thread is the limit; see the block above.
+SCPS-15097:
+  gameFixes:
+    - OPHFlagHack # Holds a steady 30 fps; see the OPHFlagHack block above.
+  gsHWFixes:
+    recommendedBlendingLevel: 4 # Upstream: fixes water color.
+    halfPixelOffset: 5 # Upstream: fixes misalignments and borders on side.
+    nativeScaling: 3 # Upstream: fixes post effects shadows and DOF effects.
+    nativeCounterDraws: 1 # Shadow volumes at native resolution; see the nativeCounterDraws block above.
+  speedHacks:
+    iopThread: 1 # EE thread is the limit; see the block above.
+SCPS-19320:
+  gameFixes:
+    - OPHFlagHack # Holds a steady 30 fps; see the OPHFlagHack block above.
+  gsHWFixes:
+    recommendedBlendingLevel: 4 # Upstream: fixes water color.
+    halfPixelOffset: 5 # Upstream: fixes misalignments and borders on side.
+    nativeScaling: 3 # Upstream: fixes post effects shadows and DOF effects.
+    nativeCounterDraws: 1 # Shadow volumes at native resolution; see the nativeCounterDraws block above.
+  speedHacks:
+    iopThread: 1 # EE thread is the limit; see the block above.
+SCPS-19335:
+  gameFixes:
+    - OPHFlagHack # Holds a steady 30 fps; see the OPHFlagHack block above.
+  gsHWFixes:
+    recommendedBlendingLevel: 4 # Upstream: fixes water color.
+    halfPixelOffset: 5 # Upstream: fixes misalignments and borders on side.
+    nativeScaling: 3 # Upstream: fixes post effects shadows and DOF effects.
+    nativeCounterDraws: 1 # Shadow volumes at native resolution; see the nativeCounterDraws block above.
+  speedHacks:
+    iopThread: 1 # EE thread is the limit; see the block above.
+
+# Shadow of the Colossus, the Korean release and two demos (none measured). bmdhacks, 2026-10-22: OPHFlagHack added
+# (see the OPHFlagHack block above); NetherSX2 sets it on these too. No iopThread: they were not measured for it.
+# bmdhacks, 2026-10-22: nativeCounterDraws added (see its block above), same game engine.
+SCKA-20061:
+  gameFixes:
+    - OPHFlagHack # Holds a steady 30 fps; see the OPHFlagHack block above.
+  gsHWFixes:
+    recommendedBlendingLevel: 4 # Upstream: fixes water color.
+    halfPixelOffset: 5 # Upstream: fixes misalignments and borders on side.
+    nativeScaling: 3 # Upstream: fixes post effects shadows and DOF effects.
+    nativeCounterDraws: 1 # Shadow volumes at native resolution; see the nativeCounterDraws block above.
+SCED-53962:
+  gameFixes:
+    - OPHFlagHack # Holds a steady 30 fps; see the OPHFlagHack block above.
+  gsHWFixes:
+    recommendedBlendingLevel: 4 # Upstream: fixes water color.
+    halfPixelOffset: 5 # Upstream: fixes misalignments and borders on side.
+    nativeScaling: 1 # Upstream: fixes post effects shadows and DOF effects.
+    nativeCounterDraws: 1 # Shadow volumes at native resolution; see the nativeCounterDraws block above.
+SCUS-97505:
+  gameFixes:
+    - OPHFlagHack # Holds a steady 30 fps; see the OPHFlagHack block above.
+  gsHWFixes:
+    recommendedBlendingLevel: 4 # Upstream: fixes water color.
+    halfPixelOffset: 5 # Upstream: fixes misalignments and borders on side.
+    nativeScaling: 3 # Upstream: fixes post effects shadows and DOF effects.
+    nativeCounterDraws: 1 # Shadow volumes at native resolution; see the nativeCounterDraws block above.
+
+# God of War, ten releases (none measured). bmdhacks, 2026-10-21: iopThread added; upstream has no speedHacks here.
+SCUS-97399:
+  speedHacks:
+    iopThread: 1 # Not measured; same engine as God of War II. See the block above.
+SCES-51533:
+  speedHacks:
+    iopThread: 1 # Not measured; same engine as God of War II. See the block above.
+SCES-53133:
+  speedHacks:
+    iopThread: 1 # Not measured; same engine as God of War II. See the block above.
+SCAJ-30010:
+  speedHacks:
+    iopThread: 1 # Not measured; same engine as God of War II. See the block above.
+SCKA-30002:
+  speedHacks:
+    iopThread: 1 # Not measured; same engine as God of War II. See the block above.
+SCKA-30003:
+  speedHacks:
+    iopThread: 1 # Not measured; same engine as God of War II. See the block above.
+SLPM-66167:
+  speedHacks:
+    iopThread: 1 # Not measured; same engine as God of War II. See the block above.
+SLPM-67010:
+  speedHacks:
+    iopThread: 1 # Not measured; same engine as God of War II. See the block above.
+SLPM-67011:
+  speedHacks:
+    iopThread: 1 # Not measured; same engine as God of War II. See the block above.
+SLPM-67012:
+  speedHacks:
+    iopThread: 1 # Not measured; same engine as God of War II. See the block above.
+
+# God of War II, eight releases (SCUS-97481 measured). bmdhacks, 2026-10-21: iopThread added to the upstream mvuFlag.
+SCUS-97481:
+  speedHacks:
+    mvuFlag: 0 # Fixes enemies attacks turning into squares.
+    iopThread: 1 # EE thread is the limit; see the block above.
+SCES-54206:
+  speedHacks:
+    mvuFlag: 0 # Fixes enemies attacks turning into squares.
+    iopThread: 1 # EE thread is the limit; see the block above.
+SCAJ-20190:
+  speedHacks:
+    mvuFlag: 0 # Fixes enemies attacks turning into squares.
+    iopThread: 1 # EE thread is the limit; see the block above.
+SCAJ-30011:
+  speedHacks:
+    mvuFlag: 0 # Fixes enemies attacks turning into squares.
+    iopThread: 1 # EE thread is the limit; see the block above.
+SCKA-30006:
+  speedHacks:
+    mvuFlag: 0 # Fixes enemies attacks turning into squares.
+    iopThread: 1 # EE thread is the limit; see the block above.
+SCKA-30007:
+  speedHacks:
+    mvuFlag: 0 # Fixes enemies attacks turning into squares.
+    iopThread: 1 # EE thread is the limit; see the block above.
+SLPM-67013:
+  speedHacks:
+    mvuFlag: 0 # Fixes enemies attacks turning into squares.
+    iopThread: 1 # EE thread is the limit; see the block above.
+SLPM-67017:
+  speedHacks:
+    mvuFlag: 0 # Fixes enemies attacks turning into squares.
+    iopThread: 1 # EE thread is the limit; see the block above.

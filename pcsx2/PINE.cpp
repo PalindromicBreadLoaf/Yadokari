@@ -6,8 +6,10 @@
 #include "Host.h"
 #include "Elfheader.h"
 #include "GS.h"
+#include "GS/GSDumpBundle.h"
 #include "GS/GSPerfMon.h"
 #include "GS/Renderers/Common/GSDevice.h"
+#include "ImGui/FullscreenUIShot.h"
 #include "MTGS.h"
 #include "PerformanceMetrics.h"
 #include "SaveState.h"
@@ -233,8 +235,19 @@ namespace PINEServer
 		MsgGSDump = 0x14, /**< Records a GS dump of the next N frames. */
 		MsgGetEffectiveSetting = 0x15, /**< Reads what a setting is actually running as. */
 
+		// Big Picture from outside, for an agent with no monitor (see ImGui/FullscreenUIShot.h).
+		// All work with no VM running. Each replies [u32 size][JSON, NUL-terminated]:
+		// {"ok":true,...} or {"ok":false,"error":"..."}; a malformed request fails the command.
+		MsgUIScreenshot = 0x16, /**< [u32 path_len][path .png][u32 settle_frames] Draws that many frames, writes the next; needs --headless. */
+		MsgUIOpenPage = 0x17, /**< [u32 name_len][name] Opens a Big Picture page, e.g. "settings:graphics". */
+		MsgUIWaitFrames = 0x18, /**< [u32 frames][u32 timeout_ms] Waits for that many presents (0 ms = 30 s). */
+
 		MsgUnimplemented = 0xFF /**< Unimplemented IPC message. */
 	};
+
+	static_assert(MsgUIScreenshot == FullscreenUIShot::OpScreenshot && MsgUIOpenPage == FullscreenUIShot::OpOpenPage &&
+					  MsgUIWaitFrames == FullscreenUIShot::OpWaitFrames,
+		"PINE opcodes and FullscreenUIShot.h disagree");
 
 	/**
 	 * Emulator status enum.
@@ -419,6 +432,7 @@ namespace PINEServer
 			"\"gs_thread_pct\":{:.3f},\"gs_thread_ms\":{:.3f},"
 			"\"gs_back_thread_pct\":{:.3f},\"gs_back_thread_ms\":{:.3f},"
 			"\"vu_thread_pct\":{:.3f},\"vu_thread_ms\":{:.3f},"
+			"\"iop_thread_pct\":{:.3f},\"iop_thread_ms\":{:.3f},"
 			"\"gpu_pct\":{:.3f},\"gpu_ms_avg\":{:.3f},\"gpu_ms_last\":{:.3f},"
 			"\"gpu_vs_invocations\":{:.0f},\"gpu_ps_invocations\":{:.0f},"
 			"\"prims\":{:.1f},\"draws\":{:.1f},\"draw_calls\":{:.1f},"
@@ -440,6 +454,8 @@ namespace PINEServer
 			// so under the split the two have to be read together to see the GS cost.
 			PerformanceMetrics::GetGSBackThreadUsage(), PerformanceMetrics::GetGSBackThreadAverageTime(),
 			PerformanceMetrics::GetVUThreadUsage(), PerformanceMetrics::GetVUThreadAverageTime(),
+			// Zero unless the IOP runs on its own thread beside the EE.
+			PerformanceMetrics::GetIOPThreadUsage(), PerformanceMetrics::GetIOPThreadAverageTime(),
 			PerformanceMetrics::GetGPUUsage(), PerformanceMetrics::GetGPUAverageTime(),
 			PerformanceMetrics::GetLastGPUTime(),
 			PerformanceMetrics::GetGPUAverageVSInvocations(), PerformanceMetrics::GetGPUAveragePSInvocations(),
@@ -549,8 +565,9 @@ namespace PINEServer
 	 * The reply describes the request, not a finished file. The dump is opened on the next
 	 * VSync and a multi-frame dump is closed some frames after that, so a client that waits
 	 * for the file has to keep the VM running or step it with MsgFrameAdvance -- a paused VM
-	 * never reaches the VSync that writes anything. A screenshot lands next to the dump too;
-	 * that is inherent to the snapshot path, not something this command adds.
+	 * never reaches the VSync that writes anything. `path` is the dump's zip, which holds the
+	 * dump, its driver report and its screenshot. It is written when the dump closes and
+	 * appears whole, so the file existing means the dump is finished.
 	 *
 	 * `queued` false carries a `reason`, because both ways a request can be turned away are
 	 * served commands that quietly did nothing rather than socket-level failures. The reasons
@@ -578,7 +595,7 @@ namespace PINEServer
 		// extension, and let what is left be the base name.
 		if (!path.empty())
 		{
-			for (const std::string_view suffix : {".gs.zst", ".gs.xz", ".gs", ".png"})
+			for (const std::string_view suffix : {".gs.zip", ".gs.zst", ".gs.xz", ".gs", ".png"})
 			{
 				if (StringUtil::EndsWithNoCase(path, suffix))
 				{
@@ -590,7 +607,6 @@ namespace PINEServer
 
 		bool queued = false, stopped = false;
 		std::string base;
-		const char* dump_ext = "";
 		const char* reason = "";
 
 		Host::RunOnCPUThread(
@@ -618,21 +634,6 @@ namespace PINEServer
 						reason = "snapshot pending";
 						return;
 					}
-
-					// GSConfig is the GS thread's copy of the config, so read the compression
-					// method here -- it decides the extension the dump writer will append.
-					switch (GSConfig.GSDumpCompression)
-					{
-						case GSDumpCompressionMethod::Uncompressed:
-							dump_ext = ".gs";
-							break;
-						case GSDumpCompressionMethod::LZMA:
-							dump_ext = ".gs.xz";
-							break;
-						default:
-							dump_ext = ".gs.zst";
-							break;
-					}
 				});
 				MTGS::WaitGS(false);
 			},
@@ -641,7 +642,7 @@ namespace PINEServer
 		*reply = fmt::format(
 			"{{\"queued\":{},\"stopped\":{},\"frames\":{},\"path\":\"{}\",\"reason\":\"{}\"}}",
 			queued ? "true" : "false", stopped ? "true" : "false", frames,
-			queued ? JsonEscape(base + dump_ext) : std::string(), reason);
+			queued ? JsonEscape(GSDumpBundle::ZipPath(base)) : std::string(), reason);
 		return true;
 	}
 } // namespace PINEServer
@@ -1245,6 +1246,25 @@ PINEServer::IPCBuffer PINEServer::ParseCommand(std::span<u8> buf, std::vector<u8
 				if (!SafetyChecks(buf_cnt, 0, ret_cnt, 0, buf_size)) [[unlikely]]
 					goto error;
 				Host::RunOnCPUThread([]() { VMManager::FrameAdvance(1); });
+				break;
+			}
+			case MsgUIScreenshot:
+			case MsgUIOpenPage:
+			case MsgUIWaitFrames:
+			{
+				std::string reply;
+				u32 consumed = 0;
+				if (!FullscreenUIShot::HandlePineCommand(buf[buf_cnt - 1], buf.data() + buf_cnt, buf_size - buf_cnt, &consumed, &reply)) [[unlikely]]
+					goto error;
+				buf_cnt += consumed;
+
+				const u32 size = reply.size() + 1;
+				if (!SafetyChecks(buf_cnt, 0, ret_cnt, size + 4, buf_size)) [[unlikely]]
+					goto error;
+				ToResultVector(ret_buffer, size, ret_cnt);
+				ret_cnt += 4;
+				memcpy(&ret_buffer[ret_cnt], reply.c_str(), size);
+				ret_cnt += size;
 				break;
 			}
 			case MsgGSDump:

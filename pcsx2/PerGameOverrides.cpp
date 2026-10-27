@@ -46,6 +46,7 @@ namespace
 		{"UserHacks_ForceEvenSpritePosition", GSHWFixId::ForceEvenSpritePosition, GSUserHackOverride::ForceEvenSpritePosition},
 		{"UserHacks_native_scaling", GSHWFixId::NativeScaling, GSUserHackOverride::NativeScaling},
 		{"UserHacks_NativePaletteDraw", GSHWFixId::NativePaletteDraw, GSUserHackOverride::NativePaletteDraw},
+		{"UserHacks_NativeCounterDraws", GSHWFixId::NativeCounterDraws, GSUserHackOverride::MaxCount},
 		{"UserHacks_BilinearHack", GSHWFixId::BilinearUpscale, GSUserHackOverride::BilinearHack},
 		{"UserHacks_TCOffsetX", GSHWFixId::Count, GSUserHackOverride::TextureOffsetX},
 		{"UserHacks_TCOffsetY", GSHWFixId::Count, GSUserHackOverride::TextureOffsetY},
@@ -74,6 +75,7 @@ namespace
 		{"pcrtc_offsets", GSHWFixId::PCRTCOffsets, GSUserHackOverride::MaxCount},
 		{"pcrtc_overscan", GSHWFixId::PCRTCOverscan, GSUserHackOverride::MaxCount},
 		{"CoalesceRenderPasses", GSHWFixId::CoalesceRenderPasses, GSUserHackOverride::MaxCount},
+		{"GSBackThreadMode", GSHWFixId::BackThread, GSUserHackOverride::MaxCount},
 		{"TriFilter", GSHWFixId::TrilinearFiltering, GSUserHackOverride::MaxCount},
 		{"UserHacks_SkipDraw_Start", GSHWFixId::SkipDrawStart, GSUserHackOverride::MaxCount},
 		{"UserHacks_SkipDraw_End", GSHWFixId::SkipDrawEnd, GSUserHackOverride::MaxCount},
@@ -118,6 +120,8 @@ namespace
 		"vu1Instant", // SpeedHack::InstantVU1
 		"vuThread", // SpeedHack::MTVU
 		"EECycleRate", // SpeedHack::EECycleRate
+		"iopThread", // SpeedHack::IOPThread
+		"DynamicEECycleRate", // SpeedHack::DynamicEECycleRate
 	};
 } // namespace
 

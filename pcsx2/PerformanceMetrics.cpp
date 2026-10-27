@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2002-2026 PCSX2 Dev Team
 // SPDX-License-Identifier: GPL-3.0+
 
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <mutex>
@@ -14,6 +15,7 @@
 #include "PerformanceMetrics.h"
 
 #include "GS.h"
+#include "IopThread/IopPlacement.h"
 #include "MTGS.h"
 #include "MTVU.h"
 #include "VMManager.h"
@@ -63,9 +65,22 @@ static u32 s_gs_privileged_register_writes_since_last_update = 0;
 
 static Threading::ThreadHandle s_cpu_thread_handle;
 static u64 s_last_cpu_time = 0;
+
+// The CPU thread's frame-work clock, in GetCPUTicks() units. It opens at the limiter's
+// post-sleep return and closes at the next Throttle() entry, so the interval it measures is
+// the frame's active work with the deliberate limiter sleep taken out. Zero means no period
+// is open, which is how a frame the limiter did not pace is refused rather than reported.
+//
+// It is CPU-thread-owned and deliberately in the GetCPUTicks() domain rather than
+// Common::Timer's: on AArch64 that is one mrs of the architected counter instead of a vDSO
+// call, it is the same clock the limiter's own target is expressed in, and Throttle() already
+// reads it once per frame - so both consumers, the Android ADPF hint and the dynamic EE
+// cycle-rate sampler, share a single timestamp per frame instead of taking one each.
+static u64 s_frame_work_start = 0;
 static u64 s_last_gs_time = 0;
 static u64 s_last_gs_back_time = 0;
 static u64 s_last_vu_time = 0;
+static u64 s_last_iop_time = 0;
 static u64 s_last_ticks = 0;
 
 // The GS back thread registers itself from its own entry point and is cleared from the MTGS
@@ -85,6 +100,24 @@ static u64 SampleGSBackThreadCPUTime()
 	const u64 now = s_gs_back_thread_handle ? s_gs_back_thread_handle.GetCPUTime() : s_last_gs_back_time;
 	const u64 delta = (now > s_last_gs_back_time) ? (now - s_last_gs_back_time) : 0;
 	s_last_gs_back_time = now;
+	return delta;
+}
+
+// The IOP thread is started and stopped by the CPU thread and sampled by whichever thread presents a
+// frame, so like the GS back thread its handle and running total are owned by a mutex, taken twice a
+// second at most.
+static std::mutex s_iop_thread_mutex;
+static Threading::ThreadHandle s_iop_thread_handle;
+
+/// CPU time consumed by the IOP thread since the last call, in Threading tick units. A thread that
+/// started or stopped inside the window contributes only the part of it that the handle was installed
+/// for, for the same reason as the GS back thread's.
+static u64 SampleIOPThreadCPUTime()
+{
+	std::unique_lock lock(s_iop_thread_mutex);
+	const u64 now = s_iop_thread_handle ? s_iop_thread_handle.GetCPUTime() : s_last_iop_time;
+	const u64 delta = (now > s_last_iop_time) ? (now - s_last_iop_time) : 0;
+	s_last_iop_time = now;
 	return delta;
 }
 
@@ -132,7 +165,6 @@ static bool s_adpf_create_failed = false;
 static bool s_adpf_report_warned = false;
 static bool s_adpf_paused = false; // reporting suspended (unlimited/vsync/interrupted), edge-logged
 static int64_t s_adpf_target_ns = 0;
-static Common::Timer::Value s_adpf_work_start = 0; // start of the current active-work segment (0 = none)
 static int64_t s_adpf_work_accum_ns = 0; // this frame's segments closed so far; -1 = frame incomplete, skip it
 
 // The frame deadline in ns: emulated refresh scaled by the limiter's target speed, so turbo /
@@ -194,6 +226,15 @@ static float s_gs_back_thread_usage = 0.0f;
 static float s_gs_back_thread_time = 0.0f;
 static float s_vu_thread_usage = 0.0f;
 static float s_vu_thread_time = 0.0f;
+static float s_iop_thread_usage = 0.0f;
+static float s_iop_thread_time = 0.0f;
+
+// Update() closes a window by writing a dozen statics. TryGetWindowSnapshot() reads them from another
+// thread, so the writer brackets its stores with this counter (odd while writing, even otherwise) and
+// the reader keeps a copy only if the counter was even and did not move.
+static std::atomic<u32> s_window_seq{0};
+static float s_window_seconds = 0.0f;
+static std::atomic<bool> s_gpu_timer_supported{false};
 
 static PerformanceMetrics::FrameTimeHistory s_frame_time_history;
 static u32 s_frame_time_history_pos = 0;
@@ -237,6 +278,8 @@ void PerformanceMetrics::Clear()
 	s_gs_back_thread_time = 0.0f;
 	s_vu_thread_usage = 0.0f;
 	s_vu_thread_time = 0.0f;
+	s_iop_thread_usage = 0.0f;
+	s_iop_thread_time = 0.0f;
 
 	s_average_gpu_time = 0.0f;
 	s_last_gpu_time = 0.0f;
@@ -282,6 +325,7 @@ void PerformanceMetrics::Reset()
 	s_last_gs_time = MTGS::GetThreadHandle().GetCPUTime();
 	SampleGSBackThreadCPUTime(); // rebases the running total; the delta is deliberately dropped
 	s_last_vu_time = THREAD_VU1 ? vu1Thread.GetThreadHandle().GetCPUTime() : 0;
+	SampleIOPThreadCPUTime(); // rebases the running total; the delta is deliberately dropped
 	s_last_ticks = GetCPUTicks();
 
 	for (GSSWThreadStats& stat : s_gs_sw_threads)
@@ -313,6 +357,9 @@ void PerformanceMetrics::Update(bool gs_register_write, bool fb_blit, bool is_sk
 		return;
 
 	s_last_update_time.ResetTo(now_ticks);
+	s_window_seq.fetch_add(1, std::memory_order_relaxed);
+	std::atomic_thread_fence(std::memory_order_release);
+	s_window_seconds = time;
 	s_minimum_frame_time = std::exchange(s_minimum_frame_time_accumulator, 0.0f);
 	s_average_frame_time = std::exchange(s_average_frame_time_accumulator, 0.0f) / static_cast<float>(s_unskipped_frames_since_last_update);
 	s_maximum_frame_time = std::exchange(s_maximum_frame_time_accumulator, 0.0f);
@@ -360,6 +407,7 @@ void PerformanceMetrics::Update(bool gs_register_write, bool fb_blit, bool is_sk
 	const u64 gs_time = MTGS::GetThreadHandle().GetCPUTime();
 	const u64 gs_back_delta = SampleGSBackThreadCPUTime();
 	const u64 vu_time = THREAD_VU1 ? vu1Thread.GetThreadHandle().GetCPUTime() : 0;
+	const u64 iop_delta = SampleIOPThreadCPUTime();
 
 	const u64 cpu_delta = cpu_time - s_last_cpu_time;
 	const u64 gs_delta = gs_time - s_last_gs_time;
@@ -372,10 +420,25 @@ void PerformanceMetrics::Update(bool gs_register_write, bool fb_blit, bool is_sk
 	s_gs_thread_usage = static_cast<double>(gs_delta) * pct_divider;
 	s_gs_back_thread_usage = static_cast<double>(gs_back_delta) * pct_divider;
 	s_vu_thread_usage = static_cast<double>(vu_delta) * pct_divider;
+	s_iop_thread_usage = static_cast<double>(iop_delta) * pct_divider;
 	s_cpu_thread_time = static_cast<double>(cpu_delta) * time_divider;
 	s_gs_thread_time = static_cast<double>(gs_delta) * time_divider;
 	s_gs_back_thread_time = static_cast<double>(gs_back_delta) * time_divider;
 	s_vu_thread_time = static_cast<double>(vu_delta) * time_divider;
+	s_iop_thread_time = static_cast<double>(iop_delta) * time_divider;
+
+	{
+		IopThread::PrimeLoad load;
+		load.present[IopThread::kPrimeEE] = true;
+		load.busy[IopThread::kPrimeEE] = s_cpu_thread_usage;
+		load.present[IopThread::kPrimeVU] = THREAD_VU1;
+		load.busy[IopThread::kPrimeVU] = s_vu_thread_usage;
+		load.present[IopThread::kPrimeGSFront] = true;
+		load.busy[IopThread::kPrimeGSFront] = s_gs_thread_usage;
+		load.present[IopThread::kPrimeGSBack] = HasGSBackThread();
+		load.busy[IopThread::kPrimeGSBack] = s_gs_back_thread_usage;
+		VMManager::Internal::UpdatePrimeCorePlacement(load);
+	}
 
 	for (GSSWThreadStats& thread : s_gs_sw_threads)
 	{
@@ -397,9 +460,14 @@ void PerformanceMetrics::Update(bool gs_register_write, bool fb_blit, bool is_sk
 		if (HasGSBackThread())
 			std::snprintf(gs_back, sizeof(gs_back), " GSB %.0f%%", s_gs_back_thread_usage);
 
-		Console.WriteLn("PerfLog: %.1f fps | EE %.0f%% GS %.0f%%%s VU %.0f%% GPU %.0f%% | frame %llu",
+		// The IOP thread only exists while the IOP runs concurrently, so likewise omitted otherwise.
+		char iop[32] = {};
+		if (HasIOPThread())
+			std::snprintf(iop, sizeof(iop), " IOP %.0f%%", s_iop_thread_usage);
+
+		Console.WriteLn("PerfLog: %.1f fps | EE %.0f%% GS %.0f%%%s VU %.0f%%%s GPU %.0f%% | frame %llu",
 			static_cast<float>(s_log_accum_frames) / s_log_accum_time, s_cpu_thread_usage,
-			s_gs_thread_usage, gs_back, s_vu_thread_usage, s_gpu_usage,
+			s_gs_thread_usage, gs_back, s_vu_thread_usage, iop, s_gpu_usage,
 			static_cast<unsigned long long>(s_frame_number));
 		s_log_accum_time = 0.0f;
 		s_log_accum_frames = 0;
@@ -409,7 +477,51 @@ void PerformanceMetrics::Update(bool gs_register_write, bool fb_blit, bool is_sk
 	s_unskipped_frames_since_last_update = 0;
 	s_presents_since_last_update = 0;
 
+	s_window_seq.fetch_add(1, std::memory_order_release);
+
 	Host::OnPerformanceMetricsUpdated();
+}
+
+void PerformanceMetrics::SetGPUTimerSupported(bool supported)
+{
+	s_gpu_timer_supported.store(supported, std::memory_order_relaxed);
+}
+
+bool PerformanceMetrics::HasGPUTimer()
+{
+	return s_gpu_timer_supported.load(std::memory_order_relaxed);
+}
+
+bool PerformanceMetrics::TryGetWindowSnapshot(WindowSnapshot* out)
+{
+	const u32 before = s_window_seq.load(std::memory_order_acquire);
+	if (before == 0 || (before & 1))
+		return false;
+
+	WindowSnapshot snap;
+	snap.sequence = before / 2;
+	snap.seconds = s_window_seconds;
+	snap.speed = GetSpeed();
+	snap.ee_usage = s_cpu_thread_usage;
+	snap.gs_usage = s_gs_thread_usage;
+	snap.gs_back_usage = s_gs_back_thread_usage;
+	snap.vu_usage = s_vu_thread_usage;
+	snap.iop_usage = s_iop_thread_usage;
+	snap.gpu_usage = s_gpu_usage;
+	snap.has_gs_back_thread = HasGSBackThread();
+	snap.has_iop_thread = HasIOPThread();
+	snap.has_gpu_timer = HasGPUTimer();
+	snap.ee_ms = static_cast<float>(s_cpu_thread_time);
+	snap.gs_ms = static_cast<float>(s_gs_thread_time);
+	snap.gs_back_ms = static_cast<float>(s_gs_back_thread_time);
+	snap.gpu_ms = s_average_gpu_time;
+
+	std::atomic_thread_fence(std::memory_order_acquire);
+	if (s_window_seq.load(std::memory_order_relaxed) != before)
+		return false;
+
+	*out = snap;
+	return true;
 }
 
 void PerformanceMetrics::OnGPUPresent(float gpu_time, u64 vs_invocations, u64 ps_invocations)
@@ -477,32 +589,31 @@ void PerformanceMetrics::AdpfShutdown()
 	}
 	s_adpf_tids.clear();
 	s_adpf_create_failed = false;
-	s_adpf_work_start = 0;
 	s_adpf_work_accum_ns = 0;
 #endif
+	s_frame_work_start = 0;
 }
 
-void PerformanceMetrics::AdpfEndWorkSegment(bool frame_end)
-{
 #if defined(__ANDROID__)
-	// Sampled at Throttle() entry — the instant the frame's active CPU work finished, before the
-	// limiter sleep — so (now - work_start) excludes the deliberate limiter sleep. It is NOT pure
-	// CPU compute: the EE can still block behind a full MTGS queue that is itself stalled on
-	// presentation, so some present-wait can leak in. Acceptable for a first experiment, and a far
-	// better approximation of ADPF's "last workload cycle" than the present interval.
-	const Common::Timer::Value now = Common::Timer::GetCurrentValue();
+// Reports the frame's work to PerformanceHintManager. The limiter waits twice per frame, so a
+// frame is two segments: the first is held in s_adpf_work_accum_ns and the pair is reported at
+// the frame's last wait. `segment_open` is false when no period was open at this wait (first
+// frame, or just resumed from a pause).
+static void AdpfEndWorkSegment(bool segment_open, u64 segment_ticks, bool frame_end)
+{
 	std::lock_guard<std::mutex> lock(s_adpf_mutex);
 	if (!s_adpf_enabled)
 		return;
 	AdpfEnsureSession();
-	if (!s_adpf_session || s_adpf_work_start == 0)
+	if (!s_adpf_session || !segment_open)
 	{
-		// No open segment (first frame, or just resumed from a pause). If this is the frame's
-		// first wait, its second segment alone would under-report the frame, so skip it.
+		// If this is the frame's first wait, its second segment alone would under-report the
+		// frame, so skip it.
 		s_adpf_work_accum_ns = frame_end ? 0 : -1;
 		return;
 	}
-	const int64_t segment_ns = static_cast<int64_t>(Common::Timer::ConvertValueToSeconds(now - s_adpf_work_start) * 1.0e9);
+	const int64_t segment_ns =
+		static_cast<int64_t>((static_cast<double>(segment_ticks) * 1.0e9) / static_cast<double>(GetTickFrequency()));
 	if (!frame_end)
 	{
 		if (s_adpf_work_accum_ns >= 0)
@@ -537,35 +648,56 @@ void PerformanceMetrics::AdpfEndWorkSegment(bool frame_end)
 		s_adpf_report_warned = true;
 		Console.Warning("ADPF: reportActualWorkDuration returned %d — driver is ignoring the hint.", ret);
 	}
+}
 #endif
+
+u64 PerformanceMetrics::OnFrameWorkSegmentComplete(u64 now_ticks, bool frame_end)
+{
+	// Called at Throttle() entry — the instant this segment of the frame's active CPU work
+	// finished, before the limiter sleep — so (now - work_start) excludes the deliberate limiter
+	// sleep. It is NOT pure CPU compute: the EE can still block behind a full MTGS queue that is
+	// itself stalled on presentation, so some present-wait leaks in. That is exactly why the
+	// cycle-rate sampler times the EE thread's GS and VU1 waits separately and subtracts them.
+	const bool segment_open = (s_frame_work_start != 0);
+	const u64 segment_ticks = (segment_open && now_ticks > s_frame_work_start) ? (now_ticks - s_frame_work_start) : 0;
+
+#if defined(__ANDROID__)
+	AdpfEndWorkSegment(segment_open, segment_ticks, frame_end);
+#else
+	(void)frame_end;
+#endif
+
+	return segment_ticks;
 }
 
-void PerformanceMetrics::AdpfBeginFrameWork()
+void PerformanceMetrics::OnFrameWorkBegin()
 {
-#if defined(__ANDROID__)
 	// Opens a work period at the post-sleep instant (Throttle exit), so the deliberate limiter
-	// sleep is excluded from the next reported duration.
-	const Common::Timer::Value now = Common::Timer::GetCurrentValue();
-	std::lock_guard<std::mutex> lock(s_adpf_mutex);
-	s_adpf_work_start = now;
-#endif
+	// sleep is excluded from the next measured duration.
+	s_frame_work_start = GetCPUTicks();
 }
 
-void PerformanceMetrics::AdpfPauseFrameWork()
+void PerformanceMetrics::OnFrameWorkPaused()
 {
-#if defined(__ANDROID__)
 	// Not frame-limiting (unlimited / host-vsync / interrupted) — invalidate the period so no
-	// wall-time-with-wait duration is reported, and edge-log so a tester never sees "ACTIVE" while
-	// nothing is actually being submitted.
+	// wall-time-with-wait duration is measured.
+	s_frame_work_start = 0;
+
+#if defined(__ANDROID__)
+	// Edge-log, so a tester never sees "ACTIVE" while nothing is actually being submitted.
 	std::lock_guard<std::mutex> lock(s_adpf_mutex);
 	if (s_adpf_session && !s_adpf_paused)
 	{
 		Console.WriteLn("ADPF: reporting paused (unlimited / host-vsync / interrupted) — no durations submitted.");
 		s_adpf_paused = true;
 	}
-	s_adpf_work_start = 0;
 	s_adpf_work_accum_ns = 0;
 #endif
+}
+
+u64 PerformanceMetrics::GetCPUThreadCPUTime()
+{
+	return s_cpu_thread_handle.GetCPUTime();
 }
 
 void PerformanceMetrics::SetGSSWThreadCount(u32 count)
@@ -596,6 +728,20 @@ void PerformanceMetrics::AccumulateGSAcquireWait(u64 ns)
 
 void PerformanceMetrics::AccumulateGSGpuWait(u64 ns)
 {
+}
+
+void PerformanceMetrics::SetIOPThread(Threading::ThreadHandle thread)
+{
+	std::unique_lock lock(s_iop_thread_mutex);
+	// Rebase off the incoming handle, so the first window after a start measures this thread's time
+	// and not its difference against the retired thread's total.
+	s_last_iop_time = thread ? thread.GetCPUTime() : 0;
+	s_iop_thread_handle = std::move(thread);
+	if (!s_iop_thread_handle)
+	{
+		s_iop_thread_usage = 0.0f;
+		s_iop_thread_time = 0.0f;
+	}
 }
 
 u64 PerformanceMetrics::GetFrameNumber()
@@ -692,6 +838,22 @@ float PerformanceMetrics::GetVUThreadUsage()
 float PerformanceMetrics::GetVUThreadAverageTime()
 {
 	return s_vu_thread_time;
+}
+
+bool PerformanceMetrics::HasIOPThread()
+{
+	std::unique_lock lock(s_iop_thread_mutex);
+	return static_cast<bool>(s_iop_thread_handle);
+}
+
+float PerformanceMetrics::GetIOPThreadUsage()
+{
+	return s_iop_thread_usage;
+}
+
+float PerformanceMetrics::GetIOPThreadAverageTime()
+{
+	return s_iop_thread_time;
 }
 
 u32 PerformanceMetrics::GetGSSWThreadCount()

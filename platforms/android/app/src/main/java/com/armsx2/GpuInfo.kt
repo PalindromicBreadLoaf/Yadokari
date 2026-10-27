@@ -80,15 +80,13 @@ object GpuInfo {
      * built-in system driver). [sourceLabel] matches friendlyDriverSource().
      */
     fun recommendation(renderer: String?): Recommendation? {
-        val r = renderer ?: return null
+        val r = CustomDriver.withAdrenoModelNumber(renderer) ?: return null
         if (!r.contains("Adreno", ignoreCase = true)) return null
         val model = Regex("""(\d{3,4})""").find(r.substringAfter("Adreno", ""))?.value?.toIntOrNull()
         return when {
             model != null && model >= 800 -> Recommendation("GameHub 8Elite", "Turnip tuned for Snapdragon 8 Elite / Adreno 8xx")
-            model != null && model >= 700 -> Recommendation("Mr Purple", "purple-turnip builds for Adreno 7xx")
-            // The in-pass read fix is trusted on the 650 and up only; below that the pack buys nothing.
-            model != null && model in 650..699 -> Recommendation("ARMSX2 Turnip", "ARMSX2's Turnip with the in-pass read fix for Adreno 650 and up")
-            model != null && model in 600..649 -> Recommendation("KIMCHI", "AdrenoTools Turnip for Adreno 6xx")
+            // Our own Turnip for all of 6xx and 7xx: the same range the first-run setup offers it on, so the two agree.
+            CustomDriver.isAdreno6xxOr7xx(r) -> Recommendation("ARMSX2 Turnip", "ARMSX2's own Turnip for Adreno 6xx and 7xx")
             else -> Recommendation("KIMCHI", "AdrenoTools Turnip (Adreno)")
         }
     }

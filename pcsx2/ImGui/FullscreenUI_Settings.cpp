@@ -6,12 +6,14 @@
 #include "GS/GS.h"
 #include "GS/GSUtil.h"
 #include "Achievements.h"
+#include "AutoTune/AutoTuneApplier.h"
 #include "GameList.h"
 #include "Host.h"
 #include "Host/AudioStream.h"
 #include "INISettingsInterface.h"
 #include "ImGui/FullscreenUI_Internal.h"
 #include "ImGui/ImGuiFullscreen.h"
+#include "ImGui/ImGuiFullscreen_Keyboard.h"
 #include "ImGui/ImGuiManager.h"
 #include "Input/InputManager.h"
 #include "MTGS.h"
@@ -215,6 +217,14 @@ void FullscreenUI::SetSettingsChanged(SettingsInterface* bsi)
 		s_game_settings_changed.store(true, std::memory_order_release);
 	else
 		s_settings_changed.store(true, std::memory_order_release);
+}
+
+void FullscreenUI::SetSettingsChanged(SettingsInterface* bsi, const char* section, const char* key)
+{
+	// Read from the base layer directly: callers hold the settings lock, which is not recursive.
+	if (IsEditingGameSettings(bsi))
+		AutoTune::DisableForManualChange(*bsi, section, key, Host::Internal::GetBaseSettingsLayer()->GetBoolValue("EmuCore", "AutoTune", false));
+	SetSettingsChanged(bsi);
 }
 
 bool FullscreenUI::GetEffectiveBoolSetting(SettingsInterface* bsi, const char* section, const char* key, bool default_value)
@@ -511,7 +521,7 @@ bool FullscreenUI::DrawToggleSetting(SettingsInterface* bsi, const char* title, 
 			bsi->DeleteValue(section, key);
 	}
 
-	SetSettingsChanged(bsi);
+	SetSettingsChanged(bsi, section, key);
 	return true;
 }
 
@@ -564,7 +574,7 @@ void FullscreenUI::DrawIntListSetting(SettingsInterface* bsi, const char* title,
 						bsi->SetIntValue(section, key, index + option_offset);
 					}
 
-					SetSettingsChanged(bsi);
+					SetSettingsChanged(bsi, section, key);
 				}
 
 				CloseChoiceDialog();
@@ -621,7 +631,7 @@ void FullscreenUI::DrawIntRangeSetting(SettingsInterface* bsi, const char* title
 			else
 				bsi->SetIntValue(section, key, dlg_value);
 
-			SetSettingsChanged(bsi);
+			SetSettingsChanged(bsi, section, key);
 		}
 
 		ImGui::PopStyleColor(7);
@@ -756,7 +766,7 @@ void FullscreenUI::DrawIntSpinBoxSetting(SettingsInterface* bsi, const char* tit
 			else
 				bsi->SetIntValue(section, key, dlg_value);
 
-			SetSettingsChanged(bsi);
+			SetSettingsChanged(bsi, section, key);
 		}
 
 		if (MenuButtonWithoutSummary(FSUI_CSTR("OK"), true, LAYOUT_MENU_BUTTON_HEIGHT_NO_SUMMARY, g_large_font, ImVec2(0.5f, 0.0f)))
@@ -824,7 +834,7 @@ void FullscreenUI::DrawFloatRangeSetting(SettingsInterface* bsi, const char* tit
 			else
 				bsi->SetFloatValue(section, key, dlg_value);
 
-			SetSettingsChanged(bsi);
+			SetSettingsChanged(bsi, section, key);
 		}
 
 		ImGui::PopStyleColor(7);
@@ -964,7 +974,7 @@ void FullscreenUI::DrawFloatSpinBoxSetting(SettingsInterface* bsi, const char* t
 			else
 				bsi->SetFloatValue(section, key, dlg_value);
 
-			SetSettingsChanged(bsi);
+			SetSettingsChanged(bsi, section, key);
 		}
 
 		if (MenuButtonWithoutSummary(FSUI_CSTR("OK"), true, LAYOUT_MENU_BUTTON_HEIGHT_NO_SUMMARY, g_large_font, ImVec2(0.5f, 0.0f)))
@@ -1228,7 +1238,7 @@ void FullscreenUI::DrawStringListSetting(SettingsInterface* bsi, const char* tit
 						bsi->SetStringValue(section, key, option_values_copy[index].c_str());
 					}
 
-					SetSettingsChanged(bsi);
+					SetSettingsChanged(bsi, section, key);
 				}
 
 				CloseChoiceDialog();
@@ -1272,7 +1282,7 @@ void FullscreenUI::DrawStringListSetting(SettingsInterface* bsi, const char* tit
 						bsi->SetStringValue(section, key, raw_options[index].first.c_str());
 					}
 
-					SetSettingsChanged(bsi);
+					SetSettingsChanged(bsi, section, key);
 				}
 
 				CloseChoiceDialog();
@@ -1342,7 +1352,7 @@ void FullscreenUI::DrawFloatListSetting(SettingsInterface* bsi, const char* titl
 						bsi->SetFloatValue(section, key, option_values[index]);
 					}
 
-					SetSettingsChanged(bsi);
+					SetSettingsChanged(bsi, section, key);
 				}
 
 				CloseChoiceDialog();
@@ -1393,7 +1403,7 @@ void FullscreenUI::DrawEnumSetting(SettingsInterface* bsi, const char* title, co
 						bsi->SetStringValue(section, key, to_string_function(static_cast<DataType>(index)));
 					}
 
-					SetSettingsChanged(bsi);
+					SetSettingsChanged(bsi, section, key);
 				}
 
 				CloseChoiceDialog();
@@ -1651,6 +1661,8 @@ void FullscreenUI::SwitchToSettings()
 	s_game_settings_entry.reset();
 	s_game_settings_interface.reset();
 	s_game_settings_serial.clear();
+	s_game_settings_crc = 0;
+	s_game_autotune_lines.clear();
 	s_game_patch_list = {};
 	s_enabled_game_patch_cache = {};
 	s_game_cheats_list = {};
@@ -1665,8 +1677,10 @@ void FullscreenUI::SwitchToGameSettings(const std::string_view serial, u32 crc)
 {
 	s_game_settings_entry.reset();
 	s_game_settings_serial = serial;
+	s_game_settings_crc = crc;
 	s_game_settings_interface = std::make_unique<INISettingsInterface>(VMManager::GetGameSettingsPath(serial, crc));
 	s_game_settings_interface->Load();
+	RefreshGameAutoTuneLines();
 	PopulatePatchesAndCheatsList(serial, crc);
 	s_current_main_window = MainWindowType::Settings;
 	s_settings_page = SettingsPage::Summary;
@@ -1675,7 +1689,7 @@ void FullscreenUI::SwitchToGameSettings(const std::string_view serial, u32 crc)
 
 void FullscreenUI::SwitchToGameSettings()
 {
-	if (s_current_disc_serial.empty() || s_current_disc_crc == 0)
+	if (s_current_disc_serial.empty() || (s_current_disc_crc == 0 && !IsArcadeSessionActive()))
 		return;
 
 	auto lock = GameList::GetLock();
@@ -1755,11 +1769,52 @@ void FullscreenUI::DoClearGameSettings()
 		return;
 
 	Pcsx2Config::ClearConfiguration(s_game_settings_interface.get());
+	// The record of what auto-tune changed goes with the settings it describes.
+	s_game_settings_interface->RemoveSection(AutoTune::kStoreSection);
+	s_game_autotune_lines.clear();
 
 	SetSettingsChanged(s_game_settings_interface.get());
 
 	ShowToast(ICON_FA_TRASH,
 		fmt::format(FSUI_FSTR("Game settings have been cleared for '{}'."), Path::GetFileTitle(s_game_settings_interface->GetFileName())));
+}
+
+void FullscreenUI::RefreshGameAutoTuneLines()
+{
+	s_game_autotune_lines = AutoTune::DescribeForGame(s_game_settings_serial, s_game_settings_crc);
+}
+
+void FullscreenUI::DoResetGameAutoTune()
+{
+	if (!s_game_settings_interface)
+		return;
+
+	// ResetForGame edits the game's file (and applies the change on the CPU thread when this game is running). This
+	// page holds its own copy of that file and would write the old values back on its next change, so read it again.
+	const AutoTune::ResetResult result = AutoTune::ResetForGame(s_game_settings_serial, s_game_settings_crc);
+	{
+		auto lock = Host::GetSettingsLock();
+		s_game_settings_interface->Clear();
+		s_game_settings_interface->Load();
+	}
+	RefreshGameAutoTuneLines();
+
+	if (!result.had_record)
+	{
+		ShowToast(ICON_FA_WAND_MAGIC, FSUI_STR("Auto-tune had not changed anything for this game."));
+		return;
+	}
+
+	if (result.left_alone.empty())
+	{
+		ShowToast(ICON_FA_ROTATE_LEFT, fmt::format(FSUI_FSTR("Auto-tune reset: {} setting(s) put back."), result.restored.size()));
+	}
+	else
+	{
+		ShowToast(ICON_FA_ROTATE_LEFT,
+			fmt::format(FSUI_FSTR("Auto-tune reset: {} setting(s) put back, {} you changed yourself left as they are."),
+				result.restored.size(), result.left_alone.size()));
+	}
 }
 
 void FullscreenUI::DrawSettingsWindow()
@@ -1786,6 +1841,7 @@ void FullscreenUI::DrawSettingsWindow()
 			ICON_PF_MICROCHIP,
 			ICON_PF_GEARS_OPTIONS_SETTINGS,
 			ICON_PF_PICTURE,
+			ICON_FA_IMAGES,
 			ICON_FA_GAUGE,
 			ICON_PF_SOUND,
 			ICON_PF_MEMORY_CARD,
@@ -1794,7 +1850,9 @@ void FullscreenUI::DrawSettingsWindow()
 			ICON_FA_TROPHY,
 			ICON_PF_GAMEPAD_ALT,
 			ICON_PF_KEYBOARD_ALT,
+			ICON_FA_COINS,
 			ICON_FA_TRIANGLE_EXCLAMATION,
+			ICON_FA_MEMORY, // Drivers: last, because it is left out of the list where packs do not exist
 		};
 		static constexpr const char* per_game_icons[] = {
 			ICON_FA_INFO,
@@ -1812,6 +1870,7 @@ void FullscreenUI::DrawSettingsWindow()
 			SettingsPage::BIOS,
 			SettingsPage::Emulation,
 			SettingsPage::Graphics,
+			SettingsPage::TexturePacks,
 			SettingsPage::OSD,
 			SettingsPage::Audio,
 			SettingsPage::MemoryCard,
@@ -1820,7 +1879,9 @@ void FullscreenUI::DrawSettingsWindow()
 			SettingsPage::Achievements,
 			SettingsPage::Controller,
 			SettingsPage::Hotkey,
+			SettingsPage::Arcade,
 			SettingsPage::Advanced,
+			SettingsPage::Drivers, // must stay last, see count below
 		};
 		static constexpr SettingsPage per_game_pages[] = {
 			SettingsPage::Summary,
@@ -1851,9 +1912,12 @@ void FullscreenUI::DrawSettingsWindow()
 			FSUI_NSTR("Patches"),
 			FSUI_NSTR("Cheats"),
 			FSUI_NSTR("Game Fixes"),
+			FSUI_NSTR("GPU Drivers"),
+			FSUI_NSTR("Arcade Setup"),
+			FSUI_NSTR("Texture Packs"),
 		};
 
-		const u32 count = game_settings ? (show_advanced_settings ? std::size(per_game_pages) : (std::size(per_game_pages) - 1)) : std::size(global_pages);
+		const u32 count = game_settings ? (show_advanced_settings ? std::size(per_game_pages) : (std::size(per_game_pages) - 1)) : (std::size(global_pages) - (ShowDriversSettingsPage() ? 0 : 1));
 		const char* const* icons = game_settings ? per_game_icons : global_icons;
 		const SettingsPage* pages = game_settings ? per_game_pages : global_pages;
 		u32 index = 0;
@@ -2014,6 +2078,18 @@ void FullscreenUI::DrawSettingsWindow()
 				DrawGameFixesSettingsPage();
 				break;
 
+			case SettingsPage::Drivers:
+				DrawDriversSettingsPage(bsi);
+				break;
+
+			case SettingsPage::Arcade:
+				DrawArcadeSettingsPage();
+				break;
+
+			case SettingsPage::TexturePacks:
+				DrawTexturePacksSettingsPage();
+				break;
+
 			default:
 				break;
 		}
@@ -2140,10 +2216,39 @@ void FullscreenUI::DrawSummarySettingsPage()
 					CloseChoiceDialog();
 				});
 		}
+
+		DrawCoverRegionPinSetting(*s_game_settings_entry);
+		DrawArcadeGameSettings(*s_game_settings_entry);
 	}
 	else
 	{
 		MenuButton(FSUI_ICONSTR(ICON_FA_BAN, "Cannot show details for games which were not scanned in the game list."), "");
+	}
+
+	MenuHeading(FSUI_CSTR("Automatic Performance Tuning"));
+
+	if (s_game_autotune_lines.empty())
+	{
+		ActiveButton(FSUI_CSTR("Automatic performance tuning has not changed any settings for this game."), false, false,
+			LAYOUT_MENU_BUTTON_HEIGHT_NO_SUMMARY);
+	}
+	else
+	{
+		for (const std::string& line : s_game_autotune_lines)
+			ActiveButton(line.c_str(), false, false, LAYOUT_MENU_BUTTON_HEIGHT_NO_SUMMARY);
+
+		if (MenuButton(FSUI_ICONSTR(ICON_FA_ROTATE_LEFT, "Reset Auto-Tune"),
+				FSUI_CSTR("Puts back the settings auto-tune changed for this game, and forgets what it learned about it.")))
+		{
+			OpenConfirmMessageDialog(FSUI_ICONSTR(ICON_FA_ROTATE_LEFT, "Reset Auto-Tune"),
+				FSUI_STR("Put back the settings that automatic performance tuning changed for this game? Settings you changed yourself "
+						 "since are left as they are, and auto-tune may try the same settings again."),
+				[](bool yes) {
+					if (yes)
+						DoResetGameAutoTune();
+				},
+				false);
+		}
 	}
 
 	MenuHeading(FSUI_CSTR("Options"));
@@ -2293,6 +2398,7 @@ void FullscreenUI::DrawInterfaceSettingsPage()
 	DrawToggleSetting(bsi, FSUI_ICONSTR(ICON_FA_BOX_ARCHIVE, "Create Save State Backups"),
 		FSUI_CSTR("Creates a backup copy of a save state if it already exists when the save is created. The backup copy has a .backup suffix"),
 		"EmuCore", "BackupSavestate", true);
+	DrawAutosaveSettings(bsi);
 	const SmallString glyph_mode = bsi->GetSmallStringValue("UI", "FullscreenUIGlyphStyle", "auto");
 	static constexpr const char* glyph_names[] = {
 		FSUI_NSTR("Automatic"),
@@ -2474,7 +2580,7 @@ void FullscreenUI::DrawBIOSSettingsPage()
 		{
 			u32 version, region;
 			std::string description, zone;
-			if (!IsBIOS(fd.FileName.c_str(), version, description, region, zone))
+			if (!IsConsoleBIOS(fd.FileName.c_str(), version, description, region, zone))
 				continue;
 
 			const std::string_view filename(Path::GetFileName(fd.FileName));
@@ -2604,6 +2710,17 @@ void FullscreenUI::DrawEmulationSettingsPage()
 		ee_cycle_skip_settings, std::size(ee_cycle_skip_settings), true);
 	DrawToggleSetting(bsi, FSUI_ICONSTR(ICON_FA_USERS, "Enable Multithreaded VU1 (MTVU)"),
 		FSUI_CSTR("Generally a speedup on CPUs with 4 or more cores. Safe for most games, but a few are incompatible and may hang."), "EmuCore/Speedhacks", "vuThread", false);
+	DrawToggleSetting(bsi, FSUI_ICONSTR(ICON_FA_USERS, "Enable IOP Thread"),
+		FSUI_CSTR("Runs the PS2's I/O processor (sound, disc, controllers and memory cards) on its own thread. A speedup on CPUs with at least four fast cores. It turns itself off on CPUs without spare cores."),
+		"EmuCore/Speedhacks", "iopThread", false);
+	DrawToggleSetting(bsi, FSUI_ICONSTR(ICON_FA_WAND_MAGIC, "Automatic Performance Tuning"),
+		FSUI_CSTR("When a game keeps missing frames, tries performance settings one at a time and keeps the ones that help, saved per game."),
+		"EmuCore", "AutoTune", false);
+#ifdef ARCH_ARM64 // vu-aot is part of the ARM64 recompilers only
+	DrawToggleSetting(bsi, FSUI_ICONSTR(ICON_FA_MICROCHIP, "Enable VU1 Ahead-of-Time Compiler"),
+		FSUI_CSTR("Optimises VU1 programs in the background and keeps the compiled VU code on disk, so later launches start with it. Faster in games that spend much of their time in VU1. Turning it off clears the compiled cache."),
+		"EmuCore/CPU/Recompiler", "EnableVUAot", true);
+#endif
 	DrawToggleSetting(bsi, FSUI_ICONSTR(ICON_FA_LOCATION_PIN_LOCK, "Enable Thread Pinning"),
 		FSUI_CSTR("Pins emulation threads to CPU cores to potentially improve performance/frame time variance."),
 		"EmuCore",
@@ -3101,6 +3218,9 @@ void FullscreenUI::DrawGraphicsSettingsPage(SettingsInterface* bsi, bool show_ad
 	DrawToggleSetting(bsi, FSUI_ICONSTR(ICON_FA_MAXIMIZE, "Show Overscan"),
 		FSUI_CSTR("Enables the option to show the overscan area on games which draw more than the safe area of the screen."), "EmuCore/GS",
 		"pcrtc_overscan", false);
+	DrawToggleSetting(bsi, FSUI_ICONSTR(ICON_FA_CROP, "Trim Upscaled Edges"),
+		FSUI_CSTR("Crops one PS2 pixel from each edge of the picture when upscaling 2x or higher, hiding the garbage that often appears there."),
+		"EmuCore/GS", "TrimUpscaledEdges", true);
 	DrawToggleSetting(bsi, FSUI_ICONSTR(ICON_FA_GLASSES, "Anti-Blur"),
 		FSUI_CSTR("Enables internal Anti-Blur hacks. Less accurate than PS2 rendering but will make a lot of games look less blurry."),
 		"EmuCore/GS", "pcrtc_antiblur", true);
@@ -3334,6 +3454,8 @@ void FullscreenUI::DrawGraphicsSettingsPage(SettingsInterface* bsi, bool show_ad
 		DrawToggleSetting(bsi, FSUI_ICONSTR(ICON_FA_DATABASE, "Precache Textures"),
 			FSUI_CSTR("Preloads all replacement textures to memory. Not necessary with asynchronous loading."), "EmuCore/GS",
 			"PrecacheTextureReplacements", false, replacement_active);
+		DrawTextureUpscaleSetting(bsi);
+		DrawTexturePacksBrowseSetting(bsi);
 
 		if (!IsEditingGameSettings(bsi))
 		{
@@ -3675,6 +3797,9 @@ void FullscreenUI::DrawAudioSettingsPage()
 		"SPU2/Output", "SyncMode", Pcsx2Config::SPU2Options::DEFAULT_SYNC_MODE,
 		&Pcsx2Config::SPU2Options::ParseSyncMode, &Pcsx2Config::SPU2Options::GetSyncModeName,
 		&Pcsx2Config::SPU2Options::GetSyncModeDisplayName, Pcsx2Config::SPU2Options::SPU2SyncMode::Count);
+	DrawToggleSetting(bsi, FSUI_ICONSTR(ICON_FA_GAUGE_HIGH, "Quick Seek"),
+		FSUI_CSTR("Uses a faster, less precise search when time stretching audio. Lowers the CPU cost of the\nTime Stretch synchronization mode at a small cost in audio quality."),
+		"SPU2/Output", "StretchUseQuickSeek", AudioStreamParameters::DEFAULT_STRETCH_USE_QUICKSEEK);
 	DrawIntRangeSetting(bsi, FSUI_ICONSTR(ICON_FA_BUCKET, "Buffer Size"),
 		FSUI_CSTR("Determines the amount of audio buffered before being pulled by the host API."),
 		"SPU2/Output", "BufferMS", AudioStreamParameters::DEFAULT_BUFFER_MS, 10, 500, FSUI_CSTR("%d ms"));
@@ -3731,6 +3856,8 @@ void FullscreenUI::DrawMemoryCardSettingsPage()
 			ShowToast(ICON_FA_ARROWS_ROTATE, FSUI_STR("Swapped Slot 1 and Slot 2 memory cards."));
 		}
 	}
+
+	DrawMemcardBackupSettings(bsi);
 
 	for (u32 port = 0; port < NUM_MEMORY_CARD_PORTS; port++)
 	{
@@ -3937,6 +4064,10 @@ void FullscreenUI::DrawNetworkHDDSettingsPage()
 			api_display_names.emplace_back("Sockets");
 		}
 
+		adapter_lists.emplace_back();
+		api_types.emplace_back(Pcsx2Config::DEV9Options::NetApi::LocalLink);
+		api_display_names.emplace_back("Local Link");
+
 		adapters_loaded = true;
 	}
 
@@ -4003,6 +4134,7 @@ void FullscreenUI::DrawNetworkHDDSettingsPage()
 				}
 
 				bsi->SetStringValue("DEV9/Eth", "EthDevice", new_device.c_str());
+				LocalLinkApiSelected(bsi, selected_api);
 				SetSettingsChanged(bsi);
 
 				CloseChoiceDialog();
@@ -4036,7 +4168,9 @@ void FullscreenUI::DrawNetworkHDDSettingsPage()
 		device_display = "Not Selected";
 	}
 
-	if (MenuButtonWithValue(FSUI_ICONSTR(ICON_FA_ETHERNET, "Ethernet Device"),
+	const bool local_link = DrawLocalLinkSettings(bsi, current_api, network_enabled);
+
+	if (!local_link && MenuButtonWithValue(FSUI_ICONSTR(ICON_FA_ETHERNET, "Ethernet Device"),
 			FSUI_CSTR("Network adapter to use for PS2 network emulation."),
 			device_display.c_str(),
 			network_enabled && show_device_setting))
@@ -4085,6 +4219,10 @@ void FullscreenUI::DrawNetworkHDDSettingsPage()
 			});
 	}
 
+	// Local Link assigns the console's address itself, so the DHCP, IP and DNS rows below do not apply.
+	// The block is left at its old indentation on purpose, so this stays a three-line change.
+	if (!local_link)
+	{
 	AdapterOptions adapter_options = AdapterOptions::None;
 	const std::string final_api = bsi->GetStringValue("DEV9/Eth", "EthApi", "Unset");
 	if (final_api == "PCAP Bridged" || final_api == "PCAP Switched")
@@ -4152,6 +4290,7 @@ void FullscreenUI::DrawNetworkHDDSettingsPage()
 	DrawIPAddressSetting(bsi, FSUI_ICONSTR(ICON_FA_SERVER, "DNS2 Address"),
 		FSUI_CSTR("Secondary DNS server address for the PS2 virtual network adapter."), "DEV9/Eth", "DNS2", "0.0.0.0",
 		dns2_editable, LAYOUT_MENU_BUTTON_HEIGHT, g_large_font, g_medium_font, IPAddressType::DNS2);
+	}
 
 	MenuHeading(FSUI_CSTR("Internal HDD"));
 
@@ -4353,8 +4492,8 @@ void FullscreenUI::DrawNetworkHDDSettingsPage()
 
 void FullscreenUI::OpenMemoryCardCreateDialog()
 {
-	// Pre-fill the first unused "Mcd00N" so a card can be created with a controller alone:
-	// Big Picture's input popup has no on-screen keyboard, so a blank field is a dead end.
+	// Pre-fill the first unused "Mcd00N" so a card can be created with a single press of OK;
+	// the on-screen keyboard in the popup is there to give it another name.
 	std::string default_name;
 	for (int i = 1; i <= 999; i++)
 	{
@@ -4496,6 +4635,11 @@ void FullscreenUI::DoCreateMemoryCard(std::string name, MemoryCardType type, Mem
 
 void FullscreenUI::DrawAchievementsLoginWindow()
 {
+	// The keyboard dialog for a field takes this popup's place until it closes. Beginning the popup in the
+	// meantime would clear s_achievements_login_open, since ImGui reads a popup that is not open as closed.
+	if (ImGuiFullscreen::IsInputDialogOpen())
+		return;
+
 	if (s_achievements_login_open && !ImGui::IsPopupOpen("RetroAchievements"))
 		ImGui::OpenPopup("RetroAchievements");
 
@@ -4560,12 +4704,14 @@ void FullscreenUI::DrawAchievementsLoginWindow()
 			ImGui::BeginDisabled();
 
 		ImGui::SetNextItemWidth(content_width);
-		ImGui::InputTextWithHint("##username", FSUI_CSTR("Username"), s_achievements_login_username, sizeof(s_achievements_login_username));
+		ImGuiFullscreen::InputTextWithKeyboard("##username", FSUI_CSTR("Username"), s_achievements_login_username, sizeof(s_achievements_login_username), false,
+			FSUI_CSTR("Enter your RetroAchievements user name."));
 
 		ImGui::Spacing();
 
 		ImGui::SetNextItemWidth(content_width);
-		ImGui::InputTextWithHint("##password", FSUI_CSTR("Password"), s_achievements_login_password, sizeof(s_achievements_login_password), ImGuiInputTextFlags_Password);
+		ImGuiFullscreen::InputTextWithKeyboard("##password", FSUI_CSTR("Password"), s_achievements_login_password, sizeof(s_achievements_login_password), true,
+			FSUI_CSTR("Enter your RetroAchievements password."));
 
 		ImGui::PopStyleColor(5);
 		ImGui::PopStyleVar(3);
@@ -5848,6 +5994,8 @@ void FullscreenUI::DrawPatchesOrCheatsSettingsPage(bool cheats)
 			s_game_settings_entry->crc);
 	}
 
+	DrawOnlinePatchesRow(cheats);
+
 	if (cheats)
 	{
 		if (patch_list.empty())
@@ -6090,6 +6238,8 @@ TRANSLATE_NOOP("FullscreenUI", "System Settings");
 TRANSLATE_NOOP("FullscreenUI", "Underclocks or overclocks the emulated Emotion Engine CPU.");
 TRANSLATE_NOOP("FullscreenUI", "Makes the emulated Emotion Engine skip cycles. Helps a small subset of games like SOTC. Most of the time it's harmful to performance.");
 TRANSLATE_NOOP("FullscreenUI", "Generally a speedup on CPUs with 4 or more cores. Safe for most games, but a few are incompatible and may hang.");
+TRANSLATE_NOOP("FullscreenUI", "Runs the PS2's I/O processor (sound, disc, controllers and memory cards) on its own thread. A speedup on CPUs with at least four fast cores. It turns itself off on CPUs without spare cores.");
+TRANSLATE_NOOP("FullscreenUI", "Optimises VU1 programs in the background and keeps the compiled VU code on disk, so later launches start with it. Faster in games that spend much of their time in VU1. Turning it off clears the compiled cache.");
 TRANSLATE_NOOP("FullscreenUI", "Pins emulation threads to CPU cores to potentially improve performance/frame time variance.");
 TRANSLATE_NOOP("FullscreenUI", "Enables loading cheats from pnach files.");
 TRANSLATE_NOOP("FullscreenUI", "Allows games and homebrew to access files / folders directly on the host computer.");
@@ -6297,7 +6447,9 @@ TRANSLATE_NOOP("FullscreenUI", "HDD Image Selection");
 TRANSLATE_NOOP("FullscreenUI", "RetroAchievements");
 TRANSLATE_NOOP("FullscreenUI", "Please enter your user name and password for retroachievements.org below.\n\nYour password will not be saved in ARMSX2, an access token will be generated and used instead.");
 TRANSLATE_NOOP("FullscreenUI", "Username");
+TRANSLATE_NOOP("FullscreenUI", "Enter your RetroAchievements user name.");
 TRANSLATE_NOOP("FullscreenUI", "Password");
+TRANSLATE_NOOP("FullscreenUI", "Enter your RetroAchievements password.");
 TRANSLATE_NOOP("FullscreenUI", "Logging in...");
 TRANSLATE_NOOP("FullscreenUI", "Dismiss");
 TRANSLATE_NOOP("FullscreenUI", "Login");
@@ -6398,6 +6550,9 @@ TRANSLATE_NOOP("FullscreenUI", "Activating cheats can cause unpredictable behavi
 TRANSLATE_NOOP("FullscreenUI", "Activating game patches can cause unpredictable behavior, crashing, soft-locks, or broken saved games.");
 TRANSLATE_NOOP("FullscreenUI", "Use patches at your own risk, the ARMSX2 team will provide no support for users who have enabled game patches.");
 TRANSLATE_NOOP("FullscreenUI", "Game Fixes");
+TRANSLATE_NOOP("FullscreenUI", "GPU Drivers");
+TRANSLATE_NOOP("FullscreenUI", "Arcade Setup");
+TRANSLATE_NOOP("FullscreenUI", "Texture Packs");
 TRANSLATE_NOOP("FullscreenUI", "Game fixes should not be modified unless you are aware of what each option does and the implications of doing so.");
 TRANSLATE_NOOP("FullscreenUI", "Needed for some games with complex FMV rendering.");
 TRANSLATE_NOOP("FullscreenUI", "Skips videos/FMVs in games to avoid game hanging/freezes.");
@@ -6745,6 +6900,16 @@ TRANSLATE_NOOP("FullscreenUI", "Slow-Motion Speed");
 TRANSLATE_NOOP("FullscreenUI", "EE Cycle Rate");
 TRANSLATE_NOOP("FullscreenUI", "EE Cycle Skipping");
 TRANSLATE_NOOP("FullscreenUI", "Enable Multithreaded VU1 (MTVU)");
+TRANSLATE_NOOP("FullscreenUI", "Enable IOP Thread");
+TRANSLATE_NOOP("FullscreenUI", "Automatic Performance Tuning");
+TRANSLATE_NOOP("FullscreenUI", "Automatic performance tuning has not changed any settings for this game.");
+TRANSLATE_NOOP("FullscreenUI", "Reset Auto-Tune");
+TRANSLATE_NOOP("FullscreenUI", "Puts back the settings auto-tune changed for this game, and forgets what it learned about it.");
+TRANSLATE_NOOP("FullscreenUI", "Put back the settings that automatic performance tuning changed for this game? Settings you changed yourself since are left as they are, and auto-tune may try the same settings again.");
+TRANSLATE_NOOP("FullscreenUI", "Auto-tune had not changed anything for this game.");
+TRANSLATE_NOOP("FullscreenUI", "Auto-tune reset: {} setting(s) put back.");
+TRANSLATE_NOOP("FullscreenUI", "Auto-tune reset: {} setting(s) put back, {} you changed yourself left as they are.");
+TRANSLATE_NOOP("FullscreenUI", "Enable VU1 Ahead-of-Time Compiler");
 TRANSLATE_NOOP("FullscreenUI", "Enable Thread Pinning");
 TRANSLATE_NOOP("FullscreenUI", "Enable Cheats");
 TRANSLATE_NOOP("FullscreenUI", "Enable Host Filesystem");
@@ -6776,6 +6941,8 @@ TRANSLATE_NOOP("FullscreenUI", "Integer Scaling");
 TRANSLATE_NOOP("FullscreenUI", "Screen Offsets");
 TRANSLATE_NOOP("FullscreenUI", "Show Overscan");
 TRANSLATE_NOOP("FullscreenUI", "Anti-Blur");
+TRANSLATE_NOOP("FullscreenUI", "Trim Upscaled Edges");
+TRANSLATE_NOOP("FullscreenUI", "Crops one PS2 pixel from each edge of the picture when upscaling 2x or higher, hiding the garbage that often appears there.");
 TRANSLATE_NOOP("FullscreenUI", "Internal Resolution");
 TRANSLATE_NOOP("FullscreenUI", "Texture Filtering");
 TRANSLATE_NOOP("FullscreenUI", "Trilinear Filtering");
@@ -6896,6 +7063,8 @@ TRANSLATE_NOOP("FullscreenUI", "Fast Forward Volume");
 TRANSLATE_NOOP("FullscreenUI", "Mute All Sound");
 TRANSLATE_NOOP("FullscreenUI", "Backend");
 TRANSLATE_NOOP("FullscreenUI", "Expansion Mode");
+TRANSLATE_NOOP("FullscreenUI", "Quick Seek");
+TRANSLATE_NOOP("FullscreenUI", "Uses a faster, less precise search when time stretching audio. Lowers the CPU cost of the\nTime Stretch synchronization mode at a small cost in audio quality.");
 TRANSLATE_NOOP("FullscreenUI", "Synchronization");
 TRANSLATE_NOOP("FullscreenUI", "Buffer Size");
 TRANSLATE_NOOP("FullscreenUI", "Output Latency");

@@ -10,6 +10,7 @@ add_executable(yadokari
 	HorizonUsbStorage.cpp
 	HorizonException.cpp
 	HorizonExceptionEntry.S
+	HorizonThreadWrap.cpp
 )
 
 set_source_files_properties(HorizonException.cpp HorizonExceptionEntry.S
@@ -42,6 +43,9 @@ target_link_libraries(yadokari PRIVATE
 	usbhsfs
 	deko3d
 )
+
+# Every thread starts clamped off core 3 (HorizonThreadWrap.cpp).
+target_link_options(yadokari PRIVATE -Wl,--wrap=pthread_create)
 
 if(USE_VULKAN OR USE_OPENGL)
 	find_package(PkgConfig REQUIRED)
@@ -171,9 +175,39 @@ set(YADOKARI_RESOURCE_SRC_DIR "${CMAKE_SOURCE_DIR}/bin/resources")
 set(DK3D_ROMFS_RESOURCE_DIR "${DK3D_ROMFS_DIR}/resources")
 set(YADOKARI_RESOURCE_STAMP "${CMAKE_CURRENT_BINARY_DIR}/yadokari_resources.stamp")
 file(GLOB_RECURSE YADOKARI_RESOURCE_FILES CONFIGURE_DEPENDS "${YADOKARI_RESOURCE_SRC_DIR}/*")
+
+set(YADOKARI_PATCHES_ZIP "" CACHE FILEPATH "A patches.zip to pack instead of downloading one")
+set(YADOKARI_PATCHES_ZIP_URL
+	"https://github.com/isztldav/pcsx2_patches/releases/latest/download/patches.zip"
+	CACHE STRING "Where to fetch patches.zip when none is given")
+set(YADOKARI_PATCHES_COPY_COMMAND "")
+if(YADOKARI_PATCHES_ZIP AND EXISTS "${YADOKARI_PATCHES_ZIP}")
+	set(_patches_zip "${YADOKARI_PATCHES_ZIP}")
+else()
+	set(_patches_zip "${CMAKE_CURRENT_BINARY_DIR}/patches.zip")
+	if(NOT EXISTS "${_patches_zip}")
+		message(STATUS "Fetching patches.zip from ${YADOKARI_PATCHES_ZIP_URL}")
+		file(DOWNLOAD "${YADOKARI_PATCHES_ZIP_URL}" "${_patches_zip}" STATUS _patches_status TIMEOUT 120)
+		list(GET _patches_status 0 _patches_result)
+		if(NOT _patches_result EQUAL 0)
+			list(GET _patches_status 1 _patches_error)
+			message(WARNING "patches.zip could not be fetched (${_patches_error}); "
+				"the NRO will have no built-in game patches")
+			file(REMOVE "${_patches_zip}")
+			unset(_patches_zip)
+		endif()
+	endif()
+endif()
+if(DEFINED _patches_zip)
+	list(APPEND YADOKARI_RESOURCE_FILES "${_patches_zip}")
+	set(YADOKARI_PATCHES_COPY_COMMAND
+		COMMAND ${CMAKE_COMMAND} -E copy "${_patches_zip}" "${DK3D_ROMFS_RESOURCE_DIR}/patches.zip")
+endif()
+
 add_custom_command(
 	OUTPUT "${YADOKARI_RESOURCE_STAMP}"
 	COMMAND ${CMAKE_COMMAND} -E copy_directory "${YADOKARI_RESOURCE_SRC_DIR}" "${DK3D_ROMFS_RESOURCE_DIR}"
+	${YADOKARI_PATCHES_COPY_COMMAND}
 	COMMAND ${CMAKE_COMMAND} -E touch "${YADOKARI_RESOURCE_STAMP}"
 	DEPENDS ${YADOKARI_RESOURCE_FILES}
 	COMMENT "Copying resources into ROMFS (romfs:/resources)"
@@ -194,5 +228,6 @@ nx_generate_nacp(OUTPUT yadokari.nacp
 nx_create_nro(yadokari
 	OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/yadokari.nro"
 	NACP "${CMAKE_CURRENT_BINARY_DIR}/yadokari.nacp"
+	ICON "${CMAKE_CURRENT_SOURCE_DIR}/icon.jpg"
 	ROMFS yadokari_romfs
 )

@@ -1,7 +1,7 @@
 #version 460
 
 // Deinterlacing ubershader
-// u_mode matches ShaderInterlace (0 weave, 1 bob, 2 blend, 3 MAD buffer, 4 MAD reconstruct)
+// u_mode matches ShaderInterlace (0 weave, 1 bob, 2 blend, 3 MAD buffer, 4 MAD reconstruct, 5 comb)
 
 layout(location = 0) in vec2 vTexCoord;
 layout(location = 0) out vec4 oColor;
@@ -12,6 +12,7 @@ layout(std140, binding = 0) uniform cb0
 {
 	vec4 ZrH; // x: buffer index, y: 1/vres, z: vres, w: MAD sensitivity
 	// xy: device rows [x, y) of the merge left undrawn for this field, which Merge drew a native line lower
+	// zw (comb only): device rows per native line, device row where native line 0 starts
 	vec4 FieldPad;
 	uint u_mode;
 };
@@ -151,6 +152,33 @@ void mode_mad_reconstruct()
 	}
 }
 
+// Comb-adaptive deinterlace for interlaced video woven into one frame: keeps the field on screen
+// and rebuilds the other field's lines where they comb against both neighbours.
+void mode_comb()
+{
+	const int   field = int(ZrH.x) & 1;
+	const int   native_line = int(floor((gl_FragCoord.y - FieldPad.w) / FieldPad.z));
+	const vec4  c     = textureLod(samp0, vTexCoord, 0.0);
+	if ((native_line & 1) == field)
+	{
+		oColor = c;
+		return;
+	}
+
+	const vec2  vstep = vec2(0.0, FieldPad.z * ZrH.y); // one native line
+	const vec4  a    = textureLod(samp0, vTexCoord - vstep, 0.0);
+	const vec4  b    = textureLod(samp0, vTexCoord + vstep, 0.0);
+	const vec3  luma = vec3(0.299, 0.587, 0.114);
+	const float lc   = dot(c.rgb, luma);
+	const float la   = dot(a.rgb, luma);
+	const float lb   = dot(b.rgb, luma);
+	const float lown = 0.5 * (dot(textureLod(samp0, vTexCoord - 2.0 * vstep, 0.0).rgb, luma) +
+	                          dot(textureLod(samp0, vTexCoord + 2.0 * vstep, 0.0).rgb, luma));
+	const float out_of = ((lc - la) * (lc - lb) > 0.0) ? min(abs(lc - la), abs(lc - lb)) : 0.0;
+	const float comb   = smoothstep(0.02, 0.06, out_of - abs(lc - lown));
+	oColor = mix(c, 0.5 * (a + b), comb);
+}
+
 void main()
 {
 	if (u_mode == 0u)
@@ -161,6 +189,8 @@ void main()
 		mode_blend();
 	else if (u_mode == 3u)
 		mode_mad_buffer();
-	else
+	else if (u_mode == 4u)
 		mode_mad_reconstruct();
+	else
+		mode_comb();
 }

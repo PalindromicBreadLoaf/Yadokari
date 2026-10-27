@@ -20,7 +20,6 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateMapOf
@@ -56,7 +55,7 @@ import kotlinx.coroutines.withContext
 fun DriverManagerSection() {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
-    val installed = remember { mutableStateListOf<CustomDriver.InstalledDriver>() }
+    val installed = remember { mutableStateListOf<CustomDriver.InstalledDriver>().apply { addAll(CustomDriver.listInstalled(context)) } }
     var remote by remember { mutableStateOf<List<CustomDriver.RemoteDriver>?>(null) }
     var loadingRemote by remember { mutableStateOf(false) }
     var showRemote by remember { mutableStateOf(false) }
@@ -76,7 +75,6 @@ fun DriverManagerSection() {
         installed.clear()
         installed.addAll(CustomDriver.listInstalled(context))
     }
-    LaunchedEffect(Unit) { refreshInstalled() }
 
     val importLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         if (uri != null) scope.launch {
@@ -114,11 +112,17 @@ fun DriverManagerSection() {
             }
         }
 
+        // The driver this scope actually runs with. A per-game pick that has since been deleted
+        // follows the global driver at boot (CustomDriver.effectiveId), so show that one.
+        // Re-read whenever the settings change: in global scope a save here changes the global id.
+        val globalDriverId = remember(InGameOverlay.settingsState.value) { com.armsx2.config.ConfigStore.loadGlobal().output.customDriverId }
+        val effectiveId = CustomDriver.effectiveId(
+            InGameOverlay.settingsState.value.output.customDriverId, globalDriverId, installed.map { it.id })
         DriverRow(
             controllerId = "driver.system",
             title = str("backend.driver.systemVulkan"),
             subtitle = str("renderer.orientation.device"),
-            selected = InGameOverlay.settingsState.value.output.customDriverId.isBlank(),
+            selected = effectiveId == null,
             onClick = { selectDriver(null) },
         )
         installed.forEach { driver ->
@@ -127,12 +131,10 @@ fun DriverManagerSection() {
                 title = driver.name,
                 subtitle = listOf(driver.vendor, driver.version).filter(String::isNotBlank).joinToString(" · ")
                     .ifBlank { str("backend.driver.installed") },
-                selected = InGameOverlay.settingsState.value.output.customDriverId == driver.id,
+                selected = effectiveId == driver.id,
                 onClick = { selectDriver(driver.id) },
                 onDelete = {
-                    val wasSelected = InGameOverlay.settingsState.value.output.customDriverId == driver.id
                     CustomDriver.delete(driver)
-                    if (wasSelected) selectDriver(null)
                     refreshInstalled()
                 },
             )

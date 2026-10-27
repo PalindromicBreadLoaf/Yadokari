@@ -103,6 +103,9 @@ bool GSGetPresentCapRenderSkip();
 // a clean re-prime, no catch-up burst — as soon as fast-forward ends.
 void GSSetPresentCapSuspended(bool suspended);
 bool GSGetPresentCapSuspended();
+// The IPU decoded a picture (any thread). The display looks at the count to tell a movie is playing.
+void GSNoteVideoDecode();
+u32 GSGetVideoDecodeCount();
 int GSfreeze(FreezeAction mode, freezeData* data);
 std::string GSGetBaseSnapshotFilename();
 // False if there is no renderer, or a snapshot is already queued and this request was dropped.
@@ -134,6 +137,11 @@ void GSSetVSyncMode(GSVSyncMode mode, bool allow_present_throttle);
 
 GSRendererType GSGetCurrentRenderer();
 bool GSIsHardwareRenderer();
+
+/// The API of the GS device that is open now, None when there is none. Unlike GSGetCurrentRenderer(), which is the
+/// configured renderer and reads Auto after a reopen that was given the unresolved setting, this is what the
+/// device actually is. Safe to read from any thread.
+RenderAPI GSGetCurrentRenderAPI();
 
 /// Whether this renderer's GetOutput() reads the framebuffer at the display's own offset,
 /// block-aligning as it goes, rather than reading the whole buffer and leaving the offset

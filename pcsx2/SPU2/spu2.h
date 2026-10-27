@@ -63,6 +63,14 @@ void SetOutputPaused(bool paused);
 /// OS from reclaiming the low-latency stream during a long park.
 void SetOutputPauseSuppressed(bool suppressed);
 
+/// While the app is in the background, a paused VM pauses its output even when
+/// suppressed. Takes effect at the next UpdateOutputPaused() or pause edge.
+void SetOutputBackgrounded(bool backgrounded);
+
+/// Brings the output stream in line with the VM state and the two flags above.
+/// CPU thread only.
+void UpdateOutputPaused();
+
 /// Clears output buffers in no-sync mode, prevents long delays after fast forwarding.
 void OnTargetSpeedChanged();
 
@@ -82,6 +90,12 @@ u16 SPU2read(u32 mem);
 
 void SPU2async();
 s32 SPU2freeze(FreezeAction mode, freezeData* data);
+
+#ifdef PCSX2_RECOMPILER_TESTS
+// ee_divtrace::FingerprintIop: the block SPU2freeze(Save) writes, with the host
+// pointers in it turned into offsets. Read-only on the SPU2. See the definition.
+void SPU2freezeForFingerprint(std::vector<u8>& out);
+#endif
 
 // Partial restore from a legacy-format (AetherSX2-era) SPU2 block, whose tail
 // cannot be replayed. See the definition for what is and is not kept.

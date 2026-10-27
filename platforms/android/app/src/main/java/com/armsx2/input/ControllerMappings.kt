@@ -114,9 +114,13 @@ object ControllerMappings {
     private fun scopedKey(baseKey: String, serial: String?) =
         if (serial.isNullOrEmpty()) baseKey else gameKey(serial, baseKey)
 
-    /** Serial of the running game whose overrides apply at RUNTIME (input
-     *  dispatch), or null in menus so use falls back to global. */
-    private fun runtimeSerial(): String? = MainActivityRuntime.currentGame.value?.serial?.takeIf { it.isNotEmpty() }
+    /** Key of the running game whose overrides apply at RUNTIME (input
+     *  dispatch), or null in menus so use falls back to global. It is the game's
+     *  settingsKey, the same key the Pad tab writes under and the boot path resolves
+     *  every other per-game setting by: the serial for discs, the filename stem for
+     *  serial-less games. Reading the bare serial here dropped a serial-less game's
+     *  own mapping back to the global one in game. */
+    private fun runtimeSerial(): String? = MainActivityRuntime.currentGame.value?.settingsKey
 
     /** Read an int pref: per-game override (for the active game) first, else global. */
     private fun resolveInt(baseKey: String, default: Int): Int {
@@ -246,6 +250,10 @@ object ControllerMappings {
     fun setDpadAsLeftStick(on: Boolean, serial: String? = null) {
         MainActivityRuntime.prefs.edit { putBoolean(scopedKey(KEY_DPAD_AS_LSTICK, serial), on) }
         invalidateRuntimeCaches()
+    }
+    fun setDpadAsLeftStickForRunningGame(on: Boolean) {
+        val serial = runtimeSerial()?.takeIf { MainActivityRuntime.prefs.contains(gameKey(it, KEY_DPAD_AS_LSTICK)) }
+        setDpadAsLeftStick(on, serial)
     }
 
     // ---- Analog stick response shaping (physical sticks → PS2 analog) ----

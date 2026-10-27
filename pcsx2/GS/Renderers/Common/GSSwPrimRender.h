@@ -27,17 +27,25 @@ struct GSSwPrimRenderState
 	std::unique_ptr<GSTextureCacheSW::Texture> texture[7 + 1];
 	std::unique_ptr<GSVirtualAlignedClass<32>> rasterizer;
 
-	/// One sprite of a palette block copy, validated before any pixel is written.
+	/// One sprite of a palette block copy (or of a 32-bit texel copy), validated before any pixel is written.
 	struct PaletteBlock
 	{
 		GSVector4i rect; ///< pixels written, already scissored
 		s32 u, v; ///< 16.16 texel coordinate at the rect's top-left pixel
 		u32 alpha; ///< the vertex alpha in bits 24-31 when the texture's alpha is not used, else 0
+		int su = 1, sv = 1; ///< texels of the coordinate each pixel steps along each axis; 2 only for a 32-bit texel copy
 	};
 	std::vector<PaletteBlock> palette_blocks;
 
+	/// The palette index of each texel a masked texel copy reads, in the order it writes them.
+	std::vector<u8> texel_scratch;
+
+	/// The 32-bit texels a 32-bit texel copy reads, in the order it writes them.
+	std::vector<u32> texel_words;
+
 	/// When false every draw goes through the rasterizer, including the ones the palette block copy
-	/// would take. The copy is exact, so this changes no output; tests use it to run the reference.
+	/// and the masked texel copy would take. The copies are exact, so this changes no output; tests
+	/// use it to run the reference.
 	bool palette_block_copy = true;
 };
 

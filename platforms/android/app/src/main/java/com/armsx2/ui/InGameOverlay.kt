@@ -3,6 +3,7 @@ package com.armsx2.ui
 import androidx.compose.runtime.mutableStateOf
 import com.armsx2.EmuState
 import com.armsx2.runtime.MainActivityRuntime
+import com.armsx2.config.AutoTuneStore
 import com.armsx2.config.ConfigStore
 import com.armsx2.config.Settings
 import com.armsx2.config.SettingsScope
@@ -93,8 +94,11 @@ object InGameOverlay {
      *  snapping back to the top. Keyed by EmulationMenuTab.name to avoid coupling to that enum. */
     val menuTabScroll = HashMap<String, Int>()
 
-    fun saveSettings(updated: Settings) {
+    fun saveSettings(changed: Settings) {
         val previous = settingsState.value
+        // A setting auto-tune moves, set by hand in a game's own settings, turns auto-tune off for that game. The global
+        // settings are not a game's: changing those leaves the switch alone.
+        val updated = if (settingsScope.value == SettingsScope.Game) AutoTuneStore.withAutoTuneOffForManualChange(previous, changed) else changed
         settingsState.value = updated
         // `previous` matters: it's how ConfigStore tells a field the user just changed in
         // Game scope from one they never touched, so setting a per-game value that happens
@@ -140,7 +144,12 @@ object InGameOverlay {
                         // player has taken back for this game.
                         NativeApp.reloadGameSettingsLayer()
                     }
-                    updated.applyTo()
+                    // The core gets what is stored. In Game scope `updated` is what the screen shows,
+                    // database values included, and those would read as hardware fixes set by hand
+                    // (UserHacks) and stop the database's GS fixes applying.
+                    val stored = currentSerial.value?.takeIf { settingsScope.value == SettingsScope.Game && it.isNotBlank() }
+                        ?.let { ConfigStore.resolveForGame(it) }
+                    (stored ?: updated).applyTo()
                 }
                 // ★ Re-assert the OSD MODE after the commit. The Minimal/Full/Off modes are a
                 // LIVE-only flag apply (deliberately not persisted, so they don't overwrite the
@@ -169,6 +178,18 @@ object InGameOverlay {
                 }
             }
         }
+
+        // What a game's screens show is what the game runs, and a save can change that beyond the
+        // field it touched: turning the database's fixes off, or setting hardware fixes by hand,
+        // stops entries applying, and putting a setting at the database's own value hands it back.
+        // So show what is stored now rather than what was just edited.
+        if (settingsScope.value == SettingsScope.Game) {
+            currentSerial.value?.takeIf { it.isNotBlank() }?.let { serial ->
+                if (com.armsx2.config.GameDbOverrides.entriesFor(serial).isNotEmpty()) {
+                    settingsState.value = ConfigStore.resolveForDisplay(serial)
+                }
+            }
+        }
     }
 
     fun open() {
@@ -184,7 +205,7 @@ object InGameOverlay {
                 ?.substringBefore(" (")?.trim()?.takeIf(String::isNotBlank)
         currentSerial.value = serial
         settingsScope.value = if (serial == null) SettingsScope.Global else SettingsScope.Game
-        settingsState.value = ConfigStore.resolveForGame(serial)
+        settingsState.value = ConfigStore.resolveForDisplay(serial)
         frameLimitOn.value = settingsState.value.frameLimit.frameLimitEnable
         hardcoreOn.value = runCatching { NativeApp.isHardcoreMode() }.getOrDefault(false)
         if (MainActivityRuntime.eState.value != EmuState.STOPPED) MainActivityRuntime.pauseForOverlay()

@@ -25,10 +25,11 @@ import org.json.JSONObject
 internal val SETTINGS_CATEGORY_FIELDS: Map<SettingsCategory, List<String>> = mapOf(
     // PerformanceTab.kt
     SettingsCategory.Performance to listOf(
+        "affinityMode", "autoTune", "dynamicEeCycleRate",
         "eeClampMode", "eeCycleRate", "eeCycleSkip", "eeFpuRoundMode",
         "fastCDVD", "fpsLimit", "frameSkip", "framerateNtsc", "frameratePal",
-        "intcStat", "mtvu", "nominalSpeedPercent", "skipDuplicateFrames", "vu0RoundMode",
-        "vu1ClampMode", "vu1Instant", "vu1RoundMode", "vuClampMode", "vuDeferredWrites",
+        "hwScaler", "intcStat", "iopThread", "iopThreadLag", "mtvu", "vuAot", "nominalSpeedPercent", "screenResOverride", "skipDuplicateFrames", "vu0RoundMode",
+        "vsyncQueueSize", "vu1ClampMode", "vu1Instant", "vu1RoundMode", "vuClampMode", "vuDeferredWrites",
         "vuFlagHack", "vuNeonFusions", "vuSkipStallSim", "waitLoop",
         // LsfgSection lives on this tab. lsfgDllPath is deliberately NOT here: Reset restores
         // settings, and forgetting which file the user imported is not a setting being restored,
@@ -38,22 +39,22 @@ internal val SETTINGS_CATEGORY_FIELDS: Map<SettingsCategory, List<String>> = map
     // RendererTab.kt
     SettingsCategory.Graphics to listOf(
         "accurateBlendingUnit", "aspectRatio", "casMode", "casSharpness",
-        "customAspectRatio", "deinterlaceMode", "displayBilinear", "dumpReplaceableTextures", "fmvAspectRatio",
+        "customAspectRatio", "customDriverId", "deinterlaceMode", "displayBilinear", "dumpReplaceableTextures", "fmvAspectRatio",
         "forceMaliFbFetch", "fsrSharpness", "fxaa", "gpuProfile", "gsBackThreadMode", "hardwareDownloadMode",
         "hwAa1", "hwAccurateAlphaTest", "hwMipmap", "hwRov", "loadTextureReplacements",
         "loadTextureReplacementsAsync", "maxAnisotropy", "orientation",
         "osdShowTextureReplacements", "portraitRenderTop", "landscapeRenderTop", "autoProgressiveScan",
-        "affinityMode", "precacheTextureReplacements",
+        "precacheTextureReplacements", "renderer",
         "shadeBoost", "shadeBoostBrightness", "shadeBoostContrast", "shadeBoostGamma",
         "shadeBoostSaturation", "shaderChainEnabled", "shaderChainParams", "shaderChainPreset",
         "textureFiltering", "texturePreloading", "textureUpscale", "triFilter", "tvShader", "upscaleFloat",
-        "upscaler", "vsyncEnable",
+        "upscaler", "useAngleOpenGL", "vsyncEnable",
     ),
     // AudioTab.kt
     SettingsCategory.Audio to listOf(
         "audioBufferMs", "audioFastForwardVolume", "audioMuted", "audioOpenSLES",
-        "audioOutputLatencyMs", "audioSwapChannels", "audioTimeStretch", "audioVolume",
-        "spu2LightweightMix", "spu2NeonReverb",
+        "audioOutputLatencyMs", "audioRecordingCompatible", "audioSwapChannels", "audioTimeStretch",
+        "audioVolume", "spu2LightweightMix", "spu2NeonReverb",
     ),
     // NetworkTab.kt
     SettingsCategory.Network to listOf(
@@ -91,7 +92,7 @@ internal val SETTINGS_CATEGORY_FIELDS: Map<SettingsCategory, List<String>> = map
         "roundSprite", "screenOffsets", "showOverscan", "skipDrawEnd", "skipDrawStart",
         "spinCpuReadbacks", "spinGpuReadbacks", "swThreads", "swThreadsHeight",
         "syncToHostRefresh", "textureInsideRt", "textureOffsetX", "textureOffsetY",
-        "unscaledPaletteDraw", "useBlitSwapChain", "vsyncQueueSize",
+        "unscaledPaletteDraw", "useBlitSwapChain",
         // Not a Settings field: the game database entries switched off for this game, which the
         // Fixes tab lists. Resetting the tab turns them back on. Global scope never has it.
         com.armsx2.config.GameDbOverrides.OFF_KEY,

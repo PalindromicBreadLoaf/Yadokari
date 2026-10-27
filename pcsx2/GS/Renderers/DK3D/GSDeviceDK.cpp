@@ -1156,6 +1156,12 @@ GSDevice::PresentResult GSDeviceDK::DoBeginPresent(bool frame_skip)
 	// DoMerge may already have opened the frame? Otherwise we start here.
 	BeginFrameIfNeeded();
 
+	// The release libdeko3d svcBreaks on any acquire failure without calling cbDebug. Record
+	// whether the queue had already faulted (GPU fault/timeout) as opposed to VI refusing the
+	// dequeue, since the Atmosphère report can't tell the two apart.
+	if (dkQueueIsInErrorState(m_queue))
+		Horizon::ExitTrace("DK3D: queue in error state before dkQueueAcquireImage (GPU fault or timeout)");
+
 	const Common::Timer::Value acquire_start = Common::Timer::GetCurrentValue();
 	m_present_slot = dkQueueAcquireImage(m_queue, m_swapchain);
 	PerformanceMetrics::AccumulateGSAcquireWait(

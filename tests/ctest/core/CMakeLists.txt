@@ -2,12 +2,46 @@ add_pcsx2_test(core_test
 	ee_fpu_regfile_tests.cpp
 	ee_clamp_mode_tests.cpp
 	vu_clamp_mode_tests.cpp
+	vuaot_setting_tests.cpp
 	ee_fpu_reloc_tests.cpp
 	patch_tests.cpp
+	autotune_applier_tests.cpp
+	autotune_controller_tests.cpp
+	autotune_sampler_tests.cpp
+	autotune_settings_tests.cpp
+	autotune_store_tests.cpp
+	autotune_trace_tests.cpp
+	iop_fingerprint_tests.cpp
+	iop_thread_mode_tests.cpp
+	iop_thread_placement_tests.cpp
+	iop_thread_metrics_tests.cpp
+	iop_thread_channels_tests.cpp
+	iop_thread_tests.cpp
+	iop_thread_lockstep_tests.cpp
+	iop_thread_queue_tests.cpp
+	iop_thread_hold_tests.cpp
+	iop_thread_owner_tests.cpp
+	iop_thread_owner_release_tests.cpp
+	iop_thread_host_commands_tests.cpp
+	iop_thread_host_calls_tests.cpp
+	iop_thread_fpcr_tests.cpp
+	iop_thread_threaded_tests.cpp
+	pad_input_tests.cpp
+	shared_word_tests.cpp
+	IopThreadTestSupport.h
+	StubHostTasks.h
+	sif_pump_tests.cpp
+	sbus_tests.cpp
 	savestate_legacy_tests.cpp
 	settings_precedence_tests.cpp
 	gsrunner_affinity_tests.cpp
+	headless_shot_tests.cpp
+	onscreen_keyboard_tests.cpp
+	onscreen_keyboard_ui_tests.cpp
 	texture_upscale_setting_tests.cpp
+	ee_cycle_rate_controller_tests.cpp
+	ee_cycle_rate_eligibility_tests.cpp
+	ee_cycle_rate_sampler_tests.cpp
 	MockMemoryInterface.h
 	StubHost.cpp
 )
@@ -42,6 +76,12 @@ add_subdirectory(gs)
 
 # IPU colour-conversion oracle (arch-neutral: each host tests its own path).
 add_subdirectory(ipu)
+
+# Shared online-service layer (pcsx2/Catalog) and common/SHA256.
+add_subdirectory(catalog)
+
+# Namco arcade cabinet controls and library entries.
+add_subdirectory(arcade)
 
 
 set(multi_isa_sources

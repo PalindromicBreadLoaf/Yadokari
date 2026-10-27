@@ -58,6 +58,22 @@ std::vector<VuMemWindow> WholeMemWindow(int vu_index)
 	return {VuMemWindow{0u, std::vector<u8>(MemSize(vu_index))}};
 }
 
+// VPU_STAT lives in VU0's VI for both VUs. Set the running bit for the
+// replayed VU, and bit 12 (VU1 XGKICK still transferring) from the
+// capture's own XGKICK state, so neither leaks in from an earlier replay.
+// Bits 0-11 are cleared as before; the VU's own VI copy mirrors the result.
+void SeedVpuStat(const vu_capture::CaptureRecord& rec)
+{
+	const int idx = static_cast<int>(rec.vu_index);
+	constexpr u32 kXgkickBusy = 1u << 12;
+	u32 stat = vuRegs[0].VI[REG_VPU_STAT].UL & ~(0xFFFu | kXgkickBusy);
+	stat |= RunningBit(idx);
+	if (idx == 1 && rec.state.xgkickenable)
+		stat |= kXgkickBusy;
+	vuRegs[0].VI[REG_VPU_STAT].UL = stat;
+	Regs(idx).VI[REG_VPU_STAT].UL = stat;
+}
+
 // Restore microcode + data memory + registers from a CaptureRecord. Sets up
 // the VPU_STAT running bit + start_pc the same way VuTestHarness does, and
 // drops the JIT block cache so the capture's start_pc compiles fresh.
@@ -71,13 +87,11 @@ void PrimeFromCapture(const vu_capture::CaptureRecord& rec,
 	std::memcpy(vu.Mem, rec.vumem.data(), rec.vumem.size());
 
 	vu_capture::RestoreState(rec.state, vu);
+	vu_capture::RestoreExternal(idx, rec.external);
 
 	vu.start_pc = rec.start_pc;
 	vu.VI[REG_TPC].UL = rec.start_pc / 8u;
-
-	vuRegs[0].VI[REG_VPU_STAT].UL =
-		(vuRegs[0].VI[REG_VPU_STAT].UL & ~0xFFFu) | RunningBit(idx);
-	vu.VI[REG_VPU_STAT].UL = vuRegs[0].VI[REG_VPU_STAT].UL;
+	SeedVpuStat(rec);
 
 	vu.cycle = 0;
 	vu.ebit = 0;
@@ -129,6 +143,31 @@ void RunJitFromSeeded(int idx, u32 cycles)
 	JitCpu(idx)->Execute(cycles);
 }
 
+// Holds the host FPCR at the replayed VU's FPCR (FZ + ChopZero by default)
+// for its lifetime. Every driver that executes VU code needs it, for two
+// reasons. The interpreter computes with host scalar FP (`fs / ft` in
+// `_vuDIV`, host `sqrt` in `_vuSQRT`, ...), which uses the thread's FPCR.
+// And microVU writes FPCR at dispatch only when the EE and VU FPCRs differ,
+// so with the default config the JIT also inherits the caller's FPCR. Run
+// either under round-to-nearest and it computes different values than the
+// game did: 1-ULP false divergences in a diff, and in a bench, a program
+// whose loop condition depends on the rounding can run to the cycle budget.
+class ScopedVuFpcr
+{
+public:
+	explicit ScopedVuFpcr(int idx)
+		: m_saved(FPControlRegister::GetCurrent())
+	{
+		FPControlRegister::SetCurrent(idx == 0 ? EmuConfig.Cpu.VU0FPCR : EmuConfig.Cpu.VU1FPCR);
+	}
+	~ScopedVuFpcr() { FPControlRegister::SetCurrent(m_saved); }
+	ScopedVuFpcr(const ScopedVuFpcr&) = delete;
+	ScopedVuFpcr& operator=(const ScopedVuFpcr&) = delete;
+
+private:
+	FPControlRegister m_saved;
+};
+
 // The PATH1 sink covers Gif_Unit::TransferGSPacketData, but microVU's XGKICK
 // wrap path sends the pre-wrap head through Gif_Path::CopyGSPacketData
 // directly (the harness blind spot pstef found landing the console XGKICK
@@ -175,6 +214,7 @@ std::vector<PmuCounters::Values> BenchJitSteady(const vu_capture::CaptureRecord&
 	std::vector<u8> path1_buf;
 	gif_test_hooks::g_path1_sink = &path1_buf;
 	ResetGifPath1();
+	const ScopedVuFpcr fpcr(idx);
 
 	// Prime once WITH a cache reset so iter 0 compiles the block; subsequent
 	// iters re-seed without a reset (block stays compiled) so the measured
@@ -212,20 +252,9 @@ VuReplayResult ReplayCapture(const vu_capture::CaptureRecord& rec,
 
 	const auto windows = WholeMemWindow(idx);
 
-	// Set host FPCR to the VU's FPCR (FZ + ChopZero) for BOTH passes.
-	// The interpreter computes via host scalar FP (`fs / ft` in `_vuDIV`,
-	// host `sqrt`/`sqrtf` in `_vuSQRT`, etc.), which uses the host thread
-	// FPCR. The JIT switches FPCR to VU FPCR at dispatcher entry. If the
-	// harness sets vu_fpcr only around the JIT pass and lets interp run
-	// with default round-to-nearest, the two engines compute different
-	// FP results for the same operands — a 1-ULP false-positive divergence
-	// on any DIV/SQRT/MUL with non-trivial operands. Both passes use
-	// vu_fpcr so any divergence is a real codegen difference.
-	const FPControlRegister saved_fpcr = FPControlRegister::GetCurrent();
-	const FPControlRegister vu_fpcr = (idx == 0)
-		? EmuConfig.Cpu.VU0FPCR
-		: EmuConfig.Cpu.VU1FPCR;
-	FPControlRegister::SetCurrent(vu_fpcr);
+	// Both passes run under the VU FPCR, so any divergence is a real
+	// codegen difference rather than a rounding-mode one.
+	const ScopedVuFpcr fpcr(idx);
 
 	std::vector<u8> path1_buf;
 	gif_test_hooks::g_path1_sink = &path1_buf;
@@ -244,13 +273,14 @@ VuReplayResult ReplayCapture(const vu_capture::CaptureRecord& rec,
 	// Interp pass — restore the JIT-pass pre-state so the engines see
 	// identical inputs.
 	pre.Restore();
+	// The VIF registers and (for VU0) VU1's registers are outside the
+	// snapshot; a VU0 program can store into the latter during the JIT pass.
+	vu_capture::RestoreExternal(idx, rec.external);
 	std::memcpy(Regs(idx).Micro, rec.microcode.data(), rec.microcode.size());
 	std::memcpy(Regs(idx).Mem, rec.vumem.data(), rec.vumem.size());
 	Regs(idx).start_pc = rec.start_pc;
 	Regs(idx).VI[REG_TPC].UL = rec.start_pc / 8u;
-	vuRegs[0].VI[REG_VPU_STAT].UL =
-		(vuRegs[0].VI[REG_VPU_STAT].UL & ~0xFFFu) | RunningBit(idx);
-	Regs(idx).VI[REG_VPU_STAT].UL = vuRegs[0].VI[REG_VPU_STAT].UL;
+	SeedVpuStat(rec);
 	InterpCpu(idx)->SetStartPC(rec.start_pc);
 	JitCpu(idx)->SetStartPC(rec.start_pc);
 
@@ -263,11 +293,88 @@ VuReplayResult ReplayCapture(const vu_capture::CaptureRecord& rec,
 	out.interp_ebit = (vuRegs[0].VI[REG_VPU_STAT].UL & RunningBit(idx)) == 0;
 
 	gif_test_hooks::g_path1_sink = nullptr;
-	FPControlRegister::SetCurrent(saved_fpcr);
 
 	out.diff_lines = DiffVu(out.jit_snapshot, out.interp_snapshot, diff_mode);
 	out.diverged = !out.diff_lines.empty();
 	out.ok = true;
+	return out;
+}
+
+VuReplayResult ReplayJitOnly(const vu_capture::CaptureRecord& rec, u32 cycle_budget_override)
+{
+	VuReplayResult out;
+	if (rec.vu_index > 1)
+		return out;
+	if (!RecompilerTestEnvironment::IsReady())
+		return out;
+
+	const int idx = static_cast<int>(rec.vu_index);
+	const u32 cycles = cycle_budget_override ? cycle_budget_override : rec.cycle_budget;
+	const auto windows = WholeMemWindow(idx);
+
+	// Same FPCR handling as ReplayCapture's JIT pass.
+	const FPControlRegister saved_fpcr = FPControlRegister::GetCurrent();
+	FPControlRegister::SetCurrent((idx == 0) ? EmuConfig.Cpu.VU0FPCR : EmuConfig.Cpu.VU1FPCR);
+
+	std::vector<u8> path1_buf;
+	gif_test_hooks::g_path1_sink = &path1_buf;
+	ResetGifPath1();
+	PrimeFromCapture(rec);
+	path1_buf.clear();
+	const u64 jit_cycle_before = Regs(idx).cycle;
+	RunJitFromSeeded(idx, cycles);
+	out.jit_cycles = Regs(idx).cycle - jit_cycle_before;
+	out.jit_snapshot = VuSnapshot::Capture(idx, windows);
+	out.path1_packets_jit = path1_buf;
+	out.jit_ebit = (vuRegs[0].VI[REG_VPU_STAT].UL & RunningBit(idx)) == 0;
+
+	gif_test_hooks::g_path1_sink = nullptr;
+	FPControlRegister::SetCurrent(saved_fpcr);
+	out.ok = true;
+	return out;
+}
+
+VuChainResult ReplayJitChain(const vu_capture::CaptureRecord& rec, u32 cycle_budget_override, u32 max_resumes)
+{
+	VuChainResult out;
+	if (rec.vu_index > 1)
+		return out;
+	if (!RecompilerTestEnvironment::IsReady())
+		return out;
+
+	const int idx = static_cast<int>(rec.vu_index);
+	const u32 cycles = cycle_budget_override ? cycle_budget_override : rec.cycle_budget;
+	const auto windows = WholeMemWindow(idx);
+
+	const FPControlRegister saved_fpcr = FPControlRegister::GetCurrent();
+	FPControlRegister::SetCurrent((idx == 0) ? EmuConfig.Cpu.VU0FPCR : EmuConfig.Cpu.VU1FPCR);
+
+	std::vector<u8> path1_buf;
+	gif_test_hooks::g_path1_sink = &path1_buf;
+	ResetGifPath1();
+	PrimeFromCapture(rec);
+	path1_buf.clear();
+	const u64 jit_cycle_before = Regs(idx).cycle;
+	RunJitFromSeeded(idx, cycles);
+	out.first.jit_cycles = Regs(idx).cycle - jit_cycle_before;
+	out.first.jit_snapshot = VuSnapshot::Capture(idx, windows);
+	out.first.path1_packets_jit = path1_buf;
+	out.first.jit_ebit = (vuRegs[0].VI[REG_VPU_STAT].UL & RunningBit(idx)) == 0;
+	out.final_ebit = out.first.jit_ebit;
+	while (!out.final_ebit && out.resumes < max_resumes)
+	{
+		JitCpu(idx)->Execute(cycles);
+		out.resumes++;
+		out.final_ebit = (vuRegs[0].VI[REG_VPU_STAT].UL & RunningBit(idx)) == 0;
+	}
+	out.final_cycles = Regs(idx).cycle - jit_cycle_before;
+	out.final_snapshot = VuSnapshot::Capture(idx, windows);
+	out.final_path1 = path1_buf;
+	out.first.ok = true;
+	out.ok = true;
+
+	gif_test_hooks::g_path1_sink = nullptr;
+	FPControlRegister::SetCurrent(saved_fpcr);
 	return out;
 }
 
@@ -295,8 +402,11 @@ bool DumpJitAsm(const vu_capture::CaptureRecord& rec, const std::string& out_pat
 	// Compile once via the standard prime+execute path.
 	std::vector<u8> path1_buf;
 	gif_test_hooks::g_path1_sink = &path1_buf;
-	PrimeFromCapture(rec);
-	RunJitFromSeeded(idx, cycles);
+	{
+		const ScopedVuFpcr fpcr(idx);
+		PrimeFromCapture(rec);
+		RunJitFromSeeded(idx, cycles);
+	}
 	gif_test_hooks::g_path1_sink = nullptr;
 
 	const u8* code_start = nullptr;
@@ -366,6 +476,7 @@ std::vector<PmuCounters::Values> BenchJit(const vu_capture::CaptureRecord& rec,
 	// path-1 packets and asserting when no sink is present must be avoided.
 	std::vector<u8> path1_buf;
 	gif_test_hooks::g_path1_sink = &path1_buf;
+	const ScopedVuFpcr fpcr(idx);
 
 	samples.reserve(iters);
 	if (!reprime_per_iter)

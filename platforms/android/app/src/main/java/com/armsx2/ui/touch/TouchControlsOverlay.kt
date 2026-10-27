@@ -187,6 +187,10 @@ fun TouchControlsOverlay() {
             gyro.stop()
         }
     }
+    // Sensor off while the app is out of sight and back on when it returns, told by the lifecycle
+    // itself: the keys above only change on recomposition, which stops with the activity.
+    androidx.lifecycle.compose.LifecycleEventEffect(androidx.lifecycle.Lifecycle.Event.ON_STOP) { gyro.setInSight(false) }
+    androidx.lifecycle.compose.LifecycleEventEffect(androidx.lifecycle.Lifecycle.Event.ON_START) { gyro.setInSight(true) }
     val edit = TouchControls.editMode.value
     val running = MainActivityRuntime.eState.value == EmuState.RUNNING ||
                   MainActivityRuntime.eState.value == EmuState.PAUSED
@@ -219,6 +223,7 @@ fun TouchControlsOverlay() {
             OverlayDims.last = OverlayDims.Dims(widthPx, heightPx, density.density)
         }
         val layout = TouchControls.activeLayout.value
+        val tight = tightShoulderFactors()
         // Buttons the single UnifiedTouchLayer currently holds down (face + shoulder +
         // menu digital buttons). The covered widgets read this to paint their pressed
         // visual — they're render-only when multi-touch is on (inputEnabled=false).
@@ -383,9 +388,10 @@ fun TouchControlsOverlay() {
                     val s = with(density) { cfg.sizeDp.dp.toPx() }
                     val cx = widthPx * cfg.xFrac
                     val cy = heightPx * cfg.yFrac
-                    Rect(cx - s / 2f, cy - s / 2f, cx + s / 2f, cy + s / 2f)
+                    val halfH = s * (tight[cfg.id] ?: 1f) / 2f
+                    Rect(cx - s / 2f, cy - halfH, cx + s / 2f, cy + halfH)
                 },
-                circles = multi.map { cfg ->
+                circles = multi.filter { it.id !in tight }.map { cfg ->
                     val s = with(density) { cfg.sizeDp.dp.toPx() }
                     Offset(widthPx * cfg.xFrac, heightPx * cfg.yFrac) to s * radius
                 },
@@ -433,12 +439,13 @@ fun TouchControlsOverlay() {
             val yFrac = if (snapping) snapFracToGrid(cfg.yFrac, heightPx, gridPx) else cfg.yFrac
             val cx = w * xFrac
             val cy = h * yFrac
+            val boxH = size * (tight[cfg.id] ?: 1f)
             val left = cx - size / 2
-            val top = cy - size / 2
+            val top = cy - boxH / 2
             Box(
                 modifier = Modifier
                     .offset(x = left, y = top)
-                    .size(size)
+                    .size(width = size, height = boxH)
                     .alpha(if (edit && !cfg.enabled) 0.4f else 1f),
             ) {
                 when (cfg.id.kind) {
@@ -525,6 +532,126 @@ fun TouchControlsOverlay() {
 }
 
 /* -------------------------------------------------------------------- */
+/*  Remote play: these controls on a friend's device, as player 2        */
+/* -------------------------------------------------------------------- */
+
+/** Where presses go while a remote play viewer is open (com.armsx2.remoteplay): to the stream's
+ *  player 2 instead of this device's emulator. Set for the viewer's whole life rather than while the
+ *  controls are composed, so the releases they send as they hide still reach player 2. */
+@Volatile
+private var remotePlayPadSink: ((keycode: Int, value: Int, pressed: Boolean) -> Unit)? = null
+
+/** Remote play's viewer sets this when it opens; see [RemotePlayTouchControls]. */
+fun setRemotePlayPadSink(sink: ((keycode: Int, value: Int, pressed: Boolean) -> Unit)?) {
+    remotePlayPadSink = sink
+}
+
+/**
+ * Clears the sink, but only while it is still [sink]: a second viewer screen that closes (refused,
+ * say) must not cut off the one still playing.
+ */
+fun clearRemotePlayPadSink(sink: (keycode: Int, value: Int, pressed: Boolean) -> Unit) {
+    if (remotePlayPadSink === sink) remotePlayPadSink = null
+}
+
+/** What a remote play viewer gets: the controller itself. Pause, fast forward, save states, the
+ *  pressure modifier and the light gun act on a game running on this device, and there is none. */
+private fun isRemotePlayKind(kind: TouchButtonId.Kind): Boolean = when (kind) {
+    TouchButtonId.Kind.FACE, TouchButtonId.Kind.SHOULDER, TouchButtonId.Kind.MENU,
+    TouchButtonId.Kind.DPAD, TouchButtonId.Kind.STICK, TouchButtonId.Kind.MACRO,
+    TouchButtonId.Kind.ANALOGEXTRA -> true
+    else -> false
+}
+
+/**
+ * Remote play: the player's own touch controls (layout, skin, size, opacity, multi-touch and glide
+ * settings) on a friend's stream, playing as player 2. Presses go to the sink set with
+ * [setRemotePlayPadSink]. Built from the same widgets as [TouchControlsOverlay], minus everything
+ * tied to a local game: the light gun, screen gestures, gyro and the buttons [isRemotePlayKind]
+ * leaves out.
+ */
+@Composable
+fun RemotePlayTouchControls() {
+    TouchControls.ensureLoaded()
+    val context = LocalContext.current
+    val isPortrait = LocalConfiguration.current.orientation == Configuration.ORIENTATION_PORTRAIT
+    TouchControls.portrait.value = isPortrait
+    LaunchedEffect(isPortrait) {
+        // The global profile and skin, as outside a game.
+        TouchControls.applyActiveProfileForOrientation()
+        ControllerSkinStore.applyForSerial(context, null)
+    }
+
+    BoxWithConstraints(Modifier.fillMaxSize()) {
+        val w = maxWidth
+        val h = maxHeight
+        val density = LocalDensity.current
+        val widthPx = with(density) { w.toPx() }
+        val heightPx = with(density) { h.toPx() }
+        LaunchedEffect(widthPx, heightPx, density.density) {
+            OverlayDims.last = OverlayDims.Dims(widthPx, heightPx, density.density)
+        }
+        val full = TouchControls.activeLayout.value
+        val layout = remember(full) { TouchLayout(full.buttons.filter { isRemotePlayKind(it.id.kind) }) }
+        val tight = tightShoulderFactors()
+        var unifiedPressed by remember { mutableStateOf<Set<TouchButtonId>>(emptySet()) }
+        var unifiedDpad by remember { mutableStateOf(DpadState()) }
+        val faceMulti = TouchControls.faceMultiTouch.value
+        if (!faceMulti) {
+            if (unifiedPressed.isNotEmpty()) unifiedPressed = emptySet()
+            if (unifiedDpad.any()) unifiedDpad = DpadState()
+        }
+
+        // Layered as in TouchControlsOverlay: the full-screen layers under the widgets.
+        if (faceMulti) {
+            UnifiedTouchLayer(
+                layout = layout,
+                widthPx = widthPx,
+                heightPx = heightPx,
+                glideMode = TouchControls.glideMode.value,
+                gunAttached = false,
+                onPressedChange = { unifiedPressed = it },
+                onDpadChange = { unifiedDpad = it },
+            )
+        }
+        val halfSticks = TouchControls.fullHalfSticks.value
+        if (halfSticks) {
+            FullHalfStickLayer(layout = layout, widthPx = widthPx, heightPx = heightPx, faceMulti = faceMulti, gunAttached = false)
+        }
+        for (cfg in layout.buttons) {
+            if (!cfg.enabled) continue
+            if (halfSticks && cfg.id.kind == TouchButtonId.Kind.STICK &&
+                !(cfg.id == TouchButtonId.L_STICK && TouchControls.fullHalfKeepLeftStick.value)) continue
+            if (!extraShown(cfg, gunAttached = false)) continue
+            val size = cfg.sizeDp.dp
+            val boxH = size * (tight[cfg.id] ?: 1f)
+            Box(
+                modifier = Modifier
+                    .offset(x = w * cfg.xFrac - size / 2, y = h * cfg.yFrac - boxH / 2)
+                    .size(width = size, height = boxH),
+            ) {
+                when (cfg.id.kind) {
+                    TouchButtonId.Kind.DPAD -> DpadWidget(
+                        cfg, edit = false,
+                        inputEnabled = !faceMulti,
+                        forced = if (faceMulti) unifiedDpad else null,
+                    )
+                    TouchButtonId.Kind.STICK -> StickWidget(cfg, edit = false)
+                    TouchButtonId.Kind.MACRO -> MacroWidget(cfg, edit = false, inputEnabled = !(faceMulti && !cfg.tapToHold))
+                    TouchButtonId.Kind.ANALOGEXTRA -> AnalogExtraWidget(cfg, edit = false)
+                    else -> ButtonWidget(
+                        cfg = cfg,
+                        edit = false,
+                        inputEnabled = !(faceMulti && isMultiTouchKind(cfg.id.kind) && !cfg.tapToHold),
+                        forcedPressed = faceMulti && cfg.id in unifiedPressed,
+                    )
+                }
+            }
+        }
+    }
+}
+
+/* -------------------------------------------------------------------- */
 /*  Digital button widget                                                */
 /* -------------------------------------------------------------------- */
 
@@ -602,6 +729,37 @@ private fun skinPainter(key: String?): Painter? {
     val ctx = LocalContext.current
     val bmp = remember(active, key) { ControllerSkinStore.bitmapForKey(ctx, key) } ?: return null
     return remember(bmp) { BitmapPainter(bmp) }
+}
+
+/** Height over width of a shoulder button's art on screen: the skin's image or the bundled sprite.
+ *  At most 1: art taller than it is wide fills the square anyway. */
+@Composable
+private fun shoulderArtAspect(id: TouchButtonId): Float {
+    val art = (skinPainter(skinKeyFor(id)) ?: painterResource(drawableFor(id, false))).intrinsicSize
+    return if (art.width.isFinite() && art.height.isFinite() && art.width > 0f && art.height > 0f)
+        (art.height / art.width).coerceIn(0.2f, 1f) else 1f
+}
+
+private val SHOULDER_IDS = listOf(TouchButtonId.L1, TouchButtonId.R1, TouchButtonId.L2, TouchButtonId.R2)
+
+/**
+ * Height factor of each shoulder button's box while Tight shoulder buttons is on, else empty.
+ *
+ * Every widget is a square of its size, and with multi-touch on a button also answers anywhere in a
+ * circle 1.24 times as wide. L1/R1's sprite is only 0.58 of its width tall, so those reached far
+ * above and below the button and got in the way (a request pointing at NetherSX2, which keeps the
+ * touch area to the button). With the option on, a shoulder's widget box, touch area and the
+ * regions other layers leave to it are all its artwork's box.
+ */
+@Composable
+private fun tightShoulderFactors(): Map<TouchButtonId, Float> {
+    val on = TouchControls.tightShoulders.value
+    val factors = HashMap<TouchButtonId, Float>(SHOULDER_IDS.size)
+    for (id in SHOULDER_IDS) {
+        val aspect = shoulderArtAspect(id)
+        if (on) factors[id] = aspect
+    }
+    return factors
 }
 
 /** Logical skin key for a button, or null for buttons with no skin slot. */
@@ -754,21 +912,28 @@ private fun UnifiedTouchLayer(
     }
 
     val density = LocalDensity.current
+    val tight = tightShoulderFactors()
     val buttonRects = hitButtons.map { cfg ->
         val sizePx = with(density) { cfg.sizeDp.dp.toPx() }
         val cx = widthPx * cfg.xFrac
         val cy = heightPx * cfg.yFrac
-        UnifiedHit(id = cfg.id, cx = cx, cy = cy, radius = sizePx * TouchControls.multiTouchRadius.floatValue)
+        val factor = tight[cfg.id]
+        if (factor != null) {
+            UnifiedHit(id = cfg.id, cx = cx, cy = cy, radius = 0f, halfW = sizePx / 2f, halfH = sizePx * factor / 2f)
+        } else {
+            UnifiedHit(id = cfg.id, cx = cx, cy = cy, radius = sizePx * TouchControls.multiTouchRadius.floatValue)
+        }
     }
     val foreignBounds = foreignRects.map { cfg ->
         val sizePx = with(density) { cfg.sizeDp.dp.toPx() }
         val cx = widthPx * cfg.xFrac
         val cy = heightPx * cfg.yFrac
+        val halfH = sizePx * (tight[cfg.id] ?: 1f) / 2f
         UnifiedRect(
             left = cx - sizePx / 2f,
-            top = cy - sizePx / 2f,
+            top = cy - halfH,
             right = cx + sizePx / 2f,
-            bottom = cy + sizePx / 2f,
+            bottom = cy + halfH,
         )
     } + listOfNotNull(
         // #357: the top-center cog carve-out went away with the cog. PAUSE inherits its job as the
@@ -834,11 +999,7 @@ private fun UnifiedTouchLayer(
                 // Full-screen: positions are already in global (layer) coordinates.
                 fun hits(pos: Offset): Set<TouchButtonId> =
                     buttonRects
-                        .filter { hit ->
-                            val dx = pos.x - hit.cx
-                            val dy = pos.y - hit.cy
-                            dx * dx + dy * dy <= hit.radius * hit.radius
-                        }
+                        .filter { hit -> hit.contains(pos.x, pos.y) }
                         .map { it.id }
                         .toSet()
                 fun inForeignRegion(pos: Offset): Boolean =
@@ -1031,7 +1192,17 @@ private data class UnifiedHit(
     val cx: Float,
     val cy: Float,
     val radius: Float,
-)
+    /** Half extents of a box hit, for a tight shoulder button; 0 = the circle of [radius]. */
+    val halfW: Float = 0f,
+    val halfH: Float = 0f,
+) {
+    fun contains(x: Float, y: Float): Boolean {
+        val dx = x - cx
+        val dy = y - cy
+        return if (halfW > 0f) dx >= -halfW && dx <= halfW && dy >= -halfH && dy <= halfH
+        else dx * dx + dy * dy <= radius * radius
+    }
+}
 
 private data class UnifiedRect(
     val left: Float,
@@ -1968,20 +2139,25 @@ private fun computeStickEmit(nx: Float, ny: Float, left: Boolean): StickEmit {
 }
 
 private fun applyStickDiff(codes: StickCodes, prev: StickEmit, next: StickEmit) {
-    // The player the touch controls play as (Player 1 unless set to 2); see sendDigital.
-    val port = TouchControls.playerPort
-    if (prev.xPos != next.xPos) NativeApp.setPadButtonForPort(port, codes.xPos, next.xPos, next.xPos > 0)
-    if (prev.xNeg != next.xNeg) NativeApp.setPadButtonForPort(port, codes.xNeg, next.xNeg, next.xNeg > 0)
-    if (prev.yPos != next.yPos) NativeApp.setPadButtonForPort(port, codes.yPos, next.yPos, next.yPos > 0)
-    if (prev.yNeg != next.yNeg) NativeApp.setPadButtonForPort(port, codes.yNeg, next.yNeg, next.yNeg > 0)
+    if (prev.xPos != next.xPos) sendStickAxis(codes.xPos, next.xPos)
+    if (prev.xNeg != next.xNeg) sendStickAxis(codes.xNeg, next.xNeg)
+    if (prev.yPos != next.yPos) sendStickAxis(codes.yPos, next.yPos)
+    if (prev.yNeg != next.yNeg) sendStickAxis(codes.yNeg, next.yNeg)
 }
 
 private fun releaseStick(codes: StickCodes, last: StickEmit) {
-    val port = TouchControls.playerPort
-    if (last.xPos != 0) NativeApp.setPadButtonForPort(port, codes.xPos, 0, false)
-    if (last.xNeg != 0) NativeApp.setPadButtonForPort(port, codes.xNeg, 0, false)
-    if (last.yPos != 0) NativeApp.setPadButtonForPort(port, codes.yPos, 0, false)
-    if (last.yNeg != 0) NativeApp.setPadButtonForPort(port, codes.yNeg, 0, false)
+    if (last.xPos != 0) sendStickAxis(codes.xPos, 0)
+    if (last.xNeg != 0) sendStickAxis(codes.xNeg, 0)
+    if (last.yPos != 0) sendStickAxis(codes.yPos, 0)
+    if (last.yNeg != 0) sendStickAxis(codes.yNeg, 0)
+}
+
+/** One stick half-axis (0..32767) to the player the touch controls play as (Player 1 unless set to
+ *  2; see sendDigital), or to a friend's game as player 2 during remote play. */
+private fun sendStickAxis(code: Int, value: Int) {
+    val sink = remotePlayPadSink
+    if (sink != null) sink(code, value, value > 0)
+    else NativeApp.setPadButtonForPort(TouchControls.playerPort, code, value, value > 0)
 }
 
 /* -------------------------------------------------------------------- */
@@ -2011,11 +2187,7 @@ private data class HalfStickParams(
 ) {
     fun inForeign(pos: Offset): Boolean =
         foreignRects.any { pos.x >= it.left && pos.x <= it.right && pos.y >= it.top && pos.y <= it.bottom } ||
-            foreignCircles.any {
-                val dx = pos.x - it.cx
-                val dy = pos.y - it.cy
-                dx * dx + dy * dy <= it.radius * it.radius
-            }
+            foreignCircles.any { it.contains(pos.x, pos.y) }
 }
 
 /** Invisible full-screen layer: the LEFT half drives the left analog, the RIGHT half the right one.
@@ -2033,6 +2205,7 @@ private fun FullHalfStickLayer(
 ) {
     if (widthPx <= 0f || heightPx <= 0f) return
     val density = LocalDensity.current
+    val tight = tightShoulderFactors()
     // Foreign regions: every enabled non-stick widget on screen (D-pad, face, shoulders, menu, L3/R3,
     // Pause, FF, macro, state, pressure; [extraShown]). A finger starting on one of these drives the
     // button, not a stick.
@@ -2042,14 +2215,15 @@ private fun FullHalfStickLayer(
             val sizePx = with(density) { cfg.sizeDp.dp.toPx() }
             val cx = widthPx * cfg.xFrac
             val cy = heightPx * cfg.yFrac
-            UnifiedRect(cx - sizePx / 2f, cy - sizePx / 2f, cx + sizePx / 2f, cy + sizePx / 2f)
+            val halfH = sizePx * (tight[cfg.id] ?: 1f) / 2f
+            UnifiedRect(cx - sizePx / 2f, cy - halfH, cx + sizePx / 2f, cy + halfH)
         }
     // With multi-touch on, a face/shoulder/menu button answers anywhere in its hit circle
     // (UnifiedTouchLayer), and the circle reaches past the square. Leave those to the button too,
     // or a thumb on the rim of Cross would move the right stick instead.
     val radius = TouchControls.multiTouchRadius.floatValue
     val foreignCircles = if (!faceMulti) emptyList() else layout.buttons
-        .filter { it.enabled && isUnifiedKind(it.id.kind) && !it.tapToHold }
+        .filter { it.enabled && isUnifiedKind(it.id.kind) && !it.tapToHold && it.id !in tight }
         .map { cfg ->
             val sizePx = with(density) { cfg.sizeDp.dp.toPx() }
             UnifiedHit(id = cfg.id, cx = widthPx * cfg.xFrac, cy = heightPx * cfg.yFrac, radius = sizePx * radius)
@@ -2162,6 +2336,13 @@ private class HalfStickInputNode(private var params: HalfStickParams) : Modifier
 /* -------------------------------------------------------------------- */
 
 private fun sendDigital(keycode: Int, pressed: Boolean) {
+    remotePlayPadSink?.let { sink ->
+        // Remote play: a full press to player 2 (the stream carries no pressure), and none of the
+        // local pressure bookkeeping, which belongs to a game on this device.
+        sink(keycode, if (pressed) 255 else 0, pressed)
+        if (pressed && TouchControls.touchHaptics.value) NativeApp.touchHaptic()
+        return
+    }
     // Pressure modifier: send a soft (~50%) range for pressure-capable buttons
     // while the modifier is held; 0 (full press) otherwise. native-lib.cpp's
     // setPadButton turns the range into a 0..1 pressure value.

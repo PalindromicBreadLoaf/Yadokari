@@ -210,10 +210,25 @@ open class MainActivityRuntime : ComponentActivity() {
             romsDirs.value = dirs
             val arr = org.json.JSONArray()
             for (d in dirs) arr.put(d)
+            // A folder taken out of the library takes its subfolder choice with it.
+            val withoutSubfolders = romsDirsWithoutSubfolders.value.filterTo(LinkedHashSet()) { it in dirs }
+            romsDirsWithoutSubfolders.value = withoutSubfolders
             prefs.edit {
                 putString("romsDirs", arr.toString())
+                    .putStringSet(KEY_ROMS_DIRS_WITHOUT_SUBFOLDERS, withoutSubfolders)
                     .remove("roms")
             }
+        }
+
+        /** The game folders in [romsDirs] whose subfolders the library leaves out: only the files
+         *  directly in them are scanned. Every other folder is scanned with all its subfolders. */
+        val romsDirsWithoutSubfolders = mutableStateOf<Set<String>>(emptySet())
+        private const val KEY_ROMS_DIRS_WITHOUT_SUBFOLDERS = "romsDirsWithoutSubfolders"
+
+        fun setRomsDirSubfolders(dir: String, include: Boolean) {
+            val updated = LinkedHashSet(romsDirsWithoutSubfolders.value).apply { if (include) remove(dir) else add(dir) }
+            romsDirsWithoutSubfolders.value = updated
+            prefs.edit { putStringSet(KEY_ROMS_DIRS_WITHOUT_SUBFOLDERS, updated) }
         }
 
         // Default backend is "auto" — emucore's GSUtil::GetPreferredRenderer
@@ -576,6 +591,34 @@ open class MainActivityRuntime : ComponentActivity() {
             stop(saveAutosave = saveAutosave)
         }
 
+        /** The Close Game and Close Game & Quit hotkeys ask first (#814, asked for by anubys-droid): a
+         *  hotkey is easy to press by mistake (a child's BACK, mapped to Close Game & Quit to keep
+         *  them out of the menu), and closing loses whatever the game has not saved. The game holds
+         *  paused while the question is up; Cancel, B or BACK goes back to it. Cancel is selected
+         *  first, and the open prompt swallows the hotkey itself, so pressing it twice cannot close
+         *  the game. */
+        fun confirmCloseGame(quit: Boolean) {
+            if (com.armsx2.ui.common.GlobalConfirm.pending.value != null) return
+            val wasRunning = eState.value == EmuState.RUNNING
+            if (wasRunning) pauseForOverlay()
+            com.armsx2.ui.common.GlobalConfirm.ask(
+                title = com.armsx2.i18n.I18n.get(if (quit) "hotkeys.confirmQuit.title" else "hotkeys.confirmClose.title"),
+                message = com.armsx2.i18n.I18n.get("hotkeys.confirmClose.message"),
+                confirmLabel = com.armsx2.i18n.I18n.get(if (quit) "games.toolbar.exit" else "action.close"),
+                destructive = true,
+                onDismiss = { if (wasRunning) resume() },
+            ) {
+                // Stop the VM (flushes memcards/savestate), then finish the app once the VM has
+                // fully unwound: never finish inline (stop() is async).
+                if (quit) {
+                    quitAfterStop = true
+                    stop()
+                } else {
+                    closeGame()
+                }
+            }
+        }
+
         /** Fully exit the app (the library Exit button and hold-back gesture route
          *  here). VM-safe: if a game is running, flush it first (quitAfterStop +
          *  async stop(), which finishes once the VM unwinds via the STOPPED branch);
@@ -828,6 +871,7 @@ open class MainActivityRuntime : ComponentActivity() {
                     if (restartNow) {
                         start()
                     } else {
+                        failPendingFileLoadOnBoot()
                         WindowImpl.toolbarVisible.value = true
                         WindowImpl.showLibrary.value = false
                         WindowImpl.overlayVisible.value = false
@@ -988,17 +1032,22 @@ open class MainActivityRuntime : ComponentActivity() {
             // re-open the GS device and run Vulkan::LoadVulkanLibrary. The
             // VK loader reads the pinned path lazily so the order matters.
             val ctx = instance?.applicationContext
-            // Per-game GPU driver: pin THIS title's resolved driver (blank = system). Keep the
-            // session mirror in sync so the picker UI + delete/reselect logic stay correct.
-            val pickedId = resolved.output.customDriverId.takeIf { it.isNotBlank() }
+            // Per-game GPU driver: pin THIS title's resolved driver. If that driver has been
+            // deleted, fall back to the global one, and to the system driver if that is gone too.
+            val installedDrivers = if (ctx != null) com.armsx2.CustomDriver.listInstalled(ctx) else emptyList()
+            val pickedId = com.armsx2.CustomDriver.effectiveId(
+                resolved.output.customDriverId,
+                com.armsx2.config.ConfigStore.loadGlobal().output.customDriverId,
+                installedDrivers.map { it.id },
+            )
             customDriverId.value = pickedId
-            val picked: com.armsx2.CustomDriver.InstalledDriver? =
-                if (ctx != null) pickedId?.let { id ->
-                    com.armsx2.CustomDriver.listInstalled(ctx).firstOrNull { it.id == id }
-                } else null
+            val picked = installedDrivers.firstOrNull { it.id == pickedId }
             // Turnip options (#719) go into the environment before the device is created.
             com.armsx2.CustomDriver.applyDriverEnv()
-            if (ctx != null) com.armsx2.CustomDriver.applyToNative(ctx, picked)
+            if (ctx != null) {
+                com.armsx2.CustomDriver.applyToNative(ctx, picked)
+                applyAngleEnv(ctx, resolved)
+            }
             when (renderer.value) {
                 "vulkan" -> NativeApp.renderVulkan()
                 "opengl" -> NativeApp.renderOpenGL()
@@ -1140,9 +1189,6 @@ open class MainActivityRuntime : ComponentActivity() {
                     "uri=${uri.take(240)} state=${eState.value} runLoop=$vmRunLoopActive " +
                     "stopping=$vmStopInProgress nativeReady=${nativeReady.value}"
             )
-            // Refresh the ANGLE EGL env before the GS thread opens the GL context, so a
-            // just-changed AndroidUseAngleOpenGL / renderer choice takes effect on this boot.
-            instance?.applicationContext?.let { applyAngleEnv(it) }
             // Native GS/settings calls in start()→applyRendererPrefs null-deref if the
             // base settings layer isn't installed yet (initialize() not finished). On a
             // cold first launch — reliably on Samsung DeX — a fast game tap races init
@@ -1287,6 +1333,7 @@ open class MainActivityRuntime : ComponentActivity() {
                     if (restartNow) {
                         start()
                     } else {
+                        failPendingFileLoadOnBoot()
                         // BIOS exit had no cleanup at all — it relied entirely on stop()'s racy
                         // branch, so quitting the BIOS also left the launcher stuck in its rotation.
                         onReturnedToLibrary()
@@ -1403,6 +1450,7 @@ open class MainActivityRuntime : ComponentActivity() {
             if (!shouldStop) {
                 // Nothing left to stop (the VM self-terminated). Still reconcile the library
                 // state — this early return also used to leak a stale per-game rotation.
+                if (!vmRestartAfterStop) failPendingFileLoadOnBoot()
                 onReturnedToLibrary()
                 return
             }
@@ -1435,6 +1483,7 @@ open class MainActivityRuntime : ComponentActivity() {
                     if (restartNow) {
                         start()
                     } else {
+                        failPendingFileLoadOnBoot()
                         synchronized(vmLifecycleLock) {
                             WindowImpl.toolbarVisible.value = true
                             WindowImpl.showLibrary.value = false
@@ -1503,19 +1552,17 @@ open class MainActivityRuntime : ComponentActivity() {
          *  system GLES driver — useful where the native GLES stack is broken (e.g. some MediaTek
          *  Mali). Cleared otherwise. Env vars are read by native getenv in this same process, so
          *  this Kotlin call is the whole hook. MUST run before the GS thread opens the GL context,
-         *  so it's invoked at emucore init and before each game launch. Renderer restart applies a
-         *  live toggle (like the GPU-profile override). Uses the GLOBAL settings; per-game renderer
-         *  overrides are out of scope for v1. */
-        fun applyAngleEnv(context: Context) {
-            val settings = runCatching { com.armsx2.config.ConfigStore.loadGlobal() }.getOrNull()
-            val eligible = settings?.display?.useAngleOpenGL == true && settings.output.renderer == "opengl"
+         *  so that applyRendererPrefs calls it before every boot with [settings]. Renderer restart
+         *  applies a live toggle (like the GPU-profile override). */
+        fun applyAngleEnv(context: Context, settings: com.armsx2.config.Settings) {
+            val eligible = settings.display.useAngleOpenGL && settings.output.renderer == "opengl"
             val libDir = context.applicationInfo.nativeLibraryDir
             val egl = File(libDir, "libEGL_angle.so")
             val gles = File(libDir, "libGLESv2_angle.so")
             // gsBackThread rides on every line: GV7's back thread is the OTHER ANGLE suspect
             // (ANGLE binds an EGL context to a single thread far more strictly than the native
             // GLES drivers do), so the log has to say whether it was engaged.
-            val ctx = "renderer=${settings?.output?.renderer} useAngle=${settings?.display?.useAngleOpenGL} gsBackThread=${settings?.display?.gsBackThreadMode}"
+            val ctx = "renderer=${settings.output.renderer} useAngle=${settings.display.useAngleOpenGL} gsBackThread=${settings.display.gsBackThreadMode}"
             try {
                 if (eligible && egl.exists() && gles.exists()) {
                     android.system.Os.setenv("ARMSX2_ANGLE_EGL_LIBRARY", egl.absolutePath, true)
@@ -1558,6 +1605,20 @@ open class MainActivityRuntime : ComponentActivity() {
         @Volatile
         private var pendingSlotLoadOnBoot: Int? = null
 
+        @Volatile
+        private var pendingFileLoadOnBoot: PendingFileLoad? = null
+
+        private data class PendingFileLoad(val path: String, val onResult: (Boolean) -> Unit)
+
+        private fun failPendingFileLoadOnBoot() {
+            val request = synchronized(vmLifecycleLock) {
+                val pending = pendingFileLoadOnBoot ?: return
+                pendingFileLoadOnBoot = null
+                pending
+            }
+            android.os.Handler(android.os.Looper.getMainLooper()).post { request.onResult(false) }
+        }
+
         // The last game we booted, retained across exit-to-library so the Save Manager can
         // re-launch + load a save AFTER the game was exited. Kept SEPARATE from currentGame
         // (which stop() nulls for settings-scope) so it can't resurrect per-game scope in the
@@ -1568,6 +1629,21 @@ open class MainActivityRuntime : ComponentActivity() {
         {
             val game = currentGame.value ?: contextGame.value ?: return false
             return launchGameFromSaveSlot(game, slot)
+        }
+
+        fun launchCurrentGameFromSaveFile(path: String, onResult: (Boolean) -> Unit): Boolean {
+            val game = currentGame.value ?: contextGame.value ?: return false
+            val launchPath = if (game.uri.scheme == "file") {
+                game.uri.path ?: game.uri.toString()
+            } else {
+                game.uri.toString()
+            }
+            if (launchPath.isBlank() || path.isBlank()) return false
+            pendingFileLoadOnBoot = PendingFileLoad(path, onResult)
+            pendingSlotLoadOnBoot = null
+            pendingAutoLoadOnBoot = false
+            launchGame(launchPath, game)
+            return true
         }
 
         /**
@@ -1585,6 +1661,7 @@ open class MainActivityRuntime : ComponentActivity() {
             }
             if (launchPath.isBlank()) return false
             pendingSlotLoadOnBoot = slot
+            pendingFileLoadOnBoot = null
             pendingAutoLoadOnBoot = false
             launchGame(launchPath, game)
             return true
@@ -1714,9 +1791,11 @@ open class MainActivityRuntime : ComponentActivity() {
         fun onVmRunning() {
             adoptExternalGameIdentity()
             val requestedSlot = pendingSlotLoadOnBoot
-            val loadAutosave = pendingAutoLoadOnBoot && requestedSlot == null
-            if (requestedSlot == null && !loadAutosave) return
+            val requestedFile = pendingFileLoadOnBoot
+            val loadAutosave = pendingAutoLoadOnBoot && requestedSlot == null && requestedFile == null
+            if (requestedSlot == null && requestedFile == null && !loadAutosave) return
             pendingSlotLoadOnBoot = null
+            pendingFileLoadOnBoot = null
             pendingAutoLoadOnBoot = false
             val handler = android.os.Handler(android.os.Looper.getMainLooper())
             val tryLoad = object : Runnable {
@@ -1724,7 +1803,10 @@ open class MainActivityRuntime : ComponentActivity() {
                 var lastFrame = -1
                 var advancingPolls = 0
                 override fun run() {
-                    if (vmStopInProgress || eState.value == EmuState.STOPPED) return
+                    if (vmStopInProgress || eState.value == EmuState.STOPPED) {
+                        requestedFile?.onResult?.invoke(false)
+                        return
+                    }
                     // Wait until the renderer is actually PRESENTING frames before restoring the
                     // state. A boot-time load that fires as soon as the disc CRC is known — before
                     // the present loop is flowing — leaves the restored frame undisplayed (a black
@@ -1739,6 +1821,13 @@ open class MainActivityRuntime : ComponentActivity() {
                     lastFrame = frame
                     if (advancingPolls < 3) {
                         if (++attempts < 60) handler.postDelayed(this, 250)
+                        else requestedFile?.onResult?.invoke(false)
+                        return
+                    }
+                    if (requestedFile != null) {
+                        val status = runCatching { NativeApp.loadStateFromFile(requestedFile.path) }.getOrDefault(-1)
+                        if (status == 0 && ++attempts < 60) handler.postDelayed(this, 250)
+                        else requestedFile.onResult(status == 1)
                         return
                     }
                     val loaded = runCatching {
@@ -1750,6 +1839,47 @@ open class MainActivityRuntime : ComponentActivity() {
                 }
             }
             handler.postDelayed(tryLoad, 250)
+        }
+
+        /**
+         * Treat an install a launcher has already prepared as set up, without making anyone walk
+         * the wizard to say so (ARMSX2 #847, the check ARMSX3 #114 added, requested by
+         * carter-lilley).
+         *
+         * A launcher that installs ARMSX2, puts a BIOS in its BIOS folder and starts a game by
+         * path has done everything setup asks for, and then setup asked again. Worse, an external
+         * launch waits for setupComplete, so the game it was asked to start never booted.
+         *
+         * Checked against the filesystem rather than any flag a caller could set: a PS2 BIOS the
+         * wizard itself would accept, in the folder the core boots from, plus a game, either a
+         * ROMs folder already configured or the one this launch hands over. If placement failed,
+         * setup runs and the user can fix it, which is the failure a skip flag would have hidden.
+         *
+         * Persisted once decided, matching finishSetup, so a working install is not put back into
+         * setup by a later change to the folder.
+         */
+        private fun adoptPreparedSetup(context: Context, launchHasGame: Boolean) {
+            if (setupComplete.value) return
+            if (romsDirs.value.isEmpty() && !launchHasGame) return
+
+            // The wizard's own test (getBiosInfoFromFd), and not an arcade board's BIOS, which
+            // cannot start a PS2 disc. The chosen one comes first if it is still there.
+            fun ps2Bios(file: File): Boolean = file.isFile && !file.name.startsWith(".") && runCatching {
+                val fd = ParcelFileDescriptor.open(file, ParcelFileDescriptor.MODE_READ_ONLY).detachFd()
+                NativeApp.getBiosInfoFromFd(fd)?.let { !com.armsx2.arcade.Arcade.isArcadeBios(it) } == true
+            }.getOrDefault(false)
+            val chosen = bios.value?.takeIf { it.isNotEmpty() }?.let(::File)
+            val found = chosen?.takeIf(::ps2Bios)
+                ?: internalBiosDir(context).listFiles()?.sortedBy { it.name.lowercase() }?.firstOrNull(::ps2Bios)
+                ?: return
+
+            android.util.Log.i("ARMSX2", "setup: a BIOS and a game are already in place, skipping the wizard")
+            bios.value = found.absolutePath
+            prefs.edit(commit = true) {
+                putString("bios", found.absolutePath)
+                putBoolean("setupComplete", true)
+            }
+            setupComplete.value = true
         }
 
         fun finishSetup() {
@@ -2187,10 +2317,6 @@ open class MainActivityRuntime : ComponentActivity() {
         // the main thread, they held up the first screen long enough on an SD card for Android to report
         // the app as not responding.
 
-        // Point the ANGLE EGL env vars at the bundled libs (or clear them) before the
-        // GS thread ever opens a GL context. Re-applied per launch below too.
-        applyAngleEnv(applicationContext)
-
         // Keep the configured BIOS in app-private internal storage (NOT under a
         // custom/SD data root). The native core can't reliably open a BIOS off a
         // removable/SAF volume on Android 11+, so a data-root-on-SD setup failed VM
@@ -2594,13 +2720,19 @@ open class MainActivityRuntime : ComponentActivity() {
                 if (legacy != null) listOf(legacy) else emptyList()
             }
         }
+        romsDirsWithoutSubfolders.value =
+            runCatching { prefs.getStringSet(KEY_ROMS_DIRS_WITHOUT_SUBFOLDERS, null)?.toSet() }.getOrNull().orEmpty()
+        adoptPreparedSetup(applicationContext, launchHasGame = extractLaunchUri(intent) != null)
         // Setup recovery. Auto Backup can restore our prefs (incl. setupComplete + the
         // ROMs URIs) on reinstall, but SAF/all-files PERMISSIONS are never backed up — so
         // a restored setup can point at a folder we can no longer read, which would strand
         // the user in an empty library with the wizard skipped. If no configured ROMs
         // folder is actually reachable, drop setupComplete for this session so the wizard
         // re-runs (and re-requests the permission); finishSetup re-arms it.
-        if (setupComplete.value && !romsAccessible(this, romsDirs.value)) {
+        // Only when there IS a ROMs folder to lose. A launcher-prepared install has none (see
+        // adoptPreparedSetup), and romsAccessible counts an empty list as lost, which put the
+        // wizard straight back after the skip.
+        if (setupComplete.value && romsDirs.value.isNotEmpty() && !romsAccessible(this, romsDirs.value)) {
             setupComplete.value = false
             setupRecoveryNeeded.value = true
         }
@@ -3161,7 +3293,11 @@ open class MainActivityRuntime : ComponentActivity() {
                 Modifier.fillMaxSize(),
                 contentAlignment = Alignment.TopCenter,
             ) {
-                com.armsx2.ui.friends.FriendOnlineBanner()
+                androidx.compose.foundation.layout.Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    com.armsx2.ui.friends.FriendOnlineBanner()
+                    // Remote play: a friend joining or leaving as player 2, for the host.
+                    com.armsx2.remoteplay.RemotePlayNoticeBanner()
+                }
             }
             }
         }
@@ -3206,7 +3342,34 @@ open class MainActivityRuntime : ComponentActivity() {
         return event.keyCode
     }
 
+    private fun dispatchSystemImeKeyEvent(event: KeyEvent): Boolean {
+        val kc = event.keyCode
+        val isController = event.isFromSource(InputDevice.SOURCE_GAMEPAD) ||
+            event.isFromSource(InputDevice.SOURCE_JOYSTICK)
+        if (kc != KeyEvent.KEYCODE_BACK && !isController) {
+            return when (kc) {
+                KeyEvent.KEYCODE_TAB, KeyEvent.KEYCODE_NAVIGATE_NEXT, KeyEvent.KEYCODE_NAVIGATE_PREVIOUS -> true
+                // Alt+Up/Down are the field's Home/End; plain Up/Down would only move focus.
+                KeyEvent.KEYCODE_DPAD_UP, KeyEvent.KEYCODE_DPAD_DOWN ->
+                    if (event.isAltPressed) super.dispatchKeyEvent(event) else true
+                else -> super.dispatchKeyEvent(event)
+            }
+        }
+        if (event.action == KeyEvent.ACTION_DOWN && event.repeatCount == 0) {
+            when (kc) {
+                KeyEvent.KEYCODE_BUTTON_A, KeyEvent.KEYCODE_DPAD_CENTER,
+                KeyEvent.KEYCODE_BUTTON_B, KeyEvent.KEYCODE_BACK ->
+                    com.armsx2.ui.home.LibraryKeyboard.close()
+                KeyEvent.KEYCODE_BUTTON_X -> com.armsx2.ui.home.LibraryKeyboard.backspace()
+            }
+        }
+        return true
+    }
+
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+        // Before anything can consume it: whether the pad is driving the menus decides whether
+        // selection highlights show at all.
+        com.armsx2.ui.common.PadInput.onKey(event)
         // The library screensaver sees every key first: any input resets its clock, and the press
         // that wakes it goes no further, so it can't also start a game.
         if (com.armsx2.ui.home.LibraryScreensaver.onKey(event)) return true
@@ -3454,6 +3617,9 @@ open class MainActivityRuntime : ComponentActivity() {
         if (com.armsx2.ui.home.LibraryKeyboard.visible.value) {
             // The phone's volume keys stay the system's, as they are with any modal up.
             if (isVolumeKey(kc)) return false
+            if (com.armsx2.ui.home.LibraryKeyboard.useSystemIme.value) {
+                return dispatchSystemImeKeyEvent(event)
+            }
             if (event.action == KeyEvent.ACTION_DOWN) {
                 when (kc) {
                     KeyEvent.KEYCODE_DPAD_UP -> com.armsx2.ui.home.LibraryKeyboard.move(0, -1)
@@ -3826,18 +3992,15 @@ open class MainActivityRuntime : ComponentActivity() {
                     return true
                 }
                 ControllerMappings.SysHotkey.ACHIEVEMENTS -> {
-                    if (down) com.armsx2.ui.emulation.EmulationMenuInputController.open(com.armsx2.ui.emulation.EmulationMenuTab.Options)
+                    if (down) com.armsx2.ui.emulation.EmulationMenuInputController.open(com.armsx2.ui.emulation.EmulationMenuTab.Achievements)
                     return true
                 }
                 ControllerMappings.SysHotkey.CLOSE_GAME -> {
-                    if (down) closeGame()
+                    if (down && event.repeatCount == 0) confirmCloseGame(quit = false)
                     return true
                 }
                 ControllerMappings.SysHotkey.QUIT_APP -> {
-                    // Stop the VM (flushes memcards/savestate), then finish the app once
-                    // the VM has fully unwound — never finish inline (stop() is async).
-                    if (down) { quitAfterStop = true; stop()
-                    }
+                    if (down && event.repeatCount == 0) confirmCloseGame(quit = true)
                     return true
                 }
                 ControllerMappings.SysHotkey.SAVE_AND_EXIT -> {
@@ -4234,6 +4397,8 @@ open class MainActivityRuntime : ComponentActivity() {
     // on every other device — see maybeCorrectTouchScale). ALWAYS returns super, so it can never
     // block or consume a tap.
     override fun dispatchTouchEvent(ev: MotionEvent): Boolean {
+        // A touch hands the menus back from the pad, so selection highlights hide (PadInput).
+        com.armsx2.ui.common.PadInput.onTouch(ev)
         if (com.armsx2.ui.home.LibraryScreensaver.onTouch(ev)) return true
         maybeCorrectTouchScale(ev)
         return super.dispatchTouchEvent(ev)
@@ -4471,6 +4636,7 @@ open class MainActivityRuntime : ComponentActivity() {
     }
 
     override fun dispatchGenericMotionEvent(ev: MotionEvent): Boolean {
+        com.armsx2.ui.common.PadInput.onMotion(ev)
         if (com.armsx2.ui.home.LibraryScreensaver.onMotion(ev)) return true
         // Controller-input diagnostic (ARMSX2_JOYCON): logged before ANY gate so it
         // captures the raw axes even mid-(re)bind and for SOURCE_DPAD-only events the
@@ -5558,10 +5724,9 @@ open class MainActivityRuntime : ComponentActivity() {
             ControllerMappings.SysHotkey.GYRO_RECENTER -> recenterGyro()
             ControllerMappings.SysHotkey.RES_UP -> stepResolution(1)
             ControllerMappings.SysHotkey.RES_DOWN -> stepResolution(-1)
-            ControllerMappings.SysHotkey.ACHIEVEMENTS -> com.armsx2.ui.emulation.EmulationMenuInputController.open(com.armsx2.ui.emulation.EmulationMenuTab.Options)
-            ControllerMappings.SysHotkey.CLOSE_GAME -> closeGame()
-            ControllerMappings.SysHotkey.QUIT_APP -> { quitAfterStop = true; stop()
-            }
+            ControllerMappings.SysHotkey.ACHIEVEMENTS -> com.armsx2.ui.emulation.EmulationMenuInputController.open(com.armsx2.ui.emulation.EmulationMenuTab.Achievements)
+            ControllerMappings.SysHotkey.CLOSE_GAME -> confirmCloseGame(quit = false)
+            ControllerMappings.SysHotkey.QUIT_APP -> confirmCloseGame(quit = true)
             ControllerMappings.SysHotkey.SAVE_AND_EXIT -> closeGame(saveAutosave = true)
             ControllerMappings.SysHotkey.RESET_GAME -> restart()
             ControllerMappings.SysHotkey.SLOW_DOWN -> toggleSlowDown()
@@ -5905,6 +6070,22 @@ open class MainActivityRuntime : ComponentActivity() {
         com.armsx2.LibraryMusic.pause()
         // Pause-menu track was already paused by setForeground(false) at the top of onPause.
         super.onPause()
+    }
+
+    // Stopped, not paused: a split-screen or picture-in-picture app is paused but still in sight.
+    // The overlay pause opened in onPause keeps the game's audio device running for a quick
+    // resume; out of sight that only kept Android's audio mixer holding a wakelock all night with
+    // the device locked (#825, #817). Native pauses it for real until onStart. Discord idles too.
+    override fun onStart() {
+        super.onStart()
+        runCatching { NativeApp.setAppBackgrounded(false) }
+        com.armsx2.DiscordPresence.setForeground(true)
+    }
+
+    override fun onStop() {
+        runCatching { NativeApp.setAppBackgrounded(true) }
+        com.armsx2.DiscordPresence.setForeground(false)
+        super.onStop()
     }
 
     override fun onResume() {

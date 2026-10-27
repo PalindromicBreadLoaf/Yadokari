@@ -10,8 +10,10 @@
 #include "GS/Renderers/Common/GSSnapshotPolicy.h"
 #include "GS/DriverReport/GSDriverReport.h"
 #include "GS/GSDump.h"
+#include "GS/GSDumpBundle.h"
 #include "GS/GSGL.h"
 #include "GS/GSPerfMon.h"
+#include "GS/GSRemotePlay.h"
 #include "GS/GSUtil.h"
 #include "GSDumpReplayer.h"
 #ifdef ENABLE_VULKAN
@@ -226,6 +228,18 @@ bool GSRenderer::Merge(int field)
 	}
 	field_render_is_whole_picture &= isReallyInterlaced() && !m_scanmask_used;
 
+	// A movie is playing while the IPU keeps decoding pictures (see SelectGSInterlaceMode).
+	const u32 video_decodes = GSGetVideoDecodeCount();
+	if (video_decodes != m_video_decode_count)
+	{
+		m_video_decode_count = video_decodes;
+		m_video_merges_left = VIDEO_MERGES;
+	}
+	else if (m_video_merges_left > 0)
+	{
+		m_video_merges_left--;
+	}
+
 	// FFMD (half frames) requires blend deinterlacing, so automatically use that. Same when SCANMSK is used but not blended in the merge circuit (Alpine Racer 3).
 	// Centralised in GSInterlaceModePolicy.h so the progressive pass-through case (shader_mode -1)
 	// is pinned by static_assert and unit tests rather than resting on the sign behaviour of a
@@ -236,7 +250,8 @@ bool GSRenderer::Merge(int field)
 		game_deinterlacing,
 		m_regs->SMODE2.FFMD,
 		scanmask_frame,
-		field_render_is_whole_picture);
+		field_render_is_whole_picture,
+		GSConfig.MovieCombDeinterlace && m_video_merges_left > 0);
 	const int field2 = interlace_selection.field_offset;
 	const bool present_field_direct = interlace_selection.present_field_direct;
 	int mode = interlace_selection.shader_mode;
@@ -408,7 +423,12 @@ bool GSRenderer::Merge(int field)
 		// circuit the bob offset is taken from.
 		const GSFieldPadRows field_pad = top_pad[tex[1] ? 1 : 0];
 
-		g_gs_device->Interlace(fs, field ^ field2, mode, offset, field_pad);
+		// The comb pass works in the native lines of the circuit's picture. The field on screen shows
+		// the framebuffer lines of its parity, which start at the framebuffer rect's top.
+		const int circuit = tex[1] ? 1 : 0;
+		const int fb_top = PCRTCDisplays.PCRTCDisplays[circuit].framebufferRect.y + y_offset[circuit];
+		const int interlace_field = (mode == 4) ? (field ^ field2 ^ (fb_top & 1)) : (field ^ field2);
+		g_gs_device->Interlace(fs, interlace_field, mode, offset, field_pad, tex_scale[circuit], dst[circuit].y);
 	}
 
 	// Adaptive deinterlacing consumes prior fields. A skipped interlaced frame must update that
@@ -442,7 +462,7 @@ bool GSRenderer::Merge(int field)
 	// from the texture, so it would then letterbox the already-stretched result instead of
 	// correcting it. Matching the draw rect keeps the final present a 1:1 blit.
 	//
-	// m_real_size is deliberately left alone: in CalculateDrawSrcRect it only scales user Crop
+	// m_real_size is deliberately left alone: in CalculateDrawSrcRect it only scales the Crop
 	// values (with no crop the src rect is the whole texture either way), so holding it at the
 	// internal size keeps crop proportional to the frame rather than to the shaded target.
 	if (GSConfig.ShaderChainEnabled && !GSConfig.ShaderChainPreset.empty())
@@ -703,10 +723,13 @@ static GSVector4i CalculateDrawSrcRect(const GSTexture* src, const GSVector2i re
 	const GSVector2i size(src->GetSize());
 	const GSVector2 scale = GSVector2(size.x, size.y) / GSVector2(real_size.x, real_size.y).max(GSVector2(0.1f, 0.1f));
 	const float upscale = GSIsHardwareRenderer() ? GSConfig.UpscaleMultiplier : 1;
-	const int left = static_cast<int>(static_cast<float>(GSConfig.Crop[0] * scale.x) * upscale);
-	const int top = static_cast<int>(static_cast<float>(GSConfig.Crop[1] * scale.y) * upscale);
-	const int right =  size.x - static_cast<int>(static_cast<float>(GSConfig.Crop[2] * scale.x) * upscale);
-	const int bottom = size.y - static_cast<int>(static_cast<float>(GSConfig.Crop[3] * scale.y) * upscale);
+	// Upscaled hardware rendering often leaves garbage in the outermost row/column of the
+	// frame. Rather than chase each cause, trim one native pixel off every edge.
+	const int trim = (GSConfig.TrimUpscaledEdges && upscale >= 2.0f) ? 1 : 0;
+	const int left = static_cast<int>(static_cast<float>((GSConfig.Crop[0] + trim) * scale.x) * upscale);
+	const int top = static_cast<int>(static_cast<float>((GSConfig.Crop[1] + trim) * scale.y) * upscale);
+	const int right =  size.x - static_cast<int>(static_cast<float>((GSConfig.Crop[2] + trim) * scale.x) * upscale);
+	const int bottom = size.y - static_cast<int>(static_cast<float>((GSConfig.Crop[3] + trim) * scale.y) * upscale);
 	return GSVector4i(left, top, right, bottom);
 }
 
@@ -717,14 +740,16 @@ static const char* GetScreenshotSuffix()
 	return suffixes[static_cast<u8>(GSConfig.ScreenshotFormat)];
 }
 
-static void CompressAndWriteScreenshot(std::string filename, u32 width, u32 height, std::vector<u32> pixels)
+// `announce` false is a screenshot that goes into a dump's zip: the file is gone by the time the OSD
+// would name it, and the dump's own message names the zip.
+static void CompressAndWriteScreenshot(std::string filename, u32 width, u32 height, std::vector<u32> pixels, bool announce = true)
 {
 	RGBA8Image image;
 	image.SetPixels(width, height, std::move(pixels));
 
 	std::string key(fmt::format("GSScreenshot_{}", filename));
 
-	if (!GSDumpReplayer::IsRunner())
+	if (announce && !GSDumpReplayer::IsRunner())
 	{
 		Host::AddIconOSDMessage(key, ICON_FA_CAMERA,
 			fmt::format(TRANSLATE_FS("GS", "Saving screenshot to '{}'."), Path::GetFileName(filename)), 60.0f);
@@ -736,10 +761,10 @@ static void CompressAndWriteScreenshot(std::string filename, u32 width, u32 heig
 #endif
 	std::unique_lock lock(s_screenshot_threads_mutex);
 	s_screenshot_threads.emplace_back([key = std::move(key), filename = std::move(filename), image = std::move(image),
-										  quality = GSConfig.ScreenshotQuality]() {
+										  quality = GSConfig.ScreenshotQuality, announce]() {
 		if (image.SaveToFile(filename.c_str(), quality))
 		{
-			if (!GSDumpReplayer::IsRunner())
+			if (announce && !GSDumpReplayer::IsRunner())
 			{
 				Host::AddIconOSDMessage(std::move(key), ICON_FA_CAMERA,
 					fmt::format(TRANSLATE_FS("GS", "Saved screenshot to '{}'."), Path::GetFileName(filename)),
@@ -969,6 +994,31 @@ void GSRenderer::UpdateVsyncNeedsMTGS()
 {
 	m_vsync_needs_mtgs.store(!m_snapshot.empty() || m_dump || m_dump_frames != 0, std::memory_order_release);
 }
+
+#ifdef __ANDROID__
+// Remote play: where the picture goes in the stream's frame, as fractions of it (x, y, width,
+// height). The friend sees it as this screen shows it, aspect ratio and all, with black around it;
+// a stretched picture fills the frame, since the friend's screen has its own shape to stretch to.
+static GSVector4 RemotePlayArea(const GSVector4& draw_rect)
+{
+	const u32 size = GSRemotePlay::g_max_size.load(std::memory_order_relaxed);
+	const float frame_w = static_cast<float>(size >> 16);
+	const float frame_h = static_cast<float>(size & 0xffff);
+	const float draw_w = draw_rect.z - draw_rect.x;
+	const float draw_h = draw_rect.w - draw_rect.y;
+	if (GSConfig.AspectRatio == AspectRatioType::Stretch || frame_w <= 0.0f || frame_h <= 0.0f || draw_w <= 0.0f ||
+		draw_h <= 0.0f)
+	{
+		return GSVector4(0.0f, 0.0f, 1.0f, 1.0f);
+	}
+
+	// draw_rect is in the window as the player holds it, so a rotated screen needs no correction.
+	const float ratio = (draw_w / draw_h) / (frame_w / frame_h);
+	if (ratio >= 1.0f)
+		return GSVector4(0.0f, (1.0f - 1.0f / ratio) * 0.5f, 1.0f, 1.0f / ratio);
+	return GSVector4((1.0f - ratio) * 0.5f, 0.0f, ratio, 1.0f);
+}
+#endif
 
 void GSRenderer::VSync(u32 field, bool registers_written, bool idle_frame)
 {
@@ -1307,6 +1357,15 @@ void GSRenderer::VSync(u32 field, bool registers_written, bool idle_frame)
 			}
 		}
 
+#ifdef __ANDROID__
+		// Remote play takes the frame as it is about to be shown, upscaled and sharpened, before the
+		// present pass opens. A blank frame goes out black, as the screen shows it.
+		if (current && !blank_frame)
+			g_gs_device->RemotePlayVSync(current, src_uv, RemotePlayArea(draw_rect));
+		else
+			g_gs_device->RemotePlayVSync(nullptr, GSVector4::zero(), GSVector4::zero());
+#endif
+
 		if (BeginPresentFrame(false))
 		{
 			if (current && !blank_frame)
@@ -1327,7 +1386,7 @@ void GSRenderer::VSync(u32 field, bool registers_written, bool idle_frame)
 					GSConfig.Upscaler == GSUpscaler::Off && GSConfig.CASMode == GSCASMode::Disabled &&
 						s_tv_shader_indices[GSConfig.TVShader] == PresentShader::COPY &&
 						GSConfig.LinearPresent != GSPostBilinearMode::BilinearSharp &&
-						GSConfig.Rotation == DisplayRotation::Rot0 && !g_gs_device->UsesLowerLeftOrigin());
+						g_gs_device->GetPresentRotation() == DisplayRotation::Rot0 && !g_gs_device->UsesLowerLeftOrigin());
 			}
 
 			EndPresentFrame();
@@ -1348,6 +1407,7 @@ void GSRenderer::VSync(u32 field, bool registers_written, bool idle_frame)
 	{
 		u32 screenshot_width, screenshot_height;
 		std::vector<u32> screenshot_pixels;
+		const std::string screenshot_path = fmt::format("{}.{}", m_snapshot, GetScreenshotSuffix());
 
 		if (GSConfig.LinearPresent == GSPostBilinearMode::BilinearSharp)
 		{
@@ -1425,10 +1485,16 @@ void GSRenderer::VSync(u32 field, bool registers_written, bool idle_frame)
 			// Which driver drew this, beside the dump. Never fails the dump.
 			GSDriverReport::WriteSidecarForDump(m_snapshot);
 
+			// The dump, the driver report and the screenshot reach the user as one zip. The dump
+			// streams to disk now and packs them when it closes, which is the first moment all
+			// three are complete.
+			m_dump->SetBundle(GSDumpBundle::ZipPath(m_snapshot),
+				{GSDriverReport::SidecarPath(m_snapshot), screenshot_path});
+
 			Host::AddKeyedOSDMessage("GSDump",
 				fmt::format(TRANSLATE_FS("GS", "Saving {0} GS dump {1} to '{2}'"),
 					(m_dump_frames == 1) ? TRANSLATE_SV("GS", "single frame") : TRANSLATE_SV("GS", "multi-frame"), compression_str,
-					Path::GetFileName(m_dump->GetPath())),
+					Path::GetFileName(m_dump->GetFinalPath())),
 				Host::OSD_INFO_DURATION);
 		}
 
@@ -1441,8 +1507,8 @@ void GSRenderer::VSync(u32 field, bool registers_written, bool idle_frame)
 			aspect_correct, true,
 			&screenshot_width, &screenshot_height, &screenshot_pixels))
 		{
-			CompressAndWriteScreenshot(fmt::format("{}.{}", m_snapshot, GetScreenshotSuffix()),
-				screenshot_width, screenshot_height, std::move(screenshot_pixels));
+			CompressAndWriteScreenshot(screenshot_path,
+				screenshot_width, screenshot_height, std::move(screenshot_pixels), !snapshot_action.open_dump);
 		}
 		else
 		{
@@ -1461,8 +1527,9 @@ void GSRenderer::VSync(u32 field, bool registers_written, bool idle_frame)
 		if (m_dump->VSync(field, snapshot_action.dump_is_last, m_regs))
 		{
 			Host::AddKeyedOSDMessage("GSDump",
-				fmt::format(TRANSLATE_FS("GS", "Saved GS dump to '{}'."), Path::GetFileName(m_dump->GetPath())),
+				fmt::format(TRANSLATE_FS("GS", "Saved GS dump to '{}'."), Path::GetFileName(m_dump->GetFinalPath())),
 				Host::OSD_INFO_DURATION);
+			// Closes the dump and packs the zip. A failed pack replaces the message above.
 			m_dump.reset();
 		}
 		else if (!snapshot_action.dump_is_last)

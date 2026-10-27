@@ -391,6 +391,7 @@ const char* GpuProfileDetector::WorkaroundToString(DriverWorkaround value)
 		case DriverWorkaround::DisableStencilBuffer: return "DisableStencilBuffer";
 		case DriverWorkaround::PreferVulkanRenderer: return "PreferVulkanRenderer";
 		case DriverWorkaround::PreferCachedStreamRingMemory: return "PreferCachedStreamRingMemory";
+		case DriverWorkaround::ReadBackRemotePlayFrames: return "ReadBackRemotePlayFrames";
 		case DriverWorkaround::Count:
 		default: return "Unknown";
 	}
@@ -495,7 +496,8 @@ GpuProfileSelection GpuProfileDetector::Resolve(std::string_view override_value,
 
 	if (selection.override_mode == GpuProfileOverride::Adreno)
 	{
-		ApplyResolvedProfile(selection, RuntimeGpuProfile::Adreno, GpuProfileDetail::ResolveAdrenoProfile(lowered_hints));
+		ApplyResolvedProfile(selection, RuntimeGpuProfile::Adreno,
+			GpuProfileDetail::ResolveAdrenoProfile(lowered_hints, driver_context.vendor_id, driver_context.device_id));
 		return finalize();
 	}
 
@@ -517,7 +519,8 @@ GpuProfileSelection GpuProfileDetector::Resolve(std::string_view override_value,
 
 	if (GpuProfileDetail::LooksLikeAdreno(lowered_hints))
 	{
-		ApplyResolvedProfile(selection, RuntimeGpuProfile::Adreno, GpuProfileDetail::ResolveAdrenoProfile(lowered_hints));
+		ApplyResolvedProfile(selection, RuntimeGpuProfile::Adreno,
+			GpuProfileDetail::ResolveAdrenoProfile(lowered_hints, driver_context.vendor_id, driver_context.device_id));
 	}
 	else if (GpuProfileDetail::LooksLikePowerVR(lowered_hints))
 	{

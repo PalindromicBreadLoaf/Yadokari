@@ -16,13 +16,19 @@
 #include <atomic>
 #include <chrono>
 #include <cinttypes>
+#include <condition_variable>
+#include <deque>
+#include <filesystem>
+#include <functional>
 #include <cstdio>
 #include <cstring>
 #include <mutex>
 #include <optional>
 #include <string>
+#include <system_error>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -61,10 +67,8 @@ struct VersionHeader
 };
 static_assert(sizeof(VersionHeader) == 64, "VersionHeader layout drift");
 
-// On-disk header for an IndexEntry. Each record is the 64-byte header
-// followed by `entryCount` × u32 entry-PC values (microMem byte
-// offsets). entryCount must be >= 1 for a valid entry; entryCount == 0
-// indicates a tombstone alongside the flags-bit-0 check.
+// One INDEX record: a fixed 64 bytes, appended whole. A record whose
+// flags bit 0 is clear is a tombstone and is skipped on load.
 struct IndexEntryHeader
 {
 	XXH128_hash_t contentHash;  // 16 — the program's identity
@@ -75,21 +79,11 @@ struct IndexEntryHeader
 	u32           flags;        //  4 — bit 0 = valid; tombstones leave it clear
 	u64           lastUsedNs;   //  8
 	u64           execCount;    //  8 — running dispatch count, reserved
-	u32           entryCount;   //  4 — number of trailing u32 entry-PC values
-	u8            pad[12];      // 12 — round to 64 for trivial mmap
+	u8            pad[16];      // 16 — round to 64 for trivial mmap
 };
 static_assert(sizeof(IndexEntryHeader) == 64,
               "IndexEntryHeader layout drift");
 #pragma pack(pop)
-
-// In-memory companion. Holds the on-disk header plus the trailing
-// entry-PC list. Tests + dispatcher consume IndexEntry; serialization
-// in/out of disk uses IndexEntryHeader + the appended u32 array.
-struct IndexEntry
-{
-	IndexEntryHeader hdr;
-	std::vector<u32> entry_pcs;
-};
 
 struct State
 {
@@ -99,7 +93,7 @@ struct State
 	std::string indexPath;   // $root/INDEX
 	std::string versionPath; // $root/VERSION
 
-	std::unordered_map<XXH128_hash_t, IndexEntry,
+	std::unordered_map<XXH128_hash_t, IndexEntryHeader,
 	                   MvuContentHashHash, MvuContentHashEq> entries;
 
 	u64 wouldBeHits        = 0;
@@ -125,11 +119,46 @@ struct State
 	std::thread       preloadThread;
 	std::mutex        preloadMutex;
 	std::atomic<bool> preloadStop{false};
+	std::atomic<bool> preloadHold{false}; // test hooks, see TestHoldPreload
+	std::atomic<bool> preloadHeld{false};
 	std::unordered_map<XXH128_hash_t, std::vector<u8>,
 	                   MvuContentHashHash, MvuContentHashEq> preloaded;
+	// The hashes this session has written a payload or a sidecar for, under preloadMutex. The preload
+	// reads a file and puts it in `preloaded` a moment later, and a program that appears in between reads
+	// the file itself and may write a newer one: what the preload then holds is the file from before, and
+	// must not be answered after the newer one is on disk. A hash in these sets is never put in the maps.
+	std::unordered_set<XXH128_hash_t, MvuContentHashHash, MvuContentHashEq> payloadsWritten;
+	std::unordered_set<XXH128_hash_t, MvuContentHashHash, MvuContentHashEq> sidecarsWritten;
 	u64 preloadedPayloads = 0;
 	u64 preloadedBytes    = 0;
 	u64 preloadHits       = 0;
+	// vu-aot sidecars the preload read (consumed by ReadSidecar, like the payloads).
+	std::unordered_map<XXH128_hash_t, std::vector<u8>,
+	                   MvuContentHashHash, MvuContentHashEq> preloadedSidecars;
+	u64 sidecarsPreloaded   = 0;
+	u64 sidecarPreloadBytes = 0;
+	u64 sidecarPreloadHits  = 0;
+	u64 sidecarReads        = 0;
+	u64 preloadBudgetHit    = 0;
+	u64 preloadWantedBytes  = 0;
+	u64 preloadReadBytes    = 0; // payload + sidecar bytes the preload read, over the session
+	u64 ageOutFiles         = 0; // files the preload's age-out pass deleted
+	u64 ageOutBytes         = 0;
+	size_t preloadBudget    = 0; // 0: kPreloadBudgetBytes (a test sets another)
+
+	// The sidecar writer (QueueSidecar): one thread, started by the first request and stopped
+	// (after draining its queue) by Close. writerMutex guards the queue and the flags; the writer
+	// reads `root`, which stays fixed while the cache is initialized.
+	std::thread             writerThread;
+	std::mutex              writerMutex;
+	std::condition_variable writerCv;     // work queued, or stop
+	std::condition_variable writerIdleCv; // queue empty and nothing being written
+	std::deque<XXH128_hash_t> writerOrder;
+	std::unordered_map<XXH128_hash_t, std::function<std::vector<u8>()>,
+	                   MvuContentHashHash, MvuContentHashEq> writerQueue;
+	bool writerStop = false;
+	bool writerBusy = false;
+	std::atomic<u64> sidecarWrites{0}, sidecarWriteBytes{0}, sidecarSkips{0};
 
 	void StopPreload()
 	{
@@ -138,10 +167,30 @@ struct State
 			preloadThread.join();
 	}
 
+	// Writes whatever is queued, then ends the writer thread.
+	void StopWriter()
+	{
+		{
+			std::lock_guard<std::mutex> lock(writerMutex);
+			writerStop = true;
+		}
+		writerCv.notify_all();
+		if (writerThread.joinable())
+			writerThread.join();
+		std::lock_guard<std::mutex> lock(writerMutex);
+		writerStop = false;
+		writerOrder.clear();
+		writerQueue.clear();
+	}
+
 	// Joinable-thread backstop: a std::thread destroyed while joinable
 	// terminates the process. Close/ResetForTest join explicitly; this
 	// covers exit paths that skip mVUclose.
-	~State() { StopPreload(); }
+	~State()
+	{
+		StopPreload();
+		StopWriter();
+	}
 };
 
 static State g_state[2];
@@ -184,7 +233,7 @@ static bool WriteVersion(const std::string& path, const VersionHeader& hdr)
 	const std::string tmp = path + ".tmp";
 	if (!FileSystem::WriteBinaryFile(tmp.c_str(), &hdr, sizeof(hdr)))
 		return false;
-	return std::rename(tmp.c_str(), path.c_str()) == 0;
+	return FileSystem::RenamePath(tmp.c_str(), path.c_str());
 }
 
 static void EvictStaleCache(State& s)
@@ -205,13 +254,11 @@ static void EvictStaleCache(State& s)
 	}
 }
 
-// Parse a variable-length INDEX. Each record is a fixed 64-byte
-// IndexEntryHeader followed by `entryCount` × u32 entry-PC values.
-// Truncated tails (partial header, partial trailing array) are silently
-// dropped — the next SaveProgram will rewrite a clean copy, and the
-// partial bytes don't poison any in-memory state. Last-writer-wins on
-// duplicate contentHash so re-saves can extend a program's entry list
-// in place.
+// Parse the INDEX: a stream of fixed 64-byte IndexEntryHeader records.
+// A truncated tail (partial record) is dropped with a warning — the next
+// SaveProgram appends a clean record, and the partial bytes don't poison
+// any in-memory state. Last-writer-wins on duplicate contentHash so a
+// re-save (payload growth) supersedes the earlier record.
 static void LoadIndex(State& s)
 {
 	auto bytes = FileSystem::ReadBinaryFile(s.indexPath.c_str());
@@ -226,75 +273,39 @@ static void LoadIndex(State& s)
 		std::memcpy(&hdr, base + off, sizeof(hdr));
 		off += sizeof(hdr);
 
-		const size_t trail_bytes = static_cast<size_t>(hdr.entryCount) * sizeof(u32);
-		if (off + trail_bytes > total)
-		{
-			Console.Warning("mVUProgCache: INDEX %s truncated at off=%zu "
-			                "(need %zu trailing bytes, have %zu) — ignoring tail",
-			                s.indexPath.c_str(), off, trail_bytes,
-			                total - off);
-			return;
-		}
+		if ((hdr.flags & 1u) == 0u)
+			continue; // tombstone
 
-		if ((hdr.flags & 1u) == 0u || hdr.entryCount == 0u)
-		{
-			off += trail_bytes;
-			continue;
-		}
-
-		IndexEntry e;
-		e.hdr = hdr;
-		e.entry_pcs.resize(hdr.entryCount);
-		std::memcpy(e.entry_pcs.data(), base + off, trail_bytes);
-		off += trail_bytes;
-
-		s.entries[hdr.contentHash] = std::move(e); // last-writer-wins
+		s.entries[hdr.contentHash] = hdr; // last-writer-wins
 	}
 	if (off != total)
 	{
 		Console.Warning("mVUProgCache: INDEX %s has %zu trailing bytes past last "
-		                "header — ignoring", s.indexPath.c_str(), total - off);
+		                "record — ignoring", s.indexPath.c_str(), total - off);
 	}
 }
 
-// Serialize one in-memory IndexEntry as a single contiguous
-// header+trailing block. Single fwrite keeps the append atomic against
-// process death between header and trailing writes.
-static bool AppendIndexEntry(const State& s, const IndexEntry& e)
+// Append one record with a single fwrite, so a process death can't leave a
+// header without its tail.
+static bool AppendIndexEntry(const State& s, const IndexEntryHeader& e)
 {
 	std::FILE* fp = FileSystem::OpenCFile(s.indexPath.c_str(), "ab");
 	if (!fp)
 		return false;
-
-	std::vector<u8> buf(sizeof(IndexEntryHeader)
-	                    + e.entry_pcs.size() * sizeof(u32));
-	std::memcpy(buf.data(), &e.hdr, sizeof(IndexEntryHeader));
-	if (!e.entry_pcs.empty())
-	{
-		std::memcpy(buf.data() + sizeof(IndexEntryHeader),
-		            e.entry_pcs.data(),
-		            e.entry_pcs.size() * sizeof(u32));
-	}
-	const bool ok = std::fwrite(buf.data(), buf.size(), 1, fp) == 1;
+	const bool ok = std::fwrite(&e, sizeof(e), 1, fp) == 1;
 	std::fclose(fp);
 	return ok;
 }
 
 // Persist an entry: append to disk + register in the in-memory map.
-// Keeps header.entryCount and entry_pcs.size() in lock-step — callers
-// populate entry_pcs; this is the single point that updates the
-// on-disk count field.
-static bool PersistIndexEntry(State& s, const IndexEntry& e_in)
+static bool PersistIndexEntry(State& s, const IndexEntryHeader& e)
 {
-	IndexEntry e = e_in;
-	e.hdr.entryCount = static_cast<u32>(e.entry_pcs.size());
-
 	if (!AppendIndexEntry(s, e))
 	{
-		Console.Warning("mVUProgCache[%u]: INDEX append failed", e.hdr.vuIndex);
+		Console.Warning("mVUProgCache[%u]: INDEX append failed", e.vuIndex);
 		return false;
 	}
-	s.entries[e.hdr.contentHash] = std::move(e);
+	s.entries[e.contentHash] = e;
 	++s.savesWritten;
 	return true;
 }
@@ -307,11 +318,12 @@ static bool PersistIndexEntry(State& s, const IndexEntry& e_in)
 //------------------------------------------------------------------
 
 static std::string PayloadPath(const State& s, const XXH128_hash_t& hash,
-                                std::string* out_shard_dir = nullptr)
+                                std::string* out_shard_dir = nullptr,
+                                const char* extension = ".vuprog")
 {
 	char name[48];
-	std::snprintf(name, sizeof(name), "%016" PRIx64 "%016" PRIx64 ".vuprog",
-		hash.high64, hash.low64);
+	std::snprintf(name, sizeof(name), "%016" PRIx64 "%016" PRIx64 "%s",
+		hash.high64, hash.low64, extension);
 	const char shard[3] = {name[0], name[1], 0};
 	std::string shard_dir = Path::Combine(s.root, shard);
 	std::string path = Path::Combine(shard_dir, name);
@@ -336,14 +348,16 @@ static bool WritePayload(State& s, const XXH128_hash_t& hash,
 	const std::string tmp = path + ".tmp";
 	if (!FileSystem::WriteBinaryFile(tmp.c_str(), image.data(), image.size()))
 		return false;
-	if (std::rename(tmp.c_str(), path.c_str()) != 0)
+	if (!FileSystem::RenamePath(tmp.c_str(), path.c_str()))
 		return false;
 
 	// A rewritten payload supersedes any not-yet-consumed preloaded copy
 	// (which would otherwise serve the pre-growth image — sound under the
-	// consistent-prefix rule, but pointlessly stale).
+	// consistent-prefix rule, but pointlessly stale), and one the preload
+	// has read and not yet put in memory (payloadsWritten).
 	{
 		std::lock_guard<std::mutex> lock(s.preloadMutex);
+		s.payloadsWritten.insert(hash);
 		auto pit = s.preloaded.find(hash);
 		if (pit != s.preloaded.end())
 		{
@@ -354,10 +368,102 @@ static bool WritePayload(State& s, const XXH128_hash_t& hash,
 	return true;
 }
 
-// Read the payload-bearing INDEX entries into RAM on a background thread,
-// most-recently-used first, bounded by kPreloadBudgetBytes. The bound is a
-// cap, not a target — resident cost matters on low-memory devices, but
-// buffers drain as hydrations consume them.
+static constexpr char kSidecarExtension[] = ".vuaot";
+
+static std::string SidecarPath(const State& s, const XXH128_hash_t& hash,
+                                std::string* out_shard_dir = nullptr)
+{
+	return PayloadPath(s, hash, out_shard_dir, kSidecarExtension);
+}
+
+// The sidecar writer's loop: one request at a time, tmp + rename, until stopped with nothing left.
+static void SidecarWriterLoop(State& s)
+{
+	std::unique_lock<std::mutex> lock(s.writerMutex);
+	for (;;)
+	{
+		s.writerCv.wait(lock, [&] { return s.writerStop || !s.writerOrder.empty(); });
+		if (s.writerOrder.empty())
+			break; // (stopping, and drained)
+		const XXH128_hash_t hash = s.writerOrder.front();
+		s.writerOrder.pop_front();
+		auto it = s.writerQueue.find(hash);
+		if (it == s.writerQueue.end())
+			continue;
+		std::function<std::vector<u8>()> build = std::move(it->second);
+		s.writerQueue.erase(it);
+		s.writerBusy = true;
+		lock.unlock();
+
+		const std::vector<u8> bytes = build();
+		if (bytes.empty())
+			s.sidecarSkips.fetch_add(1, std::memory_order_relaxed);
+		else
+		{
+			std::string shard_dir;
+			const std::string path = SidecarPath(s, hash, &shard_dir);
+			const std::string tmp = path + ".tmp";
+			Error error;
+			if (FileSystem::EnsureDirectoryExists(shard_dir.c_str(), false, &error) &&
+				FileSystem::WriteBinaryFile(tmp.c_str(), bytes.data(), bytes.size()) &&
+				FileSystem::RenamePath(tmp.c_str(), path.c_str()))
+			{
+				s.sidecarWrites.fetch_add(1, std::memory_order_relaxed);
+				s.sidecarWriteBytes.fetch_add(bytes.size(), std::memory_order_relaxed);
+				// The file supersedes any copy the preload holds or is about to put in memory.
+				std::lock_guard<std::mutex> preloadLock(s.preloadMutex);
+				s.sidecarsWritten.insert(hash);
+				auto it = s.preloadedSidecars.find(hash);
+				if (it != s.preloadedSidecars.end())
+				{
+					s.preloadedBytes -= it->second.size();
+					s.preloadedSidecars.erase(it);
+				}
+			}
+			else
+				Console.Warning("mVUProgCache: sidecar write failed: %s", path.c_str());
+		}
+
+		lock.lock();
+		s.writerBusy = false;
+		if (s.writerOrder.empty())
+			s.writerIdleCv.notify_all();
+	}
+	s.writerBusy = false;
+	s.writerIdleCv.notify_all();
+}
+
+// A program's last use is the modification time of its payload: a hydration touches it
+// (TouchPayload) and a save writes it, so it survives a crash and needs no INDEX rewrite. The INDEX's
+// own lastUsedNs only changes when a payload grows, which is a write time, not a use.
+static std::filesystem::file_time_type::rep FileTimeNow()
+{
+	return std::filesystem::file_time_type::clock::now().time_since_epoch().count();
+}
+
+// (the paths here are UTF-8, as FileSystem takes them; a std::string handed to std::filesystem::path is the
+// ANSI code page on Windows, where a profile directory with an accented name would then not be found at all)
+static std::filesystem::path Utf8Path(const std::string& path)
+{
+	return std::filesystem::path(std::u8string(reinterpret_cast<const char8_t*>(path.data()), path.size()));
+}
+
+static void TouchPayload(const std::string& path)
+{
+	std::error_code ec; // (best effort: a read-only or foreign cache just keeps its old rank)
+	std::filesystem::last_write_time(Utf8Path(path), std::filesystem::file_time_type::clock::now(), ec);
+}
+
+// Programs not used for this long are deleted, payload and sidecar, by the preload's background
+// thread when the cache comes up. The cost of a wrong guess is one cold compile of that program.
+static constexpr int kMaxUnusedDays = 60;
+
+// Read the payload-bearing INDEX entries into RAM on a background thread, the most recently used
+// program first (payload mtime, see above), until kPreloadBudgetBytes. The bound is a cap, not a
+// target: resident cost matters on low-memory devices, but buffers drain as hydrations consume
+// them. A program's vu-aot sidecar, when it has one, is read with its payload and counts against
+// the same budget. The directory is shared by every game played under the same settings, so it can
+// hold more than the budget: what is not preloaded is read when its program appears.
 static constexpr size_t kPreloadBudgetBytes = 32 * 1024 * 1024;
 
 static void StartPreload(State& s)
@@ -365,57 +471,151 @@ static void StartPreload(State& s)
 	struct Item
 	{
 		XXH128_hash_t hash;
-		u64 lastUsedNs;
+		u64 lastUsedNs; // the INDEX's (a write time): breaks ties between equal mtimes
 		u32 size;
 	};
 	std::vector<Item> items;
 	for (const auto& kv : s.entries)
 	{
-		if (kv.second.hdr.codeSize > 0)
-			items.push_back({kv.first, kv.second.hdr.lastUsedNs, kv.second.hdr.codeSize});
+		if (kv.second.codeSize > 0)
+			items.push_back({kv.first, kv.second.lastUsedNs, kv.second.codeSize});
 	}
 	if (items.empty())
 		return;
-	std::sort(items.begin(), items.end(),
-		[](const Item& a, const Item& b) { return a.lastUsedNs > b.lastUsedNs; });
 
-	// Strict MRU prefix (first over-budget item stops the walk, no
-	// skip-and-refill) so what got preloaded is a deterministic function of
-	// the INDEX, not of file-size interleaving.
-	std::vector<std::pair<XXH128_hash_t, std::string>> files;
-	size_t budget = 0;
+	struct File
+	{
+		XXH128_hash_t hash;
+		std::string payload, sidecar;
+		u32 payloadSize;
+		u64 lastUsedNs;
+		std::filesystem::file_time_type::rep mtime;
+	};
+	// (sidecars are read for the vu-aot tier only: with it off they would sit unread)
+	const bool sidecars = EmuConfig.Cpu.Recompiler.EnableVUAot;
+	std::vector<File> files;
 	for (const Item& it : items)
-	{
-		if (budget + it.size > kPreloadBudgetBytes)
-			break;
-		budget += it.size;
-		files.emplace_back(it.hash, PayloadPath(s, it.hash));
-	}
-	if (files.size() < items.size())
-	{
-		Console.WriteLn("mVUProgCache: preload budget (%zu MiB) reached — "
-		                "%zu of %zu payloads stay on disk",
-		                kPreloadBudgetBytes / (1024 * 1024),
-		                items.size() - files.size(), items.size());
-	}
+		files.push_back({it.hash, PayloadPath(s, it.hash), SidecarPath(s, it.hash), it.size, it.lastUsedNs, 0});
+	const size_t budgetBytes = s.preloadBudget ? s.preloadBudget : kPreloadBudgetBytes;
 
 	s.preloadStop.store(false, std::memory_order_relaxed);
 	// The &s capture is intentional and safe: s aliases a process-lifetime
 	// static (g_state[]), and StopPreload() joins this thread before Close/
 	// ResetForTest ever mutate that state. Don't "fix" this into a by-value or
 	// shared_ptr capture — there is no lifetime bug to solve.
-	s.preloadThread = std::thread([&s, files = std::move(files)]() {
-		for (const auto& [hash, path] : files)
+	s.preloadThread = std::thread([&s, sidecars, budgetBytes, files = std::move(files)]() mutable {
+		// Rank by last use and age out what has not been used for a long time. A payload that is not
+		// on disk (evicted by hand, or aged out earlier) has nothing to preload.
+		const auto now = FileTimeNow();
+		const auto maxAge = std::chrono::duration_cast<std::filesystem::file_time_type::duration>(
+			std::chrono::hours(24 * kMaxUnusedDays)).count();
+		std::vector<File> ranked;
+		ranked.reserve(files.size());
+		u64 agedFiles = 0, agedBytes = 0;
+		for (File& f : files)
 		{
 			if (s.preloadStop.load(std::memory_order_relaxed))
 				return;
-			auto bytes = FileSystem::ReadBinaryFile(path.c_str());
-			if (!bytes.has_value() || bytes->empty())
-				continue; // dispatch-time read will count payloadMissing
+			std::error_code ec;
+			const auto t = std::filesystem::last_write_time(Utf8Path(f.payload), ec);
+			if (ec)
+				continue;
+			f.mtime = t.time_since_epoch().count();
+			if (now - f.mtime > maxAge)
+			{
+				for (const std::string* path : {&f.payload, &f.sidecar})
+				{
+					const s64 size = FileSystem::GetPathFileSize(path->c_str());
+					if (FileSystem::DeleteFilePath(path->c_str()))
+					{
+						agedFiles++;
+						agedBytes += static_cast<u64>(std::max<s64>(size, 0));
+					}
+				}
+				continue;
+			}
+			ranked.push_back(std::move(f));
+		}
+		// Newest first. Equal times (a file system with coarse stamps; a session loads all its programs
+		// within seconds) fall back to the INDEX's time, then the hash, so the order is a function of
+		// the files and the INDEX alone.
+		std::sort(ranked.begin(), ranked.end(), [](const File& a, const File& b) {
+			if (a.mtime != b.mtime)
+				return a.mtime > b.mtime;
+			if (a.lastUsedNs != b.lastUsedNs)
+				return a.lastUsedNs > b.lastUsedNs;
+			if (a.hash.high64 != b.hash.high64)
+				return a.hash.high64 > b.hash.high64;
+			return a.hash.low64 > b.hash.low64;
+		});
+
+		// Strict MRU prefix (the first program over budget stops the reads, no
+		// skip-and-refill) so what got preloaded is a deterministic function of
+		// the files and the INDEX, not of file-size interleaving. Past the
+		// budget the walk only sizes the files, for the stats.
+		size_t budget = 0, wanted = 0, kept = 0;
+		u64 readBytes = 0;
+		bool full = false;
+		for (const File& f : ranked)
+		{
+			if (s.preloadStop.load(std::memory_order_relaxed))
+				return;
+			const s64 sideSize = sidecars ? FileSystem::GetPathFileSize(f.sidecar.c_str()) : 0;
+			const size_t need = f.payloadSize + static_cast<size_t>(std::max<s64>(sideSize, 0));
+			wanted += need;
+			if (full || budget + need > budgetBytes)
+			{
+				full = true;
+				continue;
+			}
+			budget += need;
+			kept++;
+			auto bytes = FileSystem::ReadBinaryFile(f.payload.c_str());
+			std::optional<std::vector<u8>> side;
+			if (sideSize > 0)
+				side = FileSystem::ReadBinaryFile(f.sidecar.c_str());
+			while (s.preloadHold.load(std::memory_order_acquire) && !s.preloadStop.load(std::memory_order_relaxed))
+			{
+				s.preloadHeld.store(true, std::memory_order_release);
+				std::this_thread::sleep_for(std::chrono::milliseconds(1));
+			}
+			s.preloadHeld.store(false, std::memory_order_release);
 			std::lock_guard<std::mutex> lock(s.preloadMutex);
-			s.preloadedBytes += bytes->size();
-			++s.preloadedPayloads;
-			s.preloaded[hash] = std::move(*bytes);
+			if (bytes.has_value() && !bytes->empty() && !s.payloadsWritten.count(f.hash))
+			{
+				s.preloadedBytes += bytes->size();
+				readBytes += bytes->size();
+				++s.preloadedPayloads;
+				s.preloaded[f.hash] = std::move(*bytes);
+			}
+			// (an unreadable payload: the dispatch-time read will count payloadMissing)
+			if (side.has_value() && !side->empty() && !s.sidecarsWritten.count(f.hash))
+			{
+				s.preloadedBytes += side->size();
+				s.sidecarPreloadBytes += side->size();
+				readBytes += side->size();
+				++s.sidecarsPreloaded;
+				s.preloadedSidecars[f.hash] = std::move(*side);
+			}
+		}
+		std::lock_guard<std::mutex> lock(s.preloadMutex);
+		s.preloadWantedBytes = wanted;
+		s.preloadBudgetHit = full ? 1 : 0;
+		s.preloadReadBytes += readBytes;
+		s.ageOutFiles += agedFiles;
+		s.ageOutBytes += agedBytes;
+		if (agedFiles)
+		{
+			Console.WriteLn("mVUProgCache: %llu files (%llu KiB) unused for %d days deleted",
+			                static_cast<unsigned long long>(agedFiles),
+			                static_cast<unsigned long long>(agedBytes / 1024), kMaxUnusedDays);
+		}
+		if (full)
+		{
+			Console.WriteLn("mVUProgCache: preload budget (%zu MiB) reached — "
+			                "%zu of %zu programs stay on disk (%zu KiB wanted)",
+			                budgetBytes / (1024 * 1024),
+			                ranked.size() - kept, ranked.size(), wanted / 1024);
 		}
 	});
 }
@@ -528,15 +728,14 @@ void Init(microVU& mVU)
 {
 	// Production gate: the whole on-disk cache — init, INDEX
 	// telemetry, .vuprog payloads, dispatch-time hydration — sits behind the
-	// EmuCore/CPU/Recompiler EnableVUProgramCache INI bool. Off (the default)
-	// means no disk side effects at all. Toggling it on at runtime works
-	// because mVUreset re-enters here after every settings-driven recompiler
-	// clear; toggling it OFF leaves the already-initialized state up for the
-	// rest of the session (entries written after the toggle are keyed to the
-	// post-toggle sentinel and are evicted wholesale on the next handshake —
-	// bounded garbage, never corruption). Tests bypass this gate through
-	// InitWithSentinel / TestReinitFromLiveSentinel.
-	if (!EmuConfig.Cpu.Recompiler.EnableVUProgramCache)
+	// EmuCore/CPU/Recompiler EnableVUProgramCache INI bool, or EnableVUAot,
+	// which is bound to the cache (RecompilerOptions::UseVUProgramCache). Both
+	// off means no disk side effects at all. Toggling either on at
+	// runtime works because mVUreset re-enters here after every settings-driven
+	// recompiler clear; with both bits clear that same reset closes a cache that
+	// is up (Close, without saving), so nothing is written after the toggle.
+	// Tests bypass this gate through InitWithSentinel / TestReinitFromLiveSentinel.
+	if (!EmuConfig.Cpu.Recompiler.UseVUProgramCache())
 		return;
 	InitImpl(mVU.index & 1u, mVU.optionsSentinel);
 }
@@ -551,6 +750,8 @@ void Close(microVU& mVU)
 	State& s = g_state[mVU.index & 1];
 	if (!s.initialized)
 		return;
+	// Sidecars still queued are written first (the tier handed its last ones over just before).
+	s.StopWriter();
 	DumpStats(mVU, "close");
 	// No file handles kept open (per-call open/append/close). Clear the
 	// in-memory index so the next mVUreset starts fresh.
@@ -558,6 +759,9 @@ void Close(microVU& mVU)
 	{
 		std::lock_guard<std::mutex> lock(s.preloadMutex);
 		s.preloaded.clear();
+		s.preloadedSidecars.clear();
+		s.payloadsWritten.clear();
+		s.sidecarsWritten.clear();
 		s.preloadedBytes = 0;
 		// Zero the cumulative preload counters too (mirror ResetForTest) so a
 		// Close+Init cycle starts from a consistent baseline — otherwise
@@ -566,9 +770,213 @@ void Close(microVU& mVU)
 		// emitted this lifecycle's lifetime totals.
 		s.preloadedPayloads = 0;
 		s.preloadHits = 0;
+		s.sidecarsPreloaded = 0;
+		s.sidecarPreloadBytes = 0;
+		s.sidecarPreloadHits = 0;
+		s.sidecarReads = 0;
+		s.preloadBudgetHit = 0;
+		s.preloadWantedBytes = 0;
+		s.preloadReadBytes = 0;
+		s.ageOutFiles = 0;
+		s.ageOutBytes = 0;
 	}
+	s.sidecarWrites = 0;
+	s.sidecarWriteBytes = 0;
+	s.sidecarSkips = 0;
 	s.initialized = false;
 	s.entries.clear();
+}
+
+bool SidecarsEnabled(u32 vu_index)
+{
+	const State& s = g_state[vu_index & 1];
+	return s.initialized && s.enabled;
+}
+
+bool ReadSidecar(u32 vu_index, const XXH128_hash_t& hash, std::vector<u8>& out)
+{
+	State& s = g_state[vu_index & 1];
+	if (!s.initialized || !s.enabled)
+		return false;
+	{
+		std::lock_guard<std::mutex> lock(s.preloadMutex);
+		auto it = s.preloadedSidecars.find(hash);
+		if (it != s.preloadedSidecars.end())
+		{
+			out = std::move(it->second);
+			s.preloadedBytes -= out.size();
+			s.preloadedSidecars.erase(it);
+			++s.sidecarPreloadHits;
+			++s.sidecarReads;
+			return true;
+		}
+	}
+	// (a sidecar still queued for writing is newer than the disk's: this session wrote it, and a
+	// program asks only once per session for its own, so it is not asked for here)
+	auto bytes = FileSystem::ReadBinaryFile(SidecarPath(s, hash).c_str());
+	if (!bytes.has_value() || bytes->empty())
+		return false;
+	out = std::move(*bytes);
+	std::lock_guard<std::mutex> lock(s.preloadMutex);
+	++s.sidecarReads;
+	return true;
+}
+
+void QueueSidecar(u32 vu_index, const XXH128_hash_t& hash, std::function<std::vector<u8>()> build)
+{
+	State& s = g_state[vu_index & 1];
+	if (!s.initialized || !s.enabled)
+		return;
+	{
+		std::lock_guard<std::mutex> lock(s.writerMutex);
+		auto it = s.writerQueue.find(hash);
+		if (it != s.writerQueue.end())
+			it->second = std::move(build); // (keeps its place in the queue)
+		else
+		{
+			s.writerQueue.emplace(hash, std::move(build));
+			s.writerOrder.push_back(hash);
+		}
+		if (!s.writerThread.joinable())
+			s.writerThread = std::thread([&s]() { SidecarWriterLoop(s); });
+	}
+	s.writerCv.notify_one();
+}
+
+void FlushSidecars(u32 vu_index)
+{
+	State& s = g_state[vu_index & 1];
+	std::unique_lock<std::mutex> lock(s.writerMutex);
+	s.writerIdleCv.wait(lock, [&] { return !s.writerThread.joinable() || (s.writerOrder.empty() && !s.writerBusy); });
+}
+
+std::string TestSidecarPath(u32 vu_index, const XXH128_hash_t& hash)
+{
+	return SidecarPath(g_state[vu_index & 1], hash);
+}
+
+ClearResult ClearVuAot(bool wholeCache)
+{
+	ClearResult result;
+
+	// The threads come first. The writer would put back a file this deletes, and the preload would read
+	// one it has deleted. A request still queued is dropped, not written (the one being written when this
+	// starts is finished by the join, and deleted below).
+	for (State& s : g_state)
+	{
+		{
+			std::lock_guard<std::mutex> lock(s.writerMutex);
+			s.writerOrder.clear();
+			s.writerQueue.clear();
+		}
+		s.StopWriter();
+		s.StopPreload();
+		std::lock_guard<std::mutex> lock(s.preloadMutex);
+		for (const auto& kv : s.preloadedSidecars)
+			s.preloadedBytes -= kv.second.size();
+		s.preloadedSidecars.clear();
+		s.sidecarsWritten.clear();
+		if (wholeCache)
+		{
+			s.preloaded.clear();
+			s.payloadsWritten.clear();
+			s.preloadedBytes = 0;
+			s.initialized = false;
+			s.entries.clear();
+		}
+	}
+
+	if (EmuFolders::Cache.empty())
+		return result;
+
+	// (every path is UTF-8 through Utf8Path; the error_code overloads keep a missing or unreadable
+	// directory from throwing)
+	namespace fs = std::filesystem;
+	std::error_code ec;
+	const fs::path root = Utf8Path(Path::Combine(EmuFolders::Cache, kRootDirName));
+	if (!fs::is_directory(root, ec))
+		return result;
+
+	const auto isCacheDir = [](const std::string& name) {
+		for (const char* vu : {"vu0", "vu1"})
+		{
+			const std::string stale = std::string(vu) + ".stale.";
+			if (name == vu || name.compare(0, stale.size(), stale) == 0)
+				return true;
+		}
+		return false;
+	};
+
+	std::vector<fs::path> dirs;
+	for (fs::directory_iterator it(root, ec), end; !ec && it != end; it.increment(ec))
+	{
+		std::error_code sec;
+		if (it->is_directory(sec) && isCacheDir(it->path().filename().string()))
+			dirs.push_back(it->path());
+	}
+
+	const auto endsWith = [](const std::string& name, const char* suffix) {
+		const size_t n = std::strlen(suffix);
+		return name.size() >= n && name.compare(name.size() - n, n, suffix) == 0;
+	};
+
+	for (const fs::path& dir : dirs)
+	{
+		std::vector<fs::path> doomed;
+		if (wholeCache)
+			doomed.push_back(dir);
+		else
+		{
+			std::error_code wec;
+			for (fs::recursive_directory_iterator it(dir, wec), end; !wec && it != end; it.increment(wec))
+			{
+				std::error_code sec;
+				if (!it->is_regular_file(sec))
+					continue;
+				// (".vuaot.tmp" is a write that was cut short)
+				const std::string name = it->path().filename().string();
+				if (endsWith(name, ".vuaot") || endsWith(name, ".vuaot.tmp"))
+					doomed.push_back(it->path());
+			}
+		}
+
+		for (const fs::path& path : doomed)
+		{
+			std::error_code sec;
+			if (fs::is_directory(path, sec))
+			{
+				for (fs::recursive_directory_iterator it(path, sec), end; !sec && it != end; it.increment(sec))
+				{
+					std::error_code fec;
+					if (it->is_regular_file(fec))
+					{
+						++result.files;
+						result.bytes += it->file_size(fec);
+					}
+				}
+				fs::remove_all(path, sec);
+			}
+			else
+			{
+				++result.files;
+				result.bytes += fs::file_size(path, sec);
+				fs::remove(path, sec);
+			}
+		}
+	}
+
+	if (result.files)
+		Console.WriteLn(Color_StrongBlue, "vu-aot: cleared the %s: %" PRIu64 " files, %.1f MiB",
+			wholeCache ? "VU program cache" : "compiled cache (sidecars)", result.files,
+			static_cast<double>(result.bytes) / (1024.0 * 1024.0));
+	return result;
+}
+
+ClearResult OnVuAotSettingChanged(bool wasOn, bool isOn, bool programCacheStillOn)
+{
+	if (!wasOn || isOn)
+		return {};
+	return ClearVuAot(!programCacheStillOn);
 }
 
 void SaveProgram(microVU& mVU, const microProgram& prog)
@@ -598,13 +1006,13 @@ void SaveProgram(microVU& mVU, const microProgram& prog)
 
 	// Write/refresh the .vuprog payload when the serialized graph grew (a
 	// hydrated program compiled new blocks since the last save) or the
-	// file is missing. hdr.codeSize tracks the last-written payload size —
+	// file is missing. codeSize tracks the last-written payload size —
 	// the cheap growth signal (same program + same emitters can't change
 	// bytes without changing size).
-	auto write_payload_if_grown = [&](IndexEntry& e) -> bool {
+	auto write_payload_if_grown = [&](IndexEntryHeader& e) -> bool {
 		if (!have_image)
 			return false;
-		if (e.hdr.codeSize == static_cast<u32>(image.size()) &&
+		if (e.codeSize == static_cast<u32>(image.size()) &&
 			FileSystem::FileExists(PayloadPath(s, prog.contentHash).c_str()))
 			return false;
 		if (!WritePayload(s, prog.contentHash, image))
@@ -612,117 +1020,49 @@ void SaveProgram(microVU& mVU, const microProgram& prog)
 			Console.Warning("mVUProgCache[%u]: payload write failed", mVU.index);
 			return false;
 		}
-		e.hdr.codeSize = static_cast<u32>(image.size());
+		e.codeSize = static_cast<u32>(image.size());
 		++s.payloadWrites;
 		return true;
 	};
 
-	// When this hash has been seen before, the on-disk entry_pcs is the
-	// cumulative truth. Union the existing set with what the current
-	// program instance observed; only re-persist if the union widens past
-	// what's already on disk. This handles the cross-program-instance
-	// case: the dispatcher hits N PCs across several mVUreset cycles, but
-	// each instance starts fresh with observed={its createProg PC}.
-	// Without the union, the FIRST instance's SaveProgram wins and
-	// subsequent calls short-circuit via s.entries dedupe. Reading the
-	// existing set and unioning lets the on-disk entry list converge to
-	// all observed PCs over enough boots.
-	const u32 primary_pc = static_cast<u32>(prog.startPC) * 8u;
-
+	// A hash seen before already has an INDEX record. Re-append it only when
+	// the payload grew (a hydrated program compiled new blocks), so the
+	// record carries the new size; last-writer-wins on the next LoadIndex.
 	auto it_existing = s.entries.find(prog.contentHash);
 	if (it_existing != s.entries.end())
 	{
-		// Existing entry — widening check. Probe for genuinely-new PCs
-		// against the on-disk set without copying it first: once a
-		// program's observed-PC set has converged (the steady state
-		// after a few boots) this branch runs on every SaveProgram and
-		// the copy would be pure waste. Only materialize the wider list
-		// when a new PC actually appears.
-		IndexEntry& existing = it_existing->second;
-		std::unordered_map<u32, bool> seen;
-		for (u32 pc : existing.entry_pcs) seen.emplace(pc, true);
+		IndexEntryHeader& existing = it_existing->second;
+		if (!write_payload_if_grown(existing))
+			return; // payload current (or none to write) — nothing to record
 
-		std::vector<u32> new_pcs;
-		auto note = [&](u32 pc) {
-			if (seen.emplace(pc, true).second) new_pcs.push_back(pc);
-		};
-		// Ensure primary_pc is present (it would be, but seed
-		// defensively in case a prior save was malformed).
-		note(primary_pc);
-		for (size_t i = 0; i < prog.observed.count; ++i)
-			note(prog.observed.pcs[i]);
-
-		const bool widened = !new_pcs.empty();
-		const bool payload_written = write_payload_if_grown(existing);
-		if (!widened && !payload_written)
-			return; // No new PCs, payload current — short-circuit.
-
-		// Re-persist with the wider set / refreshed payload size
-		// (last-writer-wins on the next LoadIndex).
-		IndexEntry e = existing;
-		if (widened)
-		{
-			e.entry_pcs.reserve(e.entry_pcs.size() + new_pcs.size());
-			e.entry_pcs.insert(e.entry_pcs.end(), new_pcs.begin(), new_pcs.end());
-		}
-		e.hdr.lastUsedNs  = NowNs();
-		e.hdr.blockCount  = blockCount;
+		IndexEntryHeader e = existing;
+		e.lastUsedNs = NowNs();
+		e.blockCount = blockCount;
 		PersistIndexEntry(s, e);
 		return;
 	}
 
 	// First-time save for this hash.
-	IndexEntry e;
-	e.hdr.contentHash = prog.contentHash;
-	e.hdr.vuIndex     = mVU.index & 1u;
-	e.hdr.codeSize    = 0; // set by write_payload_if_grown on success
-	e.hdr.blockCount  = blockCount;
-	e.hdr.flags       = 1u;
-	e.hdr.lastUsedNs  = NowNs();
-	e.hdr.execCount   = 0;
-	// Primary entry is always the creator's startPC at index 0; observed
-	// PCs follow.
-	e.entry_pcs.push_back(primary_pc);
-	const auto& observed = prog.observed;
-	for (u32 i = 0; i < observed.count; ++i)
-	{
-		const u32 pc = observed.pcs[i];
-		if (pc == primary_pc)
-			continue;
-		e.entry_pcs.push_back(pc);
-	}
+	IndexEntryHeader e = {};
+	e.contentHash = prog.contentHash;
+	e.vuIndex     = mVU.index & 1u;
+	e.codeSize    = 0; // set by write_payload_if_grown on success
+	e.blockCount  = blockCount;
+	e.flags       = 1u;
+	e.lastUsedNs  = NowNs();
+	e.execCount   = 0;
 
 	write_payload_if_grown(e);
 	PersistIndexEntry(s, e);
 }
 
-bool TestGetEntryPcs(u32 vu_index, const XXH128_hash_t& hash,
-                      u32* out_pcs, size_t out_pcs_cap,
-                      size_t* out_count)
+bool TestHasIndexEntry(u32 vu_index, const XXH128_hash_t& hash)
 {
-	if (out_count)
-		*out_count = 0;
 	State& s = g_state[vu_index & 1];
-	if (!s.initialized)
-		return false;
-	auto it = s.entries.find(hash);
-	if (it == s.entries.end())
-		return false;
-	const auto& pcs = it->second.entry_pcs;
-	const size_t n  = pcs.size();
-	if (out_count)
-		*out_count = n;
-	if (out_pcs && out_pcs_cap > 0)
-	{
-		const size_t copy = (n < out_pcs_cap) ? n : out_pcs_cap;
-		for (size_t i = 0; i < copy; ++i)
-			out_pcs[i] = pcs[i];
-	}
-	return true;
+	return s.initialized && s.entries.find(hash) != s.entries.end();
 }
 
-bool TestAppendIndexEntry(u32 vu_index, const XXH128_hash_t& hash,
-                          const u32* entry_pcs, size_t entry_pc_count)
+bool TestAppendIndexEntry(u32 vu_index, const XXH128_hash_t& hash)
 {
 	State& s = g_state[vu_index & 1];
 	if (!s.initialized || !s.enabled)
@@ -733,15 +1073,11 @@ bool TestAppendIndexEntry(u32 vu_index, const XXH128_hash_t& hash,
 	if (s.entries.find(hash) != s.entries.end())
 		return false;
 
-	IndexEntry e;
-	e.hdr.contentHash = hash;
-	e.hdr.vuIndex     = vu_index & 1u;
-	e.hdr.codeSize    = 0;
-	e.hdr.blockCount  = 0;
-	e.hdr.flags       = 1u;
-	e.hdr.lastUsedNs  = NowNs();
-	e.hdr.execCount   = 0;
-	e.entry_pcs.assign(entry_pcs, entry_pcs + entry_pc_count);
+	IndexEntryHeader e = {};
+	e.contentHash = hash;
+	e.vuIndex     = vu_index & 1u;
+	e.flags       = 1u;
+	e.lastUsedNs  = NowNs();
 
 	return PersistIndexEntry(s, e);
 }
@@ -766,7 +1102,7 @@ microProgram* TryLoadProgram(microVU& mVU, const XXH128_hash_t& contentHash)
 		// Cache disabled/not initialized: the INDEX was never consulted, so
 		// this is not an INDEX miss. Leave `misses` alone (it counts genuine
 		// hash-not-in-INDEX lookups below) — otherwise the production default
-		// (EnableVUProgramCache OFF) inflates the miss count on every dispatch.
+		// (the cache off) inflates the miss count on every dispatch.
 		return nullptr;
 	}
 	auto it = s.entries.find(contentHash);
@@ -818,13 +1154,18 @@ microProgram* TryLoadProgram(microVU& mVU, const XXH128_hash_t& contentHash)
 
 	if (!prog)
 	{
-		// Layout-base / content-hash / structural rejection — degrade to
-		// recompile, never corrupt. HydrateProgram counted the reason.
+		// Another build's payload, a damaged one, or a content mismatch: degrade
+		// to recompile, never corrupt. HydrateProgram counted the reason. The
+		// file is dead weight, so the next save replaces it even when the
+		// recompiled image comes out the same size (SaveProgram skips a payload
+		// whose recorded size matches).
 		++s.payloadRejects;
+		it->second.codeSize = 0;
 		return nullptr;
 	}
 	++s.payloadHits;
-	it->second.hdr.lastUsedNs = NowNs();
+	it->second.lastUsedNs = NowNs();
+	TouchPayload(PayloadPath(s, contentHash));
 	return prog;
 }
 
@@ -863,7 +1204,19 @@ Stats GetStats(u32 vu_index)
 		out.preloadedPayloads = s.preloadedPayloads;
 		out.preloadedBytes    = s.preloadedBytes;
 		out.preloadHits       = s.preloadHits;
+		out.sidecarReads        = s.sidecarReads;
+		out.sidecarPreloadHits  = s.sidecarPreloadHits;
+		out.sidecarsPreloaded   = s.sidecarsPreloaded;
+		out.sidecarPreloadBytes = s.sidecarPreloadBytes;
+		out.preloadBudgetHit    = s.preloadBudgetHit;
+		out.preloadWantedBytes  = s.preloadWantedBytes;
+		out.preloadReadBytes    = s.preloadReadBytes;
+		out.ageOutFiles         = s.ageOutFiles;
+		out.ageOutBytes         = s.ageOutBytes;
 	}
+	out.sidecarWrites     = s.sidecarWrites.load(std::memory_order_relaxed);
+	out.sidecarWriteBytes = s.sidecarWriteBytes.load(std::memory_order_relaxed);
+	out.sidecarSkips      = s.sidecarSkips.load(std::memory_order_relaxed);
 	return out;
 }
 
@@ -891,9 +1244,23 @@ bool TestGetLiveSentinel(u32 vu_index, XXH128_hash_t* out_sentinel)
 	return true;
 }
 
+bool TestBuildSentinelForIndex(u32 vu_index, XXH128_hash_t* out_sentinel)
+{
+	if (!out_sentinel)
+		return false;
+	microVU& mVU = (vu_index & 1) ? microVU1 : microVU0;
+	mVU.index = vu_index & 1;
+	mVU.optionsSentinelValid = false;
+	mVUbuildOptionsSentinel(mVU);
+	*out_sentinel = mVU.optionsSentinel;
+	return true;
+}
+
 void ResetForTest(u32 vu_index)
 {
 	State& s = g_state[vu_index & 1];
+	s.preloadHold.store(false, std::memory_order_release);
+	s.StopWriter();
 	s.StopPreload();
 	s.initialized      = false;
 	s.enabled          = true;
@@ -915,10 +1282,53 @@ void ResetForTest(u32 vu_index)
 	{
 		std::lock_guard<std::mutex> lock(s.preloadMutex);
 		s.preloaded.clear();
+		s.payloadsWritten.clear();
+		s.sidecarsWritten.clear();
 		s.preloadedPayloads = 0;
 		s.preloadedBytes    = 0;
 		s.preloadHits       = 0;
+		s.preloadedSidecars.clear();
+		s.sidecarsPreloaded   = 0;
+		s.sidecarPreloadBytes = 0;
+		s.sidecarPreloadHits  = 0;
+		s.sidecarReads        = 0;
+		s.preloadBudgetHit    = 0;
+		s.preloadWantedBytes  = 0;
+		s.preloadReadBytes    = 0;
+		s.ageOutFiles         = 0;
+		s.ageOutBytes         = 0;
 	}
+	s.preloadBudget = 0;
+	s.sidecarWrites = 0;
+	s.sidecarWriteBytes = 0;
+	s.sidecarSkips = 0;
+}
+
+void TestSetPreloadBudget(u32 vu_index, size_t bytes)
+{
+	g_state[vu_index & 1].preloadBudget = bytes;
+}
+
+bool TestIsPreloaded(u32 vu_index, const XXH128_hash_t& hash, bool sidecar)
+{
+	State& s = g_state[vu_index & 1];
+	std::lock_guard<std::mutex> lock(s.preloadMutex);
+	return sidecar ? s.preloadedSidecars.count(hash) != 0 : s.preloaded.count(hash) != 0;
+}
+
+void TestHoldPreload(u32 vu_index, bool hold)
+{
+	g_state[vu_index & 1].preloadHold.store(hold, std::memory_order_release);
+}
+
+bool TestWritePayload(u32 vu_index, const XXH128_hash_t& hash, const std::vector<u8>& image)
+{
+	return WritePayload(g_state[vu_index & 1], hash, image);
+}
+
+bool TestPreloadIsHeld(u32 vu_index)
+{
+	return g_state[vu_index & 1].preloadHeld.load(std::memory_order_acquire);
 }
 
 void TestWaitForPreload(u32 vu_index)
@@ -937,7 +1347,10 @@ void DumpStats(const microVU& mVU, const char* tag)
 		"loads(indexHit/miss)=%llu/%llu staleEvicts=%llu "
 		"dispatchProbes=%llu dispatchIndexAvail=%llu "
 		"payload(writes/hits/missing/rejects)=%llu/%llu/%llu/%llu "
-		"preload(loaded/residentB/hits)=%llu/%llu/%llu",
+		"preload(loaded/residentB/hits)=%llu/%llu/%llu "
+		"sidecars(reads/preloadHits/preloaded/preloadB/writes/writeB/skips)=%llu/%llu/%llu/%llu/%llu/%llu/%llu "
+		"preload(wantedB/budgetHit)=%llu/%llu "
+		"preload(readB)=%llu ageOut(files/B)=%llu/%llu",
 		mVU.index, tag,
 		(unsigned long long)entries,
 		(unsigned long long)s.savesAttempted,
@@ -953,6 +1366,18 @@ void DumpStats(const microVU& mVU, const char* tag)
 		(unsigned long long)s.payloadRejects,
 		(unsigned long long)s.preloadedPayloads,
 		(unsigned long long)s.preloadedBytes,
-		(unsigned long long)s.preloadHits);
+		(unsigned long long)s.preloadHits,
+		(unsigned long long)s.sidecarReads,
+		(unsigned long long)s.sidecarPreloadHits,
+		(unsigned long long)s.sidecarsPreloaded,
+		(unsigned long long)s.sidecarPreloadBytes,
+		(unsigned long long)s.sidecarWrites,
+		(unsigned long long)s.sidecarWriteBytes,
+		(unsigned long long)s.sidecarSkips,
+		(unsigned long long)s.preloadWantedBytes,
+		(unsigned long long)s.preloadBudgetHit,
+		(unsigned long long)s.preloadReadBytes,
+		(unsigned long long)s.ageOutFiles,
+		(unsigned long long)s.ageOutBytes);
 }
 }

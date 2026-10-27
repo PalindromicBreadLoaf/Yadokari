@@ -19,6 +19,7 @@
 #include "Config.h"
 #include "GameDatabase.h"
 #include "PerGameOverrides.h"
+#include "VMManager.h"
 
 #include "common/MemorySettingsInterface.h"
 #include "common/SettingsWrapper.h"
@@ -328,6 +329,93 @@ TEST(SettingsPrecedenceApply, AClaimedGraphicsFixKeepsThePlayersValue)
 
 	EXPECT_FALSE(gs.HWMipmap) << "claimed, so the database stands aside";
 	EXPECT_EQ(gs.UserHacks_TextureInsideRt, GSTextureInRtMode::InsideTargets) << "unclaimed, so it still applies";
+}
+
+// The back thread is a recommendation: the database can turn the split on where the host has the cores for it, a player's
+// own setting for the game stands in its way, and it never turns the split off.
+TEST(SettingsPrecedenceApply, TheDatabaseTurnsTheBackThreadOnOnlyWhereTheHostCanSplit)
+{
+	GameDatabaseSchema::GameEntry entry;
+	entry.gsHWFixes.emplace_back(GameDatabaseSchema::GSHWFixId::BackThread, 1);
+
+	Pcsx2Config::GSOptions gs;
+	gs.BackThread = false;
+	entry.applyGSHardwareFixes(gs, {}, GameDatabaseSchema::ApplyMode::Hypothetical);
+	EXPECT_EQ(gs.BackThread, VMManager::Internal::CanSplitGS()) << "on exactly when this host can run the split";
+}
+
+TEST(SettingsPrecedenceApply, TheIopThreadAsksForAFifthPerformanceCoreBeforeTheDatabaseSplitsTheGs)
+{
+	GameDatabaseSchema::GameEntry entry;
+	entry.gsHWFixes.emplace_back(GameDatabaseSchema::GSHWFixId::BackThread, 1);
+
+	const bool old_iop = EmuConfig.Speedhacks.iopThread;
+	EmuConfig.Speedhacks.iopThread = true;
+	Pcsx2Config::GSOptions gs;
+	gs.BackThread = false;
+	entry.applyGSHardwareFixes(gs, {}, GameDatabaseSchema::ApplyMode::Hypothetical);
+	EmuConfig.Speedhacks.iopThread = old_iop;
+	// Four performance cores (the handhelds) are not enough with the IOP thread on; a host with five or more may split.
+	if (VMManager::Internal::GetPerformanceCoreCount() < 5)
+		EXPECT_FALSE(gs.BackThread);
+}
+
+TEST(SettingsPrecedenceApply, APlayersBackThreadSettingForTheGameKeepsTheDatabaseOut)
+{
+	GameDatabaseSchema::GameEntry entry;
+	entry.gsHWFixes.emplace_back(GameDatabaseSchema::GSHWFixId::BackThread, 1);
+
+	Pcsx2Config::GSOptions gs;
+	gs.BackThread = false;
+	const PerGameOverrides ov = GameFile().Set("EmuCore/GS", "GSBackThreadMode", 0).Overrides();
+	entry.applyGSHardwareFixes(gs, ov, GameDatabaseSchema::ApplyMode::Hypothetical);
+	EXPECT_FALSE(gs.BackThread);
+}
+
+TEST(SettingsPrecedenceApply, TheDatabaseNeverTurnsAPlayersBackThreadOff)
+{
+	GameDatabaseSchema::GameEntry entry;
+	entry.gsHWFixes.emplace_back(GameDatabaseSchema::GSHWFixId::BackThread, 0);
+
+	Pcsx2Config::GSOptions gs;
+	gs.BackThread = true;
+	entry.applyGSHardwareFixes(gs, {}, GameDatabaseSchema::ApplyMode::Hypothetical);
+	EXPECT_TRUE(gs.BackThread);
+}
+
+// The IOP thread is a speed hack the mobile overlay switches on for God of War, God of War II and Shadow of the
+// Colossus. The God of War II entries carry mvuFlag too, because an overlay speedHacks list replaces the upstream one.
+TEST(SettingsPrecedenceApply, TheDatabaseTurnsTheIopThreadOnAndKeepsTheEntrysOtherSpeedHacks)
+{
+	GameDatabaseSchema::GameEntry entry;
+	entry.speedHacks.emplace_back(SpeedHack::MVUFlag, 0);
+	entry.speedHacks.emplace_back(SpeedHack::IOPThread, 1);
+
+	Pcsx2Config config;
+	config.Speedhacks.iopThread = false;
+	config.Speedhacks.vuFlagHack = true;
+	entry.applyGameFixes(config, true, {}, GameDatabaseSchema::ApplyMode::Hypothetical);
+
+	EXPECT_TRUE(config.Speedhacks.iopThread);
+	EXPECT_FALSE(config.Speedhacks.vuFlagHack) << "the entry's other speed hack still applies";
+}
+
+TEST(SettingsPrecedenceApply, APlayersIopThreadSettingForTheGameKeepsTheDatabaseOut)
+{
+	GameDatabaseSchema::GameEntry entry;
+	entry.speedHacks.emplace_back(SpeedHack::MVUFlag, 0);
+	entry.speedHacks.emplace_back(SpeedHack::IOPThread, 1);
+
+	// A player who turned the IOP thread off for this game (or on, to the same effect on the database) owns the key.
+	const PerGameOverrides ov = GameFile().Set("EmuCore/Speedhacks", "iopThread", false).Overrides();
+
+	Pcsx2Config config;
+	config.Speedhacks.iopThread = false;
+	config.Speedhacks.vuFlagHack = true;
+	entry.applyGameFixes(config, true, ov, GameDatabaseSchema::ApplyMode::Hypothetical);
+
+	EXPECT_FALSE(config.Speedhacks.iopThread);
+	EXPECT_FALSE(config.Speedhacks.vuFlagHack) << "claiming the IOP thread leaves the rest of the entry alone";
 }
 
 // ---------------------------------------------------------------- the copy filter

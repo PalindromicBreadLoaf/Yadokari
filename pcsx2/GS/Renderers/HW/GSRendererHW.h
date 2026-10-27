@@ -5,6 +5,7 @@
 
 #include "GSTextureCache.h"
 #include "GS/Renderers/HW/GSDrawAlphaMask.h"
+#include "GS/Renderers/Common/GSBlendCarry.h"
 #include "GS/Renderers/Common/GSFunctionMap.h"
 #include "GS/Renderers/Common/GSNativeTexelGridPolicy.h"
 #include "GS/Renderers/Common/GSRenderer.h"
@@ -35,6 +36,10 @@ public:
 	static constexpr int MAX_FRAMEBUFFER_HEIGHT = 1280;
 
 private:
+	// Frontend acceptance of the final color dispatch, not GPU completion.
+	bool m_draw_color_dispatch_accepted = false;
+	bool UseSelectedColorInvalidation(const GSTextureCache::Target* rt, const GSVector4i& rect, bool skip_draw) const;
+
 	static constexpr float SSR_UV_TOLERANCE = 1.0f;
 
 	using GSC_Ptr = bool(*)(GSRendererHW& r, int& skip);	// GSC - Get Skip Count
@@ -295,6 +300,7 @@ private:
 
 	void SetTCOffset();
 	bool NextDrawColClip() const;
+	bool IsColClipCounterDraw() const;
 	bool IsPossibleChannelShuffle() const;
 	bool IsPageCopy() const;
 	bool NextDrawMatchesShuffle() const;
@@ -390,6 +396,12 @@ private:
 	// takes Stencil DATE and reuses the copy.
 	GSTexture* m_date_chain_rt = nullptr;
 	u8 m_date_chain_datm = 0;
+
+	// Blend carry-over (GSBlendCarry.h): the last blended draw of the donor class, and whether the draw in
+	// hand had its blend elided as the identity (set at the blend gate in DrawPrims).
+	GSBlendCarry::Donor m_blend_carry;
+	bool m_blend_identity = false;
+	void CarryBlendBeforeSubmit(GSTextureCache::Target* rt, GSTextureCache::Target* ds);
 	bool m_date_draw_shares_copy = false; ///< This draw's DATE keeps a shared copy true (set by EmulateDATESelectMethod).
 
 	GIFRegFRAME m_split_clear_start = {};
