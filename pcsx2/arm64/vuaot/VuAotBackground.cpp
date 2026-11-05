@@ -179,18 +179,19 @@ namespace vuaot::bg
 
 	void Worker::Start()
 	{
-		if (thread_.joinable())
+		if (thread_.Joinable())
 			return;
 		{
 			std::lock_guard lk(mu_);
 			stop_ = false;
 		}
-		thread_ = std::thread([this] { Loop(); });
+		thread_.SetStackSize(2 * 1024 * 1024);
+		thread_.Start([this] { Loop(); });
 	}
 
 	void Worker::Stop()
 	{
-		if (!thread_.joinable())
+		if (!thread_.Joinable())
 			return;
 		{
 			std::lock_guard lk(mu_);
@@ -198,7 +199,7 @@ namespace vuaot::bg
 			queue_.clear();
 		}
 		cv_.notify_all();
-		thread_.join();
+		thread_.Join();
 		std::lock_guard lk(mu_);
 		finished_.clear();
 		completed_.store(0, std::memory_order_relaxed);
@@ -209,7 +210,7 @@ namespace vuaot::bg
 	{
 		{
 			std::lock_guard lk(mu_);
-			if (stop_ || !thread_.joinable() || queue_.size() >= kMaxQueued)
+			if (stop_ || !thread_.Joinable() || queue_.size() >= kMaxQueued)
 				return false;
 			queue_.push_back(std::move(job));
 		}
@@ -257,7 +258,7 @@ namespace vuaot::bg
 	void Worker::WaitIdle()
 	{
 		std::unique_lock lk(mu_);
-		doneCv_.wait(lk, [&] { return stop_ || !thread_.joinable() || (queue_.empty() && !running_); });
+		doneCv_.wait(lk, [&] { return stop_ || !thread_.Joinable() || (queue_.empty() && !running_); });
 	}
 
 	size_t Worker::Queued()

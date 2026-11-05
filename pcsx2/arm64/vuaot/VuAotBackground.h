@@ -18,6 +18,7 @@
 // the copy happens inside one of microVU's own code-cache episodes.
 
 #include "common/Pcsx2Defs.h"
+#include "common/Threading.h"
 
 #include <atomic>
 #include <condition_variable>
@@ -138,7 +139,7 @@ namespace vuaot::bg
 		void Start();
 		// Drops every queued job and waits for the one running, if any.
 		void Stop();
-		bool Running() const { return thread_.joinable(); }
+		bool Running() const { return thread_.Joinable(); }
 
 		// False when the queue is full or the worker is not running.
 		bool Submit(std::shared_ptr<Job> job);
@@ -163,7 +164,7 @@ namespace vuaot::bg
 	private:
 		void Loop();
 
-		std::thread thread_;
+		Threading::Thread thread_;
 		std::mutex mu_;
 		std::condition_variable cv_;      // the worker waits for work
 		std::condition_variable doneCv_;  // waiters wait for a job or for idle
