@@ -11,6 +11,7 @@
 #include "common/Threading.h"
 
 #include "pcsx2/Achievements.h"
+#include "pcsx2/Catalog/CoverAutoDownload.h"
 #include "pcsx2/Config.h"
 #include "pcsx2/Host.h"
 #include "pcsx2/INISettingsInterface.h"
@@ -25,6 +26,7 @@
 
 #include "HorizonException.h"
 #include "HorizonHost.h"
+#include "HorizonThreadWrap.h"
 #include "HorizonUsbStorage.h"
 
 #include <algorithm>
@@ -591,6 +593,7 @@ int main(int argc, char* argv[])
 
 	appletUnhook(&applet_hook);
 	Host::CancelGameListRefresh();
+	Catalog::AutoCovers::Shutdown();
 	HorizonUsbStorage::Shutdown();
 	if (VMManager::GetState() != VMState::Shutdown)
 		VMManager::Shutdown(HorizonHost::TakeResumeSaveRequest());

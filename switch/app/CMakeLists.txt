@@ -44,8 +44,7 @@ target_link_libraries(yadokari PRIVATE
 	deko3d
 )
 
-# Every thread starts clamped off core 3 (HorizonThreadWrap.cpp).
-target_link_options(yadokari PRIVATE -Wl,--wrap=pthread_create)
+target_link_options(yadokari PRIVATE -Wl,--wrap=pthread_create -Wl,--wrap=pthread_join)
 
 if(USE_VULKAN OR USE_OPENGL)
 	find_package(PkgConfig REQUIRED)
