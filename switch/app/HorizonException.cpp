@@ -9,6 +9,7 @@
 #include "common/Horizon/HorizonFastmem.h"
 
 #include <cstdarg>
+#include <cstdlib>
 #include <cstddef>
 #include <cstdio>
 #include <cstring>
@@ -172,11 +173,13 @@ namespace HorizonException
 
 		Horizon::BreadcrumbInit(report_dir);
 		Breadcrumb("HorizonException::Initialize");
+
+		std::atexit(&Shutdown);
 	}
 
 	void Shutdown()
 	{
-		Breadcrumb("HorizonException::Shutdown");
+		Breadcrumb("exit handlers done");
 		if (s_report_fd >= 0)
 		{
 			close(s_report_fd);

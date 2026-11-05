@@ -604,11 +604,12 @@ int main(int argc, char* argv[])
 	VMManager::Internal::CPUThreadShutdown();
 	Horizon::ExitTrace("CPUThreadShutdown done (SysMemory released, JIT freed)");
 	Horizon::AuditHeapToExitTrace("after shutdown");
+	HorizonThreadWrap::AuditUnjoinedThreads("after shutdown");
 
 	if (romfs_available)
 		romfsExit();
-	HorizonException::Shutdown();
 	Horizon::ExitTrace("clean exit");
+	HorizonException::Breadcrumb("main returning");
 	appletUnlockExit();
 	return 0;
 }
