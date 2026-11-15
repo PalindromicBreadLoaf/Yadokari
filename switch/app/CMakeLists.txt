@@ -243,8 +243,8 @@ endif()
 set_property(TARGET yadokari_romfs APPEND PROPERTY DKP_ASSET_FILES ${DK3D_DKSH_FILES} "${YADOKARI_RESOURCE_STAMP}")
 
 nx_generate_nacp(OUTPUT yadokari.nacp
-	NAME "Yadokari"
-	AUTHOR "ARMSX2 Team & PalindromicBreadLoaf"
+	NAME "OunceSX2"
+	AUTHOR "ARMSX2 Team, PalindromicBreadLoaf & nyathea"
 	VERSION "${YADOKARI_NRO_VERSION}"
 )
 nx_create_nro(yadokari

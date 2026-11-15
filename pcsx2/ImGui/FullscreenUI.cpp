@@ -1337,7 +1337,7 @@ void FullscreenUI::DrawLandingTemplate(ImVec2* menu_pos, ImVec2* menu_size)
 			dl->AddImage(reinterpret_cast<ImTextureID>(GetCachedTexture("icons/AppIconLarge.png")->GetNativeHandle()),
 				logo_pos, logo_pos + logo_size);
 			const ImVec2 branding_pos(logo_pos.x + logo_size.x + LayoutScale(LAYOUT_MENU_BUTTON_X_PADDING), logo_pos.y);
-			ImGuiFullscreen::AddTextWithShadow(dl, heading_font, branding_pos, ImGui::GetColorU32(ImGuiCol_Text), "ARMSX2");
+			ImGuiFullscreen::AddTextWithShadow(dl, heading_font, branding_pos, ImGui::GetColorU32(ImGuiCol_Text), "OunceSX2");
 		}
 
 		// draw time
@@ -1569,7 +1569,7 @@ void FullscreenUI::DrawExitWindow()
 			QueueResetFocus(FocusResetType::WindowChanged);
 		}
 
-		if (HorizontalMenuSvgItem("fullscreenui/exit.svg", FSUI_CSTR("Exit ARMSX2"),
+		if (HorizontalMenuSvgItem("fullscreenui/exit.svg", FSUI_CSTR("Exit OunceSX2"),
 				FSUI_CSTR("Completely exits the application, returning you to your desktop.")))
 		{
 			DoRequestExit();
@@ -3436,10 +3436,10 @@ void FullscreenUI::DrawSetupWindow()
 		case SetupStep::Welcome:
 		{
 			BeginMenuButtons();
-			MenuHeading(FSUI_CSTR("Welcome to ARMSX2!"));
+			MenuHeading(FSUI_CSTR("Welcome to OunceSX2!"));
 			ActiveButton(FSUI_CSTR("Navigate with the D-Pad, and use the shoulder buttons to move between steps."), false, false,
 				LAYOUT_MENU_BUTTON_HEIGHT_NO_SUMMARY);
-			if (MenuButton(FSUI_ICONSTR(ICON_FA_GEAR, "Set Up ARMSX2"),
+			if (MenuButton(FSUI_ICONSTR(ICON_FA_GEAR, "Set Up OunceSX2"),
 					FSUI_CSTR("Choose a BIOS, add your game directories, and optionally sign in to RetroAchievements.")))
 				go_next();
 			ImGui::SetItemDefaultFocus();
@@ -3480,7 +3480,7 @@ void FullscreenUI::DrawSetupWindow()
 			BeginMenuButtons();
 			MenuHeading(FSUI_CSTR("Performance"));
 			DrawToggleSetting(bsi, FSUI_ICONSTR(ICON_FA_WAND_MAGIC, "Automatic Performance Tuning"),
-				FSUI_CSTR("When a game can't keep full speed, ARMSX2 tries lighter settings for that game one at a time and keeps the ones "
+				FSUI_CSTR("When a game can't keep full speed, OunceSX2 tries lighter settings for that game one at a time and keeps the ones "
 						  "that help. You can reset it for any game from the game's settings."),
 				"EmuCore", "AutoTune", false);
 			EndMenuButtons();
@@ -3500,7 +3500,7 @@ void FullscreenUI::DrawSetupWindow()
 				LAYOUT_MENU_BUTTON_HEIGHT_NO_SUMMARY);
 			if (IsDriverSetupInstalled())
 			{
-				ActiveButton(FSUI_CSTR("The GPU driver you installed loads when ARMSX2 restarts. ARMSX2 restarts when you finish."), false, false,
+				ActiveButton(FSUI_CSTR("The GPU driver you installed loads when OunceSX2 restarts. OunceSX2 restarts when you finish."), false, false,
 					LAYOUT_MENU_BUTTON_HEIGHT_NO_SUMMARY);
 			}
 			if (MenuButton(FSUI_ICONSTR(ICON_FA_CHECK, "Finish and Start Playing"),
@@ -3772,13 +3772,13 @@ void FullscreenUI::DrawAboutWindow()
 {
 	ImGui::SetNextWindowSize(LayoutScale(1000.0f, 600.0f));
 	ImGui::SetNextWindowPos(ImGui::GetIO().DisplaySize * 0.5f, ImGuiCond_Always, ImVec2(0.5f, 0.5f));
-	ImGui::OpenPopup(FSUI_CSTR("About ARMSX2"));
+	ImGui::OpenPopup(FSUI_CSTR("About OunceSX2"));
 
 	ImGui::PushFont(g_large_font.first, g_large_font.second);
 	ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, LayoutScale(ImGuiFullscreen::LAYOUT_WINDOW_ROUNDING));
 	ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, LayoutScale(30.0f, 30.0f));
 
-	if (ImGui::BeginPopupModal(FSUI_CSTR("About ARMSX2"), &s_about_window_open, ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize))
+	if (ImGui::BeginPopupModal(FSUI_CSTR("About OunceSX2"), &s_about_window_open, ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize))
 	{
 		const ImVec2 image_size = LayoutScale(500.0f, 76.0f);
 		const ImRect image_bb(ImGui::GetCursorScreenPos(), ImGui::GetCursorScreenPos() + ImVec2(ImGui::GetCurrentWindow()->WorkRect.GetWidth(), image_size.y));
@@ -3797,7 +3797,7 @@ void FullscreenUI::DrawAboutWindow()
 		const float indent = LayoutScale(12.0f);
 		ImGui::SetCursorPosY(ImGui::GetCursorPosY() + indent);
 		ImGui::TextWrapped("%s", FSUI_CSTR(
-									 "ARMSX2 is a free and open-source PlayStation 2 (PS2) emulator. Its purpose is to emulate the PS2's hardware, using a "
+									 "OunceSX2 is a free and open-source PlayStation 2 (PS2) emulator. Its purpose is to emulate the PS2's hardware, using a "
 									 "combination of MIPS CPU Interpreters, Recompilers and a Virtual Machine which manages hardware states and PS2 system memory. "
 									 "This allows you to play PS2 games on your PC, with many additional features and benefits."));
 		ImGui::NewLine();
@@ -4029,7 +4029,7 @@ void FullscreenUI::DrawCoverDownloaderWindow()
 		BeginMenuButtons();
 		ResetFocusHere();
 
-		ImGui::TextWrapped("%s", FSUI_CSTR("ARMSX2 can automatically download covers for games which do not currently have a cover set. We do not host any cover images, the user must provide their own source for images."));
+		ImGui::TextWrapped("%s", FSUI_CSTR("OunceSX2 can automatically download covers for games which do not currently have a cover set. We do not host any cover images, the user must provide their own source for images."));
 		ImGui::SetCursorPosY(ImGui::GetCursorPosY() + LayoutScale(8.0f));
 		ImGui::TextWrapped("%s", FSUI_CSTR("Enter one or more cover image URL templates below. Variables such as ${serial} and ${title} are supported. See the Qt Cover Downloader for more information."));
 
@@ -4401,7 +4401,7 @@ TRANSLATE_NOOP("FullscreenUI", "Start BIOS");
 TRANSLATE_NOOP("FullscreenUI", "Start the console without any disc inserted.");
 TRANSLATE_NOOP("FullscreenUI", "Back");
 TRANSLATE_NOOP("FullscreenUI", "Return to the previous menu.");
-TRANSLATE_NOOP("FullscreenUI", "Exit ARMSX2");
+TRANSLATE_NOOP("FullscreenUI", "Exit OunceSX2");
 TRANSLATE_NOOP("FullscreenUI", "Completely exits the application, returning you to your desktop.");
 TRANSLATE_NOOP("FullscreenUI", "Desktop Mode");
 TRANSLATE_NOOP("FullscreenUI", "Exits Big Picture mode, returning to the desktop interface.");
@@ -4416,15 +4416,15 @@ TRANSLATE_NOOP("FullscreenUI", "Search Directories");
 TRANSLATE_NOOP("FullscreenUI", "Adds a new directory to the game search list.");
 TRANSLATE_NOOP("FullscreenUI", "Scanning Subdirectories");
 TRANSLATE_NOOP("FullscreenUI", "Not Scanning Subdirectories");
-TRANSLATE_NOOP("FullscreenUI", "Welcome to ARMSX2!");
+TRANSLATE_NOOP("FullscreenUI", "Welcome to OunceSX2!");
 TRANSLATE_NOOP("FullscreenUI", "Navigate with the D-Pad, and use the shoulder buttons to move between steps.");
 TRANSLATE_NOOP("FullscreenUI", "Choose a BIOS, add your game directories, and optionally sign in to RetroAchievements.");
 TRANSLATE_NOOP("FullscreenUI", "Go straight to the main menu. You can configure everything later from Settings.");
 TRANSLATE_NOOP("FullscreenUI", "Performance");
-TRANSLATE_NOOP("FullscreenUI", "When a game can't keep full speed, ARMSX2 tries lighter settings for that game one at a time and keeps the ones that help. You can reset it for any game from the game's settings.");
+TRANSLATE_NOOP("FullscreenUI", "When a game can't keep full speed, OunceSX2 tries lighter settings for that game one at a time and keeps the ones that help. You can reset it for any game from the game's settings.");
 TRANSLATE_NOOP("FullscreenUI", "Setup Complete!");
 TRANSLATE_NOOP("FullscreenUI", "You're all set. These options can be changed at any time from the Settings menu.");
-TRANSLATE_NOOP("FullscreenUI", "The GPU driver you installed loads when ARMSX2 restarts. ARMSX2 restarts when you finish.");
+TRANSLATE_NOOP("FullscreenUI", "The GPU driver you installed loads when OunceSX2 restarts. OunceSX2 restarts when you finish.");
 TRANSLATE_NOOP("FullscreenUI", "Completes setup and opens the main menu.");
 TRANSLATE_NOOP("FullscreenUI", "Game List Settings");
 TRANSLATE_NOOP("FullscreenUI", "List Settings");
@@ -4435,10 +4435,10 @@ TRANSLATE_NOOP("FullscreenUI", "Shows Titles for Games when in Game Grid View Mo
 TRANSLATE_NOOP("FullscreenUI", "Operations");
 TRANSLATE_NOOP("FullscreenUI", "Identifies any new files added to the game directories.");
 TRANSLATE_NOOP("FullscreenUI", "Forces a full rescan of all games previously identified.");
-TRANSLATE_NOOP("FullscreenUI", "About ARMSX2");
-TRANSLATE_NOOP("FullscreenUI", "ARMSX2 is a free and open-source PlayStation 2 (PS2) emulator. Its purpose is to emulate the PS2's hardware, using a combination of MIPS CPU Interpreters, Recompilers and a Virtual Machine which manages hardware states and PS2 system memory. This allows you to play PS2 games on your PC, with many additional features and benefits.");
+TRANSLATE_NOOP("FullscreenUI", "About OunceSX2");
+TRANSLATE_NOOP("FullscreenUI", "OunceSX2 is a free and open-source PlayStation 2 (PS2) emulator. Its purpose is to emulate the PS2's hardware, using a combination of MIPS CPU Interpreters, Recompilers and a Virtual Machine which manages hardware states and PS2 system memory. This allows you to play PS2 games on your PC, with many additional features and benefits.");
 TRANSLATE_NOOP("FullscreenUI", "PlayStation 2 and PS2 are registered trademarks of Sony Interactive Entertainment. This application is not affiliated in any way with Sony Interactive Entertainment.");
-TRANSLATE_NOOP("FullscreenUI", "ARMSX2 can automatically download covers for games which do not currently have a cover set. We do not host any cover images, the user must provide their own source for images.");
+TRANSLATE_NOOP("FullscreenUI", "OunceSX2 can automatically download covers for games which do not currently have a cover set. We do not host any cover images, the user must provide their own source for images.");
 TRANSLATE_NOOP("FullscreenUI", "Enter one or more cover image URL templates below. Variables such as ${serial} and ${title} are supported. See the Qt Cover Downloader for more information.");
 TRANSLATE_NOOP("FullscreenUI", "URLs:");
 TRANSLATE_NOOP("FullscreenUI", "Saves covers using the game's title instead of serial number.");
@@ -4533,7 +4533,7 @@ TRANSLATE_NOOP("FullscreenUI", "Open in File Browser");
 TRANSLATE_NOOP("FullscreenUI", "Disable Subdirectory Scanning");
 TRANSLATE_NOOP("FullscreenUI", "Enable Subdirectory Scanning");
 TRANSLATE_NOOP("FullscreenUI", "Remove From List");
-TRANSLATE_NOOP("FullscreenUI", "Set Up ARMSX2");
+TRANSLATE_NOOP("FullscreenUI", "Set Up OunceSX2");
 TRANSLATE_NOOP("FullscreenUI", "Skip Setup and Start Playing");
 TRANSLATE_NOOP("FullscreenUI", "Automatic Performance Tuning");
 TRANSLATE_NOOP("FullscreenUI", "Finish and Start Playing");

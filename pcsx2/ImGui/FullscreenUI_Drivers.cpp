@@ -429,7 +429,7 @@ namespace
 				if (ui_up)
 				{
 					ShowInstallNotice(fmt::format(FSUI_FSTR("Installed {}"), tag),
-						s_state.install_from_setup ? FSUI_STR("ARMSX2 uses it after it restarts, when you finish setup.") :
+						s_state.install_from_setup ? FSUI_STR("OunceSX2 uses it after it restarts, when you finish setup.") :
 													 FSUI_STR("Choose it on the GPU Drivers page to use it."),
 						6.0f);
 				}
@@ -544,7 +544,7 @@ namespace
 		std::string error;
 		if (!DP::RelaunchAtExit(&error))
 		{
-			OpenInfoMessageDialog(FSUI_STR("Cannot Restart"), error.empty() ? std::string(FSUI_STR("ARMSX2 could not prepare to restart.")) : error);
+			OpenInfoMessageDialog(FSUI_STR("Cannot Restart"), error.empty() ? std::string(FSUI_STR("OunceSX2 could not prepare to restart.")) : error);
 			return;
 		}
 		Host::RunOnCPUThread([]() { Host::RequestExitApplication(false); });
@@ -571,7 +571,7 @@ namespace
 		message += "\n\n";
 		message += FSUI_STR("Restart now?");
 
-		OpenConfirmMessageDialog(FSUI_STR("Restart ARMSX2?"), std::move(message), [](bool yes) {
+		OpenConfirmMessageDialog(FSUI_STR("Restart OunceSX2?"), std::move(message), [](bool yes) {
 			if (yes)
 				DoRestartNow();
 		}, false);
@@ -590,7 +590,7 @@ namespace
 		if (PackIsUnusableHere(pack))
 		{
 			OpenConfirmMessageDialog(FSUI_STR("Wayland Only"),
-				FSUI_STR("This driver pack was built for Wayland sessions only, and ARMSX2 is running in an X11 session. "
+				FSUI_STR("This driver pack was built for Wayland sessions only, and OunceSX2 is running in an X11 session. "
 						 "It will probably not be able to show a picture.\n\nUse it anyway?"),
 				[bsi, id = pack.id](bool yes) {
 					if (yes)
@@ -712,8 +712,8 @@ namespace
 		{
 			const bool game = VMManager::HasValidVM();
 			if (MenuButton(FSUI_ICONSTR(ICON_FA_ARROWS_ROTATE, "Restart Now"),
-					game ? FSUI_CSTR("The driver you chose applies the next time ARMSX2 starts. Restarting closes ARMSX2 and the running game, then opens it again.") :
-						   FSUI_CSTR("The driver you chose applies the next time ARMSX2 starts. Restart now to use it; ARMSX2 opens again with the same options.")))
+					game ? FSUI_CSTR("The driver you chose applies the next time OunceSX2 starts. Restarting closes OunceSX2 and the running game, then opens it again.") :
+						   FSUI_CSTR("The driver you chose applies the next time OunceSX2 starts. Restart now to use it; OunceSX2 opens again with the same options.")))
 			{
 				RequestRestart();
 			}
@@ -726,8 +726,8 @@ namespace
 					FSUI_CSTR("The selected pack was built for Wayland sessions only, and this is an X11 session. Choose another driver.")))
 			{
 				OpenInfoMessageDialog(FSUI_STR("Wayland Only"),
-					FSUI_STR("The selected driver pack was built for Wayland sessions only, and ARMSX2 is running in an X11 session. "
-							 "It will probably not be able to show a picture. Choose the system driver or another pack, or start ARMSX2 in a Wayland session."));
+					FSUI_STR("The selected driver pack was built for Wayland sessions only, and OunceSX2 is running in an X11 session. "
+							 "It will probably not be able to show a picture. Choose the system driver or another pack, or start OunceSX2 in a Wayland session."));
 			}
 		}
 
@@ -752,7 +752,7 @@ namespace
 		const bool system_chosen = selected.empty();
 		{
 			const std::string title = fmt::format("{} {}###drv_system", system_chosen ? ICON_FA_CIRCLE_DOT : ICON_FA_CIRCLE, FSUI_STR("System Driver"));
-			if (MenuButtonWithValue(title.c_str(), FSUI_CSTR("The Vulkan driver that came with this device. A change applies the next time ARMSX2 starts."),
+			if (MenuButtonWithValue(title.c_str(), FSUI_CSTR("The Vulkan driver that came with this device. A change applies the next time OunceSX2 starts."),
 					system_chosen ? FSUI_CSTR("Selected") : "") &&
 				!system_chosen)
 			{
@@ -778,7 +778,7 @@ namespace
 					FSUI_CSTR("Not Installed")))
 			{
 				OpenInfoMessageDialog(FSUI_STR("Not Installed"),
-					fmt::format(FSUI_FSTR("The selected driver pack \"{}\" is not installed, so ARMSX2 uses the system driver."), selected));
+					fmt::format(FSUI_FSTR("The selected driver pack \"{}\" is not installed, so OunceSX2 uses the system driver."), selected));
 			}
 		}
 	}
@@ -1015,13 +1015,13 @@ void FullscreenUI::DrawDriverSetupStep()
 
 	BeginMenuButtons();
 	MenuHeading(FSUI_CSTR("GPU Driver"));
-	ActiveButton(FSUI_CSTR("ARMSX2 has its own Vulkan driver for your GPU. It is the driver ARMSX2 is tuned for."), false, false,
+	ActiveButton(FSUI_CSTR("OunceSX2 has its own Vulkan driver for your GPU. It is the driver OunceSX2 is tuned for."), false, false,
 		LAYOUT_MENU_BUTTON_HEIGHT_NO_SUMMARY);
 
 	if (!s_state.setup_installed_id.empty())
 	{
 		const std::string title = fmt::format("{} {}###drv_setup_done", ICON_FA_CIRCLE_CHECK, fmt::format(FSUI_FSTR("Installed {}"), s_state.setup_installed_tag));
-		MenuButton(title.c_str(), FSUI_CSTR("ARMSX2 restarts when you finish setup so the driver can load."));
+		MenuButton(title.c_str(), FSUI_CSTR("OunceSX2 restarts when you finish setup so the driver can load."));
 	}
 	else if (s_state.installing && s_state.install_from_setup)
 	{
@@ -1084,19 +1084,19 @@ TRANSLATE_NOOP("FullscreenUI", "Unpacking...");
 TRANSLATE_NOOP("FullscreenUI", "Checking that the driver loads...");
 TRANSLATE_NOOP("FullscreenUI", "Finishing...");
 TRANSLATE_NOOP("FullscreenUI", "Starting...");
-TRANSLATE_NOOP("FullscreenUI", "ARMSX2 uses it after it restarts, when you finish setup.");
+TRANSLATE_NOOP("FullscreenUI", "OunceSX2 uses it after it restarts, when you finish setup.");
 TRANSLATE_NOOP("FullscreenUI", "Choose it on the GPU Drivers page to use it.");
 TRANSLATE_NOOP("FullscreenUI", "The install was cancelled. Nothing was changed.");
 TRANSLATE_NOOP("FullscreenUI", "The install failed.");
 TRANSLATE_NOOP("FullscreenUI", "Another driver is being installed.");
 TRANSLATE_NOOP("FullscreenUI", "Cannot Restart");
-TRANSLATE_NOOP("FullscreenUI", "ARMSX2 could not prepare to restart.");
+TRANSLATE_NOOP("FullscreenUI", "OunceSX2 could not prepare to restart.");
 TRANSLATE_NOOP("FullscreenUI", "A game is running. Restarting closes it, and anything you have not saved is lost.");
 TRANSLATE_NOOP("FullscreenUI", "A driver is still being installed. Restarting cancels it.");
 TRANSLATE_NOOP("FullscreenUI", "Restart now?");
-TRANSLATE_NOOP("FullscreenUI", "Restart ARMSX2?");
+TRANSLATE_NOOP("FullscreenUI", "Restart OunceSX2?");
 TRANSLATE_NOOP("FullscreenUI", "Wayland Only");
-TRANSLATE_NOOP("FullscreenUI", "This driver pack was built for Wayland sessions only, and ARMSX2 is running in an X11 session. It will probably not be able to show a picture.\n\nUse it anyway?");
+TRANSLATE_NOOP("FullscreenUI", "This driver pack was built for Wayland sessions only, and OunceSX2 is running in an X11 session. It will probably not be able to show a picture.\n\nUse it anyway?");
 TRANSLATE_NOOP("FullscreenUI", "Delete Driver Pack?");
 TRANSLATE_NOOP("FullscreenUI", "Cannot Delete");
 TRANSLATE_NOOP("FullscreenUI", "The driver pack could not be deleted.");
@@ -1107,7 +1107,7 @@ TRANSLATE_NOOP("FullscreenUI", "GPU Drivers");
 TRANSLATE_NOOP("FullscreenUI", "Driver packs are Turnip builds for Qualcomm Adreno GPUs. This device has no Adreno GPU, so it keeps using its system driver.");
 TRANSLATE_NOOP("FullscreenUI", "Driver packs are only offered on Linux.");
 TRANSLATE_NOOP("FullscreenUI", "Driver In Use");
-TRANSLATE_NOOP("FullscreenUI", "The selected driver pack was built for Wayland sessions only, and ARMSX2 is running in an X11 session. It will probably not be able to show a picture. Choose the system driver or another pack, or start ARMSX2 in a Wayland session.");
+TRANSLATE_NOOP("FullscreenUI", "The selected driver pack was built for Wayland sessions only, and OunceSX2 is running in an X11 session. It will probably not be able to show a picture. Choose the system driver or another pack, or start OunceSX2 in a Wayland session.");
 TRANSLATE_NOOP("FullscreenUI", "Not Installed");
 TRANSLATE_NOOP("FullscreenUI", "Pre-release");
 TRANSLATE_NOOP("FullscreenUI", "Installing");
@@ -1115,12 +1115,12 @@ TRANSLATE_NOOP("FullscreenUI", "Download");
 TRANSLATE_NOOP("FullscreenUI", "The feed has no driver packs for this device right now.");
 TRANSLATE_NOOP("FullscreenUI", "Driver packs are Turnip builds for Qualcomm Adreno GPUs. This device uses its system driver.");
 TRANSLATE_NOOP("FullscreenUI", "Current Driver");
-TRANSLATE_NOOP("FullscreenUI", "The driver you chose applies the next time ARMSX2 starts. Restarting closes ARMSX2 and the running game, then opens it again.");
-TRANSLATE_NOOP("FullscreenUI", "The driver you chose applies the next time ARMSX2 starts. Restart now to use it; ARMSX2 opens again with the same options.");
+TRANSLATE_NOOP("FullscreenUI", "The driver you chose applies the next time OunceSX2 starts. Restarting closes OunceSX2 and the running game, then opens it again.");
+TRANSLATE_NOOP("FullscreenUI", "The driver you chose applies the next time OunceSX2 starts. Restart now to use it; OunceSX2 opens again with the same options.");
 TRANSLATE_NOOP("FullscreenUI", "The selected pack was built for Wayland sessions only, and this is an X11 session. Choose another driver.");
 TRANSLATE_NOOP("FullscreenUI", "Dismiss");
 TRANSLATE_NOOP("FullscreenUI", "Choose Driver");
-TRANSLATE_NOOP("FullscreenUI", "The Vulkan driver that came with this device. A change applies the next time ARMSX2 starts.");
+TRANSLATE_NOOP("FullscreenUI", "The Vulkan driver that came with this device. A change applies the next time OunceSX2 starts.");
 TRANSLATE_NOOP("FullscreenUI", "Selected");
 TRANSLATE_NOOP("FullscreenUI", "This driver pack is not installed. Select the system driver or install the pack.");
 TRANSLATE_NOOP("FullscreenUI", "Available Driver Packs");
@@ -1130,8 +1130,8 @@ TRANSLATE_NOOP("FullscreenUI", "GitHub could not be reached, so this list may be
 TRANSLATE_NOOP("FullscreenUI", "Asks GitHub for the current list of driver packs.");
 TRANSLATE_NOOP("FullscreenUI", "Installed Driver Packs");
 TRANSLATE_NOOP("FullscreenUI", "GPU Driver");
-TRANSLATE_NOOP("FullscreenUI", "ARMSX2 has its own Vulkan driver for your GPU. It is the driver ARMSX2 is tuned for.");
-TRANSLATE_NOOP("FullscreenUI", "ARMSX2 restarts when you finish setup so the driver can load.");
+TRANSLATE_NOOP("FullscreenUI", "OunceSX2 has its own Vulkan driver for your GPU. It is the driver OunceSX2 is tuned for.");
+TRANSLATE_NOOP("FullscreenUI", "OunceSX2 restarts when you finish setup so the driver can load.");
 TRANSLATE_NOOP("FullscreenUI", "Choose a driver later under Settings, GPU Drivers.");
 TRANSLATE_NOOP("FullscreenUI", "Using the driver pack \"{}\".");
 TRANSLATE_NOOP("FullscreenUI", "The selected driver pack \"{}\" is not installed. The system driver is in use.");
@@ -1147,7 +1147,7 @@ TRANSLATE_NOOP("FullscreenUI", "\n\nVersion: {}");
 TRANSLATE_NOOP("FullscreenUI", "\nMesa: {}");
 TRANSLATE_NOOP("FullscreenUI", "\n\nWhen this pack is loaded, the GS log's \"VK: GPU\" line ends with {}.");
 TRANSLATE_NOOP("FullscreenUI", "Installing {}: {}");
-TRANSLATE_NOOP("FullscreenUI", "The selected driver pack \"{}\" is not installed, so ARMSX2 uses the system driver.");
+TRANSLATE_NOOP("FullscreenUI", "The selected driver pack \"{}\" is not installed, so OunceSX2 uses the system driver.");
 TRANSLATE_NOOP("FullscreenUI", "Could not load the {} list");
 TRANSLATE_NOOP("FullscreenUI", "{} is already installed.");
 TRANSLATE_NOOP("FullscreenUI", "Delete {}");

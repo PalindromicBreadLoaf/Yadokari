@@ -143,7 +143,7 @@ extern "C" __attribute__((noreturn)) void __horizon_unhandled_exception(ThreadEx
 	const u64 lr_off = (ctx->lr.x >= elf_base) ? (ctx->lr.x - elf_base) : 0;
 
 	Report report;
-	report.Append("\n===== Yadokari crash report =====\n");
+	report.Append("\n===== OunceSX2 crash report =====\n");
 	report.Append("tick=%016lx aarch64=%d thr=0x%08x main=0x%08x\n", svcGetSystemTick(),
 		threadExceptionIsAArch64(ctx) ? 1 : 0, threadGetCurHandle(), envGetMainThreadHandle());
 	report.Append("cause: %s (error_desc=0x%03x)\n", DescribeError(ctx->error_desc), ctx->error_desc);
