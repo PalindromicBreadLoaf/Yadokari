@@ -540,14 +540,10 @@ extern "C" void userAppInit(void)
 	mkdir(GAMES_DIR, 0777);
 	mkdir(LOGS_DIR, 0777);
 
-	std::freopen(Path::Combine(LOGS_DIR, "stderr.txt").c_str(), "w", stderr);
-	std::setvbuf(stderr, nullptr, _IONBF, 0);
-
 	HorizonException::Initialize(LOGS_DIR);
 	HorizonException::Breadcrumb("userAppInit");
 	std::atexit([]() {
 		// Registered first, so it runs last: every destructor and exit handler of the program is done.
-		Horizon::ExitTrace("atexit: last (userAppInit)");
 		HorizonThreadWrap::ReleaseLiveThreads("at exit", true);
 		char line[96];
 		std::snprintf(line, sizeof(line), "code mappings released at exit: %zu", Horizon::ReleaseLeftoverCodeMappings());
@@ -556,45 +552,7 @@ extern "C" void userAppInit(void)
 	});
 }
 
-extern "C" u32 nvkmd_nvgpu_native_exit_status(void) __attribute__((weak));
-extern "C" void __real___nx_gpu_exit(void) __attribute__((weak));
-extern "C" void __real___nx_win_exit(void) __attribute__((weak));
-
-extern "C" void __wrap___nx_gpu_exit(void)
-{
-	Horizon::ExitTrace("__nx_gpu_exit: begin");
-	if (&__real___nx_gpu_exit)
-		__real___nx_gpu_exit();
-	if (&nvkmd_nvgpu_native_exit_status)
-	{
-		char line[64];
-		std::snprintf(line, sizeof(line), "__nx_gpu_exit: done (status=0x%x)", nvkmd_nvgpu_native_exit_status());
-		Horizon::ExitTrace(line);
-	}
-	else
-	{
-		Horizon::ExitTrace("__nx_gpu_exit: done");
-	}
-	Horizon::AuditHeapToExitTrace("after __nx_gpu_exit");
-}
-
-extern "C" void __wrap___nx_win_exit(void)
-{
-	Horizon::ExitTrace("__nx_win_exit: begin");
-	if (&__real___nx_win_exit)
-		__real___nx_win_exit();
-	{
-		const Result rc = nwindowReleaseVi2Layer(nwindowGetDefault());
-		char line[64];
-		std::snprintf(line, sizeof(line), "__nx_win_exit: done (release_vi2=0x%x)", rc);
-		Horizon::ExitTrace(line);
-	}
-	Horizon::AuditHeapToExitTrace("after __nx_win_exit");
-	std::fflush(stderr);
-}
-
-extern "C" void __real___libnx_exit(int rc) __attribute__((noreturn));
-extern "C" void __real___syscall_exit(int rc);
+extern "C" void __libnx_exit(int rc) __attribute__((noreturn));
 
 extern "C" __attribute__((noreturn)) void __wrap_diagAbortWithResult(Result res)
 {
@@ -603,24 +561,12 @@ extern "C" __attribute__((noreturn)) void __wrap_diagAbortWithResult(Result res)
 	std::snprintf(line, sizeof(line), "diagAbortWithResult(0x%08x) lr=%p", res, __builtin_return_address(0));
 	Horizon::ExitTrace(line);
 	if (!s_aborting.exchange(true, std::memory_order_acq_rel))
-		__real___libnx_exit(1);
+		__libnx_exit(1);
 	const LoaderReturnFn exit_fn = envGetExitFuncPtr();
 	if (exit_fn)
 		exit_fn(1);
 	svcExitProcess();
 	__builtin_unreachable();
-}
-
-extern "C" void __wrap___syscall_exit(int rc)
-{
-	Horizon::ExitTrace("__syscall_exit reached");
-	__real___syscall_exit(rc);
-}
-
-extern "C" __attribute__((noreturn)) void __wrap___libnx_exit(int rc)
-{
-	Horizon::ExitTrace("__libnx_exit reached");
-	__real___libnx_exit(rc);
 }
 
 extern "C" void userAppExit(void)
@@ -743,7 +689,6 @@ int main(int argc, char* argv[])
 	Log::SetFileOutputLevel(LOGLEVEL_NONE, "");
 	std::fflush(nullptr);
 
-	std::atexit([]() { Horizon::ExitTrace("atexit: first (main)"); });
 	Horizon::ExitTrace("clean exit");
 	HorizonException::Breadcrumb("main returning");
 	return 0;

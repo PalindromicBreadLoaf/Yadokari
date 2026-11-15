@@ -246,7 +246,7 @@ namespace
 		mutexLock(&s_lock);
 		for (int i = 0; i < s_early_count; ++i)
 		{
-			char line[112];
+			char line[128];
 			std::snprintf(line, sizeof(line), "%s (before main)", s_early[i]);
 			Horizon::ExitTrace(line);
 		}

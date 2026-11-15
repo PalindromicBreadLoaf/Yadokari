@@ -52,7 +52,7 @@ endif()
 target_link_options(yadokari PRIVATE -Wl,--wrap=pthread_create -Wl,--wrap=pthread_join)
 if(NINTENDO_SWITCH2)
 	target_sources(yadokari PRIVATE ServiceLookupGuard.cpp)
-	target_link_options(yadokari PRIVATE -Wl,--wrap=__nx_gpu_exit -Wl,--wrap=__nx_win_exit -Wl,--wrap=__syscall_exit -Wl,--wrap=__libnx_exit -Wl,--wrap=diagAbortWithResult -Wl,--wrap=smGetServiceWrapper -Wl,--wrap=smGetServiceOriginal)
+	target_link_options(yadokari PRIVATE -Wl,--wrap=diagAbortWithResult -Wl,--wrap=smGetServiceWrapper -Wl,--wrap=smGetServiceOriginal)
 endif()
 
 if(USE_VULKAN OR USE_OPENGL)
