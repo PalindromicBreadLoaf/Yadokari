@@ -20,6 +20,7 @@
 #include "pcsx2/ImGui/ImGuiManager.h"
 #include "pcsx2/Input/InputManager.h"
 #include "pcsx2/MTGS.h"
+#include "pcsx2/Patch.h"
 #include "pcsx2/SIO/Pad/Pad.h"
 #include "pcsx2/SIO/Pad/PadDualshock2.h"
 #include "pcsx2/VMManager.h"
@@ -33,6 +34,7 @@
 #include <array>
 #include <atomic>
 #include <cmath>
+#include <cstdio>
 #include <memory>
 #include <optional>
 #include <string>
@@ -62,6 +64,43 @@ namespace
 	std::atomic_bool s_applet_backgrounded{false};
 	std::atomic_bool s_applet_resumed{false};
 	bool s_paused_for_applet = false;
+	bool s_romfs_available = false;
+	bool s_exit_locked = false;
+	bool s_services_shutdown = false;
+	s32 s_initial_ideal_core = -1;
+	u64 s_initial_affinity_mask = 0;
+
+	void ShutdownAppServices()
+	{
+		if (s_services_shutdown)
+			return;
+		s_services_shutdown = true;
+
+		HorizonUsbStorage::Shutdown();
+		Horizon::ShutdownNetwork();
+		if (s_romfs_available)
+		{
+			romfsExit();
+			s_romfs_available = false;
+		}
+		if (s_initial_affinity_mask != 0)
+		{
+			svcSetThreadCoreMask(CUR_THREAD_HANDLE, s_initial_ideal_core, s_initial_affinity_mask);
+			s_initial_affinity_mask = 0;
+		}
+		if (s_exit_locked)
+		{
+			appletUnlockExit();
+			s_exit_locked = false;
+		}
+	}
+
+	void SafeStdioExitHandler()
+	{
+		Horizon::ExitTrace("stdio_exit_handler: begin");
+		std::fflush(nullptr);
+		Horizon::ExitTrace("stdio_exit_handler: done");
+	}
 
 	void AppletHookCallback(AppletHookType hook, void*)
 	{
@@ -490,17 +529,114 @@ void Host::CommitBaseSettingChanges()
 		ERROR_LOG("Failed to save settings: {}", error.GetDescription());
 }
 
-int main(int argc, char* argv[])
+extern "C" void (*__stdio_exit_handler)(void);
+
+extern "C" void userAppInit(void)
 {
-	Horizon::ReserveCore3ForCallingThread();
-	appletLockExit();
+	svcGetThreadCoreMask(&s_initial_ideal_core, &s_initial_affinity_mask, CUR_THREAD_HANDLE);
 
 	mkdir("sdmc:/switch", 0777);
 	mkdir(YADOKARI_ROOT, 0777);
 	mkdir(GAMES_DIR, 0777);
 	mkdir(LOGS_DIR, 0777);
 
+	std::freopen(Path::Combine(LOGS_DIR, "stderr.txt").c_str(), "w", stderr);
+	std::setvbuf(stderr, nullptr, _IONBF, 0);
+
 	HorizonException::Initialize(LOGS_DIR);
+	HorizonException::Breadcrumb("userAppInit");
+	std::atexit([]() {
+		// Registered first, so it runs last: every destructor and exit handler of the program is done.
+		Horizon::ExitTrace("atexit: last (userAppInit)");
+		HorizonThreadWrap::ReleaseLiveThreads("at exit", true);
+		char line[96];
+		std::snprintf(line, sizeof(line), "code mappings released at exit: %zu", Horizon::ReleaseLeftoverCodeMappings());
+		Horizon::ExitTrace(line);
+		__stdio_exit_handler = SafeStdioExitHandler;
+	});
+}
+
+extern "C" u32 nvkmd_nvgpu_native_exit_status(void) __attribute__((weak));
+extern "C" void __real___nx_gpu_exit(void) __attribute__((weak));
+extern "C" void __real___nx_win_exit(void) __attribute__((weak));
+
+extern "C" void __wrap___nx_gpu_exit(void)
+{
+	Horizon::ExitTrace("__nx_gpu_exit: begin");
+	if (&__real___nx_gpu_exit)
+		__real___nx_gpu_exit();
+	if (&nvkmd_nvgpu_native_exit_status)
+	{
+		char line[64];
+		std::snprintf(line, sizeof(line), "__nx_gpu_exit: done (status=0x%x)", nvkmd_nvgpu_native_exit_status());
+		Horizon::ExitTrace(line);
+	}
+	else
+	{
+		Horizon::ExitTrace("__nx_gpu_exit: done");
+	}
+	Horizon::AuditHeapToExitTrace("after __nx_gpu_exit");
+}
+
+extern "C" void __wrap___nx_win_exit(void)
+{
+	Horizon::ExitTrace("__nx_win_exit: begin");
+	if (&__real___nx_win_exit)
+		__real___nx_win_exit();
+	{
+		const Result rc = nwindowReleaseVi2Layer(nwindowGetDefault());
+		char line[64];
+		std::snprintf(line, sizeof(line), "__nx_win_exit: done (release_vi2=0x%x)", rc);
+		Horizon::ExitTrace(line);
+	}
+	Horizon::AuditHeapToExitTrace("after __nx_win_exit");
+	std::fflush(stderr);
+}
+
+extern "C" void __real___libnx_exit(int rc) __attribute__((noreturn));
+extern "C" void __real___syscall_exit(int rc);
+
+extern "C" __attribute__((noreturn)) void __wrap_diagAbortWithResult(Result res)
+{
+	static std::atomic_bool s_aborting{false};
+	char line[96];
+	std::snprintf(line, sizeof(line), "diagAbortWithResult(0x%08x) lr=%p", res, __builtin_return_address(0));
+	Horizon::ExitTrace(line);
+	if (!s_aborting.exchange(true, std::memory_order_acq_rel))
+		__real___libnx_exit(1);
+	const LoaderReturnFn exit_fn = envGetExitFuncPtr();
+	if (exit_fn)
+		exit_fn(1);
+	svcExitProcess();
+	__builtin_unreachable();
+}
+
+extern "C" void __wrap___syscall_exit(int rc)
+{
+	Horizon::ExitTrace("__syscall_exit reached");
+	__real___syscall_exit(rc);
+}
+
+extern "C" __attribute__((noreturn)) void __wrap___libnx_exit(int rc)
+{
+	Horizon::ExitTrace("__libnx_exit reached");
+	__real___libnx_exit(rc);
+}
+
+extern "C" void userAppExit(void)
+{
+	ShutdownAppServices();
+	Horizon::ExitTrace("userAppExit");
+	HorizonException::Shutdown();
+}
+
+int main(int argc, char* argv[])
+{
+	HorizonException::Breadcrumb("main entered");
+	Horizon::ReserveCore3ForCallingThread();
+	appletLockExit();
+	s_exit_locked = true;
+
 	Horizon::ExitTrace("=== main entered");
 	Horizon::AuditHeapToExitTrace("startup");
 
@@ -513,17 +649,17 @@ int main(int argc, char* argv[])
 		INFO_LOG("Horizon fastmem unavailable: {}", HorizonFastmem::GetSupportReason());
 	HorizonException::Breadcrumb("fastmem checked");
 
-	const bool romfs_available = R_SUCCEEDED(romfsInit());
-	HorizonException::Breadcrumb(romfs_available ? "romfsInit ok" : "romfsInit failed");
+	s_romfs_available = R_SUCCEEDED(romfsInit());
+	HorizonException::Breadcrumb(s_romfs_available ? "romfsInit ok" : "romfsInit failed");
 	EmuFolders::AppRoot = YADOKARI_ROOT;
 	EmuFolders::DataRoot = YADOKARI_ROOT;
 	EmuFolders::Settings = Path::Combine(YADOKARI_ROOT, "inis");
-	if (romfs_available)
+	if (s_romfs_available)
 		EmuFolders::Resources = "romfs:/resources";
 	else if (!EmuFolders::SetResourcesDirectory())
 	{
 		ERROR_LOG("ROMFS is unavailable and no SD resources directory was found");
-		appletUnlockExit();
+		ShutdownAppServices();
 		return 1;
 	}
 
@@ -531,9 +667,7 @@ int main(int argc, char* argv[])
 	if (!InitializeSettings())
 	{
 		ERROR_LOG("Failed to initialize Switch settings");
-		if (romfs_available)
-			romfsExit();
-		appletUnlockExit();
+		ShutdownAppServices();
 		return 1;
 	}
 
@@ -542,9 +676,7 @@ int main(int argc, char* argv[])
 	{
 		ERROR_LOG("Failed to initialize the Switch frontend");
 		VMManager::Internal::CPUThreadShutdown();
-		if (romfs_available)
-			romfsExit();
-		appletUnlockExit();
+		ShutdownAppServices();
 		return 1;
 	}
 
@@ -594,7 +726,6 @@ int main(int argc, char* argv[])
 	appletUnhook(&applet_hook);
 	Host::CancelGameListRefresh();
 	Catalog::AutoCovers::Shutdown();
-	HorizonUsbStorage::Shutdown();
 	if (VMManager::GetState() != VMState::Shutdown)
 		VMManager::Shutdown(HorizonHost::TakeResumeSaveRequest());
 	Horizon::ExitTrace("VMManager::Shutdown done");
@@ -602,14 +733,18 @@ int main(int argc, char* argv[])
 		MTGS::WaitForClose();
 	Horizon::ExitTrace("MTGS closed");
 	VMManager::Internal::CPUThreadShutdown();
+	Patch::UnloadPatches();
 	Horizon::ExitTrace("CPUThreadShutdown done (SysMemory released, JIT freed)");
 	Horizon::AuditHeapToExitTrace("after shutdown");
-	HorizonThreadWrap::AuditUnjoinedThreads("after shutdown");
+	HorizonThreadWrap::ReleaseLiveThreads("after shutdown", false);
 
-	if (romfs_available)
-		romfsExit();
+	// Close emulog.txt cleanly while SDMC is still mounted and before exit() runs.
+	VMManager::Internal::SetFileLogPath("");
+	Log::SetFileOutputLevel(LOGLEVEL_NONE, "");
+	std::fflush(nullptr);
+
+	std::atexit([]() { Horizon::ExitTrace("atexit: first (main)"); });
 	Horizon::ExitTrace("clean exit");
 	HorizonException::Breadcrumb("main returning");
-	appletUnlockExit();
 	return 0;
 }

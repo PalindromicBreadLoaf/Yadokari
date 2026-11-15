@@ -10,6 +10,7 @@
 #include <map>
 #include <memory>
 #include <string>
+#include <utility>
 
 class Error;
 
@@ -116,8 +117,18 @@ namespace HostSys
 	/// Only needed on ARM64, X86 has coherent D/I cache.
 #ifdef ARCH_X86
 	[[maybe_unused]] __fi static void FlushInstructionCache(void* address, u32 size) {}
+	[[maybe_unused]] __fi static void FlushInstructionCacheRanges(const std::pair<void*, u32>* ranges, size_t count) {}
 #else
 	void FlushInstructionCache(void* address, u32 size);
+#ifdef __SWITCH2__
+	void FlushInstructionCacheRanges(const std::pair<void*, u32>* ranges, size_t count);
+#else
+	__fi static void FlushInstructionCacheRanges(const std::pair<void*, u32>* ranges, size_t count)
+	{
+		for (size_t i = 0; i < count; i++)
+			FlushInstructionCache(ranges[i].first, ranges[i].second);
+	}
+#endif
 #endif
 
 #if defined(__SWITCH__)

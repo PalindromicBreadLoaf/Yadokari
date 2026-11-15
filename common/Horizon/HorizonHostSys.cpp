@@ -12,11 +12,16 @@
 #include <cstring>
 #include <map>
 #include <mutex>
+#include <vector>
 
 #include <malloc.h>
 
 #include "common/Horizon/Horizon.h"
 #include "common/Horizon/HorizonFastmem.h"
+
+#ifdef __SWITCH2__
+#include <kaihen.h>
+#endif
 
 namespace
 {
@@ -94,6 +99,43 @@ namespace
 		return (it != s_areas.end()) ? it->second.backend : AreaBackend::LibnxSvcMapMemory;
 	}
 } // namespace
+
+size_t Horizon::ReleaseLeftoverCodeMappings()
+{
+	std::vector<Jit> leftovers;
+	{
+		std::lock_guard lock(s_code_mutex);
+		for (auto& [rx, mapping] : s_code_mappings)
+			leftovers.push_back(mapping.jit);
+		s_code_mappings.clear();
+	}
+	for (Jit& jit : leftovers)
+		jitClose(&jit);
+
+	std::map<void*, HorizonRamMapping> ram_leftovers;
+	std::map<void*, HorizonRamMapping> alias_leftovers;
+	{
+		std::lock_guard lock(s_shm_mutex);
+		ram_leftovers.swap(s_ram_mappings);
+		alias_leftovers.swap(s_alias_mappings);
+	}
+	for (const auto& [map_base, mapping] : ram_leftovers)
+	{
+		svcSetMemoryPermission(map_base, mapping.size, Perm_Rw);
+		virtmemLock();
+		svcUnmapMemory(map_base, mapping.src, mapping.size);
+		virtmemUnlock();
+	}
+	for (const auto& [map_base, mapping] : alias_leftovers)
+	{
+		svcSetMemoryPermission(map_base, mapping.size, Perm_Rw);
+		virtmemLock();
+		svcUnmapProcessMemory(map_base, envGetOwnProcessHandle(),
+			reinterpret_cast<u64>(mapping.src), mapping.size);
+		virtmemUnlock();
+	}
+	return leftovers.size() + ram_leftovers.size() + alias_leftovers.size();
+}
 
 void HostSys::MemProtect(void* baseaddr, size_t size, const PageProtectionMode& mode)
 {
@@ -227,16 +269,102 @@ void HostSys::FlushInstructionCache(void* address, u32 size)
 {
 	char* const rx = static_cast<char*>(address);
 	char* rw = rx;
+#ifdef __SWITCH2__
+	Jit jit{};
+	bool found = false;
+	size_t offset = 0;
+	{
+		std::lock_guard lock(s_code_mutex);
+		if (const HorizonCodeMapping* mapping = FindCodeMapping(address))
+		{
+			jit = mapping->jit;
+			offset = static_cast<const u8*>(address) - mapping->rx;
+			found = true;
+		}
+	}
+	if (found)
+	{
+		if (size > 0)
+		{
+			const KaihenJitRange range{offset, size};
+			const Result rc = kaihenJitPublishRanges(&jit, &range, 1);
+			if (R_FAILED(rc))
+			{
+				Console.Error("HostSys::FlushInstructionCache: kaihenJitPublishRanges(0x%zx, 0x%x) failed: 0x%08x",
+					offset, size, static_cast<u32>(rc));
+			}
+		}
+		return;
+	}
+#else
 	{
 		std::lock_guard lock(s_code_mutex);
 		if (const HorizonCodeMapping* mapping = FindCodeMapping(address))
 			rw = reinterpret_cast<char*>(mapping->rw + (reinterpret_cast<u8*>(rx) - mapping->rx));
 	}
+#endif
 
 	__builtin___clear_cache(rw, rw + size);
 	if (rw != rx)
 		__builtin___clear_cache(rx, rx + size);
 }
+
+#ifdef __SWITCH2__
+void HostSys::FlushInstructionCacheRanges(const std::pair<void*, u32>* ranges, size_t count)
+{
+	if (count == 0)
+		return;
+	if (count == 1)
+	{
+		FlushInstructionCache(ranges[0].first, ranges[0].second);
+		return;
+	}
+
+	size_t i = 0;
+	while (i < count)
+	{
+		Jit jit{};
+		const u8* rx_base = nullptr;
+		std::vector<KaihenJitRange> batch;
+		{
+			std::lock_guard lock(s_code_mutex);
+			const HorizonCodeMapping* mapping = FindCodeMapping(ranges[i].first);
+			if (mapping)
+			{
+				jit = mapping->jit;
+				rx_base = mapping->rx;
+				while (i < count)
+				{
+					const auto& [addr, sz] = ranges[i];
+					if (FindCodeMapping(addr) != mapping)
+						break;
+					if (sz > 0)
+						batch.push_back(KaihenJitRange{static_cast<size_t>(static_cast<const u8*>(addr) - rx_base), sz});
+					i++;
+				}
+			}
+		}
+		if (rx_base)
+		{
+			if (!batch.empty())
+			{
+				const Result rc = kaihenJitPublishRanges(&jit, batch.data(), batch.size());
+				if (R_FAILED(rc))
+				{
+					Console.Error("HostSys::FlushInstructionCacheRanges: kaihenJitPublishRanges(%zu ranges) failed: 0x%08x",
+						batch.size(), static_cast<u32>(rc));
+				}
+			}
+		}
+		else
+		{
+			char* const rx = static_cast<char*>(ranges[i].first);
+			__builtin___clear_cache(rx, rx + ranges[i].second);
+			i++;
+		}
+	}
+}
+#endif
 
 SharedMemoryMappingArea::SharedMemoryMappingArea(u8* base_ptr, size_t size, size_t num_pages)
 	: m_base_ptr(base_ptr)

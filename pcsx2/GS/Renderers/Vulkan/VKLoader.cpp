@@ -29,6 +29,23 @@
 #include "common/Path.h"
 #endif
 
+#ifdef __SWITCH2__
+namespace ouncevk_native
+{
+extern "C" PFN_vkVoidFunction vkGetInstanceProcAddr(VkInstance instance, const char* pName);
+}
+
+namespace pcsx2_vk
+{
+#define VULKAN_MODULE_ENTRY_POINT(name, required) PFN_##name name;
+#define VULKAN_INSTANCE_ENTRY_POINT(name, required) PFN_##name name;
+#define VULKAN_DEVICE_ENTRY_POINT(name, required) PFN_##name name;
+#include "VKEntryPoints.inl"
+#undef VULKAN_DEVICE_ENTRY_POINT
+#undef VULKAN_INSTANCE_ENTRY_POINT
+#undef VULKAN_MODULE_ENTRY_POINT
+} // namespace pcsx2_vk
+#else
 extern "C" {
 
 #define VULKAN_MODULE_ENTRY_POINT(name, required) PFN_##name name;
@@ -39,9 +56,12 @@ extern "C" {
 #undef VULKAN_INSTANCE_ENTRY_POINT
 #undef VULKAN_MODULE_ENTRY_POINT
 }
+#endif
 
 #ifdef __SWITCH__
+#ifndef __SWITCH2__
 extern "C" PFN_vkVoidFunction vk_icdGetInstanceProcAddr(VkInstance instance, const char* pName);
+#endif
 
 static bool IsLoaderOnlyModuleFunction(const char* name)
 {
@@ -229,8 +249,10 @@ bool Vulkan::IsVulkanLibraryLoaded()
 bool Vulkan::LoadVulkanLibrary(Error* error)
 {
 #ifdef __SWITCH__
+#ifndef __SWITCH2__
 	// Set required NXVK environment variables.
 	setenv("NVK_I_WANT_A_BROKEN_VULKAN_DRIVER", "1", 1);
+#endif
 
 	const std::string mesa_cache_dir = Path::Combine(EmuFolders::Cache, "mesa");
 	if (FileSystem::CreateDirectoryPath(mesa_cache_dir.c_str(), true))
@@ -245,11 +267,15 @@ bool Vulkan::LoadVulkanLibrary(Error* error)
 		setenv("MESA_SHADER_CACHE_DISABLE", "1", 1);
 	}
 
+#ifdef __SWITCH2__
+	vkGetInstanceProcAddr = reinterpret_cast<PFN_vkGetInstanceProcAddr>(&ouncevk_native::vkGetInstanceProcAddr);
+#else
 	vkGetInstanceProcAddr = reinterpret_cast<PFN_vkGetInstanceProcAddr>(&vk_icdGetInstanceProcAddr);
+#endif
 
 	bool required_functions_missing = false;
 #define VULKAN_MODULE_ENTRY_POINT(name, required) \
-	if (PFN_vkVoidFunction pfn = vk_icdGetInstanceProcAddr(VK_NULL_HANDLE, #name)) \
+	if (PFN_vkVoidFunction pfn = vkGetInstanceProcAddr(VK_NULL_HANDLE, #name)) \
 		name = reinterpret_cast<PFN_##name>(pfn); \
 	if (!name && required && !IsLoaderOnlyModuleFunction(#name) && !IsInstanceDispatchModuleFunction(#name)) \
 	{ \

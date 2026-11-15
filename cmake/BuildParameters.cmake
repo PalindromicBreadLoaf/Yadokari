@@ -180,7 +180,10 @@ elseif("${CMAKE_SYSTEM_PROCESSOR}" STREQUAL "arm64" OR "${CMAKE_SYSTEM_PROCESSOR
 		add_compile_options("-march=armv8.4-a+crypto" "-mcpu=apple-m1")
 	elseif(HORIZON)
 		set(CMAKE_POSITION_INDEPENDENT_CODE ON)
-		add_compile_options("-march=armv8-a+crc" "-mtune=cortex-a57" -flax-vector-conversions)
+		if(NOT NINTENDO_SWITCH2)
+			add_compile_options("-march=armv8-a+crc" "-mtune=cortex-a57")
+		endif()
+		add_compile_options(-flax-vector-conversions)
 		option(ARMSX2_FRAME_POINTERS "Keep frame pointers so the Switch profiler can record full call stacks" OFF)
 		if(ARMSX2_FRAME_POINTERS)
 			add_compile_options(-fno-omit-frame-pointer -mno-omit-leaf-frame-pointer)
@@ -250,6 +253,9 @@ elseif("${CMAKE_SYSTEM_PROCESSOR}" STREQUAL "arm64" OR "${CMAKE_SYSTEM_PROCESSOR
 			OVERRIDE_HOST_CACHE_LINE_SIZE=64
 			__SWITCH__=1
 			__LINUX_ERRNO_EXTENSIONS__=1)
+		if(NINTENDO_SWITCH2)
+			list(APPEND PCSX2_DEFS __SWITCH2__=1)
+		endif()
 	endif()
 else()
 	message(FATAL_ERROR "Unsupported architecture: ${CMAKE_SYSTEM_PROCESSOR}")

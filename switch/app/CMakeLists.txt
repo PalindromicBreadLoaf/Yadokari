@@ -41,35 +41,54 @@ target_link_libraries(yadokari PRIVATE
 	PCSX2_FLAGS
 	-Wl,--end-group
 	usbhsfs
-	deko3d
 )
 
+if(NINTENDO_SWITCH2)
+	target_link_libraries(yadokari PRIVATE kaihen)
+else()
+	target_link_libraries(yadokari PRIVATE deko3d)
+endif()
+
 target_link_options(yadokari PRIVATE -Wl,--wrap=pthread_create -Wl,--wrap=pthread_join)
+if(NINTENDO_SWITCH2)
+	target_sources(yadokari PRIVATE ServiceLookupGuard.cpp)
+	target_link_options(yadokari PRIVATE -Wl,--wrap=__nx_gpu_exit -Wl,--wrap=__nx_win_exit -Wl,--wrap=__syscall_exit -Wl,--wrap=__libnx_exit -Wl,--wrap=diagAbortWithResult -Wl,--wrap=smGetServiceWrapper -Wl,--wrap=smGetServiceOriginal)
+endif()
 
 if(USE_VULKAN OR USE_OPENGL)
 	find_package(PkgConfig REQUIRED)
-	if(USE_OPENGL)
-		pkg_check_modules(NXVK REQUIRED nxvk-gl)
+	if(NINTENDO_SWITCH2)
+		pkg_check_modules(OUNCEVK REQUIRED vulkan)
+		target_sources(yadokari PRIVATE nvk_compat.cpp)
+		target_include_directories(yadokari PRIVATE ${OUNCEVK_INCLUDE_DIRS})
+		target_compile_options(yadokari PRIVATE ${OUNCEVK_CFLAGS_OTHER})
+		target_link_libraries(yadokari PRIVATE ${OUNCEVK_LDFLAGS})
 	else()
-		pkg_check_modules(NXVK REQUIRED nxvk)
+		if(USE_OPENGL)
+			pkg_check_modules(NXVK REQUIRED nxvk-gl)
+		else()
+			pkg_check_modules(NXVK REQUIRED nxvk)
+		endif()
+
+		# newlib shims required by NXVK.
+		target_sources(yadokari PRIVATE nvk_compat.cpp)
+		target_include_directories(yadokari PRIVATE ${NXVK_INCLUDE_DIRS})
+		target_compile_options(yadokari PRIVATE ${NXVK_CFLAGS_OTHER})
+
+		target_link_libraries(yadokari PRIVATE ${NXVK_LDFLAGS})
 	endif()
-
-	# newlib shims required by NXVK.
-	target_sources(yadokari PRIVATE nvk_compat.cpp)
-	target_include_directories(yadokari PRIVATE ${NXVK_INCLUDE_DIRS})
-	target_compile_options(yadokari PRIVATE ${NXVK_CFLAGS_OTHER})
-
-	target_link_libraries(yadokari PRIVATE ${NXVK_LDFLAGS})
 endif()
 
+set(DK3D_ROMFS_DIR "${CMAKE_CURRENT_BINARY_DIR}/romfs")
+file(MAKE_DIRECTORY "${DK3D_ROMFS_DIR}")
+set(DK3D_DKSH_FILES "")
+
+if(NOT NINTENDO_SWITCH2)
 include("${CMAKE_CURRENT_SOURCE_DIR}/../cmake/Uam.cmake")
 
 set(DK3D_SHADER_SRC_DIR "${CMAKE_SOURCE_DIR}/pcsx2/GS/Renderers/DK3D/shaders")
-set(DK3D_ROMFS_DIR "${CMAKE_CURRENT_BINARY_DIR}/romfs")
 set(DK3D_ROMFS_SHADER_DIR "${DK3D_ROMFS_DIR}/shaders")
 file(MAKE_DIRECTORY "${DK3D_ROMFS_SHADER_DIR}")
-
-set(DK3D_DKSH_FILES "")
 
 # Compile each glsl to dksh with uam.
 function(dk3d_add_shader NAME STAGE)
@@ -168,6 +187,7 @@ list(APPEND DK3D_DKSH_FILES "${DK3D_ROMFS_SHADER_DIR}/cas_csh.dksh")
 
 add_custom_target(yadokari_shaders DEPENDS ${DK3D_DKSH_FILES})
 add_dependencies(yadokari yadokari_shaders)
+endif()
 
 # Embed resources into the romfs
 set(YADOKARI_RESOURCE_SRC_DIR "${CMAKE_SOURCE_DIR}/bin/resources")
@@ -216,7 +236,10 @@ add_custom_target(yadokari_resources DEPENDS "${YADOKARI_RESOURCE_STAMP}")
 
 # Pack the compiled shaders and resources into the NRO's ROMFS.
 dkp_add_asset_target(yadokari_romfs "${DK3D_ROMFS_DIR}")
-add_dependencies(yadokari_romfs yadokari_shaders yadokari_resources)
+add_dependencies(yadokari_romfs yadokari_resources)
+if(TARGET yadokari_shaders)
+	add_dependencies(yadokari_romfs yadokari_shaders)
+endif()
 set_property(TARGET yadokari_romfs APPEND PROPERTY DKP_ASSET_FILES ${DK3D_DKSH_FILES} "${YADOKARI_RESOURCE_STAMP}")
 
 nx_generate_nacp(OUTPUT yadokari.nacp

@@ -293,7 +293,11 @@ static CPUInfo CalcCPUInfo()
 	if (!cpuinfo_initialize())
 	{
 		const unsigned hc = std::thread::hardware_concurrency();
+#ifdef __SWITCH2__
+		out.name = "NVIDIA Tegra T239";
+#else
 		out.name = "NVIDIA Tegra X1";
+#endif
 		out.num_threads = hc ? hc : 4;
 		out.num_big_cores = out.num_threads;
 		out.num_small_cores = 0;

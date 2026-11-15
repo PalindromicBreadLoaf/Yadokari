@@ -1398,9 +1398,9 @@ bool vtlb_Core_Alloc()
 		if (!s_fastmem_area)
 		{
 			// 4 GB virtual reservation can fail on devices with limited VA space
-			// (e.g. iPhone SE 2 with 4 GB RAM under LiveContainer). On iOS we
-			// continue without fastmem instead of aborting boot.
-#if TARGET_OS_IPHONE && !TARGET_OS_SIMULATOR
+			// (e.g. iPhone SE 2 with 4 GB RAM under LiveContainer, or Switch 2
+			// without Horizon fastmem). Continue without fastmem instead of aborting boot.
+#if (TARGET_OS_IPHONE && !TARGET_OS_SIMULATOR) || defined(__SWITCH__)
 			Console.Warning("Fastmem disabled: 4 GB virtual-address reservation failed; continuing without fastmem");
 			vtlbdata.fastmem_base = 0;
 			EmuConfig.Cpu.Recompiler.EnableFastmem = false;

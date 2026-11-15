@@ -3,8 +3,13 @@
 
 #pragma once
 
+#ifdef __SWITCH2__
+namespace pcsx2_vk
+{
+#else
 #ifdef __cplusplus
 extern "C" {
+#endif
 #endif
 
 #define VULKAN_MODULE_ENTRY_POINT(name, required) extern PFN_##name name;
@@ -15,6 +20,11 @@ extern "C" {
 #undef VULKAN_INSTANCE_ENTRY_POINT
 #undef VULKAN_MODULE_ENTRY_POINT
 
+#ifdef __SWITCH2__
+} // namespace pcsx2_vk
+using namespace pcsx2_vk;
+#else
 #ifdef __cplusplus
 }
+#endif
 #endif

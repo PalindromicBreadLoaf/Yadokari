@@ -281,17 +281,19 @@ void ArmCodePatchFlusher::Finish()
 	if (m_lines.empty())
 		return;
 
-#ifdef __APPLE__
+#if defined(__APPLE__) || defined(__SWITCH2__)
 	// sys_icache_invalidate (what HostSys::FlushInstructionCache calls here) is
 	// the sanctioned interface on Darwin and the only one that stays correct
-	// under the iOS dual-map and Legacy W^X modes, so this path coalesces the
-	// touched lines into runs and flushes each run instead of issuing CMOs by
-	// hand. One call per run rather than one per word; a run costs an
-	// invalidate of the gaps inside it, which is why the gap cap is a page.
+	// under the iOS dual-map and Legacy W^X modes (and Switch 2 kaiHEN JIT
+	// staging publication), so this path coalesces the touched lines into runs
+	// and flushes each run instead of issuing CMOs by hand. One call per run
+	// rather than one per word; a run costs an invalidate of the gaps inside
+	// it, which is why the gap cap is a page.
 	std::sort(m_lines.begin(), m_lines.end());
 	const size_t granule = armCodePatchGranule();
 	constexpr uintptr_t kMaxGap = 4096;
 
+	std::vector<std::pair<void*, u32>> flush_ranges;
 	uintptr_t lo = m_lines[0];
 	uintptr_t hi = m_lines[0] + granule;
 	for (size_t i = 1; i < m_lines.size(); i++)
@@ -301,11 +303,12 @@ void ArmCodePatchFlusher::Finish()
 			hi = m_lines[i] + granule;
 			continue;
 		}
-		HostSys::FlushInstructionCache(reinterpret_cast<void*>(lo), static_cast<u32>(hi - lo));
+		flush_ranges.emplace_back(reinterpret_cast<void*>(lo), static_cast<u32>(hi - lo));
 		lo = m_lines[i];
 		hi = m_lines[i] + granule;
 	}
-	HostSys::FlushInstructionCache(reinterpret_cast<void*>(lo), static_cast<u32>(hi - lo));
+	flush_ranges.emplace_back(reinterpret_cast<void*>(lo), static_cast<u32>(hi - lo));
+	HostSys::FlushInstructionCacheRanges(flush_ranges.data(), flush_ranges.size());
 #else
 	// Clean every touched line to the point of unification, one barrier, then
 	// invalidate all of them for instruction fetch, then the closing pair. The
@@ -739,6 +742,9 @@ u8* ArmConstantPool::GetLiteral(const u128& value)
 	HostSys::BeginCodeWriteRange(literal_ptr, sizeof(value));
 	std::memcpy(armGetWritableCodePtr(literal_ptr), &value, sizeof(value));
 	HostSys::EndCodeWriteRange(literal_ptr, sizeof(value));
+#ifdef __SWITCH2__
+	HostSys::FlushInstructionCache(literal_ptr, sizeof(value));
+#endif
 	m_used = offset + sizeof(value);
 	return literal_ptr;
 }
@@ -761,6 +767,9 @@ u8* ArmConstantPool::GetBlob(const u8* bytes, size_t len)
 	HostSys::BeginCodeWriteRange(blob_ptr, len);
 	std::memcpy(armGetWritableCodePtr(blob_ptr), bytes, len);
 	HostSys::EndCodeWriteRange(blob_ptr, len);
+#ifdef __SWITCH2__
+	HostSys::FlushInstructionCache(blob_ptr, static_cast<u32>(len));
+#endif
 	m_used = offset + static_cast<u32>(len);
 	return blob_ptr;
 }

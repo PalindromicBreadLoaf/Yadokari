@@ -404,6 +404,8 @@ GSRendererType GSUtil::GetPreferredRenderer()
 #elif defined(_WIN32)
 		// Use D3D device info to select renderer.
 		preferred_renderer = D3D::GetPreferredRenderer();
+#elif defined(__SWITCH2__)
+		preferred_renderer = GSRendererType::VK;
 #elif defined(__SWITCH__)
 		preferred_renderer = GSRendererType::DK3D;
 #elif defined(__ANDROID__)

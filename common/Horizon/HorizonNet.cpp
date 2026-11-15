@@ -39,6 +39,15 @@ namespace Horizon
 		return s_network_available;
 	}
 
+	void ShutdownNetwork()
+	{
+		if (!s_network_available)
+			return;
+		s_network_available = false;
+		sslExit();
+		socketExit();
+	}
+
 	void BreadcrumbInit(const char* report_dir)
 	{
 		if (s_boot_fd >= 0 || !report_dir)
@@ -101,8 +110,23 @@ namespace Horizon
 
 	void AuditHeapToExitTrace(const char* when)
 	{
-		const u64 begin = reinterpret_cast<u64>(fake_heap_start);
-		const u64 end = reinterpret_cast<u64>(fake_heap_end);
+		u64 begin = reinterpret_cast<u64>(fake_heap_start);
+		u64 end = reinterpret_cast<u64>(fake_heap_end);
+		if (begin >= end && envHasHeapOverride())
+		{
+			begin = reinterpret_cast<u64>(envGetHeapOverrideAddr());
+			end = begin + envGetHeapOverrideSize();
+		}
+		if (begin >= end)
+		{
+			u64 h_addr = 0, h_size = 0;
+			if (R_SUCCEEDED(svcGetInfo(&h_addr, InfoType_HeapRegionAddress, CUR_PROCESS_HANDLE, 0)) &&
+				R_SUCCEEDED(svcGetInfo(&h_size, InfoType_HeapRegionSize, CUR_PROCESS_HANDLE, 0)))
+			{
+				begin = h_addr;
+				end = h_addr + h_size;
+			}
+		}
 		char line[256];
 		if (begin >= end)
 		{

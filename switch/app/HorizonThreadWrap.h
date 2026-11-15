@@ -6,7 +6,9 @@
 
 namespace HorizonThreadWrap
 {
-	// Logs to exit.txt every thread that was never joined and whose stack is still
-	// borrowed from the heap.
-	void AuditUnjoinedThreads(const char* when);
+	// Logs to exit.txt every thread that was never joined and is still running or still has its stack
+	// mirrored. With stop_running, also waits briefly for running threads, pauses the ones left and unmaps
+	// their stacks so the next program started by the loader gets the heap back. Returns how many were
+	// still running.
+	int ReleaseLiveThreads(const char* when, bool stop_running);
 } // namespace HorizonThreadWrap

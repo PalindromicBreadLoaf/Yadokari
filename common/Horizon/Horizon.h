@@ -18,6 +18,10 @@ namespace Horizon
 
 	// Lazily brings up the BSD socket
 	bool EnsureNetworkInitialized();
+	void ShutdownNetwork();
+
+	// Closes any executable (JIT) mapping still open at exit; returns how many. 0 off Switch 2.
+	size_t ReleaseLeftoverCodeMappings();
 
 	// Init logging
 	void BreadcrumbInit(const char* report_dir);

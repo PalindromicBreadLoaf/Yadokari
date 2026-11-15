@@ -66,8 +66,13 @@ u64 Horizon::GetProcessCoreMask()
 
 void Horizon::ReserveCore3ForCallingThread()
 {
+#ifdef __SWITCH2__
+	const u64 mask = GetProcessCoreMask();
+	if (mask && R_FAILED(svcSetThreadCoreMask(CUR_THREAD_HANDLE, -1, mask)))
+#else
 	const u64 mask = GetProcessCoreMask() & 0x7;
 	if (mask && R_FAILED(svcSetThreadCoreMask(CUR_THREAD_HANDLE, __builtin_ctzll(mask), mask)))
+#endif
 		Console.Warning("Switch: failed to restrict worker to application cores");
 }
 
@@ -154,7 +159,13 @@ bool Threading::ThreadHandle::SetAffinity(u64 processor_mask) const
 	const u64 allowed_cores = Horizon::GetProcessCoreMask();
 	if (allowed_cores == 0)
 		return false;
+#ifdef __SWITCH2__
+	const u64 mask = processor_mask ? (processor_mask & allowed_cores) : allowed_cores;
+	const s32 ideal_core = processor_mask ? __builtin_ctzll(mask) : -1;
+#else
 	const u64 mask = processor_mask ? (processor_mask & allowed_cores) : (allowed_cores & 0x7);
+	const s32 ideal_core = __builtin_ctzll(mask);
+#endif
 	if (!mask)
 		return false;
 
@@ -171,7 +182,7 @@ bool Threading::ThreadHandle::SetAffinity(u64 processor_mask) const
 			return false;
 		handle = it->second;
 	}
-	const Result result = svcSetThreadCoreMask(handle, __builtin_ctzll(mask), mask);
+	const Result result = svcSetThreadCoreMask(handle, ideal_core, mask);
 	if (R_FAILED(result))
 		Console.Warning("Switch: setting thread affinity 0x%llx failed: 0x%08x",
 			static_cast<unsigned long long>(mask), result);

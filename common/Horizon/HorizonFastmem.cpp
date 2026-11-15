@@ -42,7 +42,7 @@ namespace
 	void ThrottledError(const char* format, ...)
 	{
 		static std::atomic<u64> s_last_tick{0};
-		constexpr u64 TICKS_PER_SECOND = 19200000ULL;
+		static const u64 TICKS_PER_SECOND = armGetSystemTickFreq();
 		const u64 now = armGetSystemTick();
 		const u64 last = s_last_tick.load(std::memory_order_relaxed);
 		if (now - last < TICKS_PER_SECOND)

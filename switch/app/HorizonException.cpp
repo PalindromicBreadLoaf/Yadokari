@@ -8,6 +8,7 @@
 #include "common/Horizon/Horizon.h"
 #include "common/Horizon/HorizonFastmem.h"
 
+#include <atomic>
 #include <cstdarg>
 #include <cstdlib>
 #include <cstddef>
@@ -18,6 +19,8 @@
 
 extern "C"
 {
+	extern char __start__[];
+	void __libnx_exit(int rc) __attribute__((noreturn));
 	alignas(0x1000) u8 __nx_exception_stack[EXCEPTION_SLOT_COUNT][EXCEPTION_STACK_SIZE];
 	u64 __nx_exception_stack_size = EXCEPTION_STACK_SIZE;
 	alignas(EXCEPTION_SLOT_SIZE) u8 g_horizon_exception_slots[EXCEPTION_SLOT_COUNT][EXCEPTION_SLOT_SIZE];
@@ -107,7 +110,7 @@ bool HorizonFastmem::HasResumableFaultHandler()
 	return true;
 }
 
-extern "C" void __libnx_exception_handler(ThreadExceptionDump* ctx)
+extern "C" bool __libnx_exception_handler(ThreadExceptionDump* ctx)
 {
 	if (threadExceptionIsAArch64(ctx))
 	{
@@ -117,28 +120,37 @@ extern "C" void __libnx_exception_handler(ThreadExceptionDump* ctx)
 			const uptr fault_address = static_cast<uptr>(ctx->far.x);
 
 			if (HorizonFastmem::ResolveFault(fault_address))
-				return;
+				return true;
 
 			const bool is_write = (ctx->esr & (1u << 6)) != 0;
 			if (PageFaultHandler::HandlePageFault(reinterpret_cast<void*>(ctx->pc.x),
 					reinterpret_cast<void*>(fault_address), is_write) ==
 				PageFaultHandler::HandlerResult::ContinueExecution)
 			{
-				return;
+				return true;
 			}
 		}
 	}
 
+	return false;
+}
+
+extern "C" __attribute__((noreturn)) void __horizon_unhandled_exception(ThreadExceptionDump* ctx)
+{
+	static std::atomic_bool s_in_unhandled_exit{false};
+	const u64 elf_base = reinterpret_cast<u64>(__start__);
+	const u64 pc_off = (ctx->pc.x >= elf_base) ? (ctx->pc.x - elf_base) : 0;
+	const u64 lr_off = (ctx->lr.x >= elf_base) ? (ctx->lr.x - elf_base) : 0;
+
 	Report report;
 	report.Append("\n===== Yadokari crash report =====\n");
-	report.Append("tick=%016lx aarch64=%d\n", svcGetSystemTick(),
-		threadExceptionIsAArch64(ctx) ? 1 : 0);
+	report.Append("tick=%016lx aarch64=%d thr=0x%08x main=0x%08x\n", svcGetSystemTick(),
+		threadExceptionIsAArch64(ctx) ? 1 : 0, threadGetCurHandle(), envGetMainThreadHandle());
 	report.Append("cause: %s (error_desc=0x%03x)\n", DescribeError(ctx->error_desc), ctx->error_desc);
-	report.Append("pc =%016lx  lr =%016lx\n", ctx->pc.x, ctx->lr.x);
+	report.Append("elf_base=%016lx\n", elf_base);
+	report.Append("pc =%016lx (+0x%lx)  lr =%016lx (+0x%lx)\n", ctx->pc.x, pc_off, ctx->lr.x, lr_off);
 	report.Append("sp =%016lx  fp =%016lx\n", ctx->sp.x, ctx->fp.x);
 	report.Append("far=%016lx  esr=%08x  pstate=%08x\n", ctx->far.x, ctx->esr, ctx->pstate);
-
-	report.Append("handler@%016lx\n", reinterpret_cast<u64>(&__libnx_exception_handler));
 
 	for (u32 i = 0; i < 29; i += 2)
 	{
@@ -151,13 +163,43 @@ extern "C" void __libnx_exception_handler(ThreadExceptionDump* ctx)
 
 	svcOutputDebugString(report.buffer, report.length);
 
-	if (s_report_fd >= 0)
+	int fd = s_report_fd;
+	bool opened_temp = false;
+	if (fd < 0)
 	{
-		write(s_report_fd, report.buffer, report.length);
-		fsync(s_report_fd);
+		fd = open("sdmc:/switch/yadokari/logs/crash.txt", O_WRONLY | O_CREAT | O_APPEND, 0666);
+		opened_temp = (fd >= 0);
+	}
+	if (fd >= 0)
+	{
+		write(fd, report.buffer, report.length);
+		fsync(fd);
+		if (opened_temp)
+			close(fd);
 	}
 
-	svcExitProcess();
+	char trace_line[192];
+	std::snprintf(trace_line, sizeof(trace_line),
+		"UNHANDLED EXCEPTION: desc=0x%x pc=0x%lx(+0x%lx) lr=0x%lx(+0x%lx) far=0x%lx esr=0x%08x",
+		ctx->error_desc, ctx->pc.x, pc_off, ctx->lr.x, lr_off, ctx->far.x, ctx->esr);
+	Horizon::ExitTrace(trace_line);
+
+	const ExceptionSlot* slot = reinterpret_cast<const ExceptionSlot*>(ctx);
+	if (slot->index < EXCEPTION_SLOT_COUNT)
+		__atomic_fetch_and(&g_horizon_exception_slot_mask, ~(1u << slot->index), __ATOMIC_ACQ_REL);
+
+	if (threadGetCurHandle() == envGetMainThreadHandle())
+	{
+		if (!s_in_unhandled_exit.exchange(true, std::memory_order_acq_rel))
+			__libnx_exit(1);
+
+		const LoaderReturnFn exit_fn = envGetExitFuncPtr();
+		if (exit_fn)
+			exit_fn(1);
+	}
+
+	svcExitThread();
+	__builtin_unreachable();
 }
 
 namespace HorizonException
@@ -173,8 +215,6 @@ namespace HorizonException
 
 		Horizon::BreadcrumbInit(report_dir);
 		Breadcrumb("HorizonException::Initialize");
-
-		std::atexit(&Shutdown);
 	}
 
 	void Shutdown()

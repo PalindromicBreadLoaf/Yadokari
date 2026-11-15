@@ -35,6 +35,7 @@ namespace
 		pthread_t pthread;
 		Handle handle;
 		uptr stack_mem;
+		uptr stack_mirror;
 		size_t stack_sz;
 		uptr start;
 		std::array<uptr, 4> arg_words;
@@ -52,7 +53,8 @@ namespace
 		{
 			std::lock_guard lock(s_live_mutex);
 			s_live_threads.push_back({pthread_self(), self->handle, reinterpret_cast<uptr>(self->stack_mem),
-				self->stack_sz, reinterpret_cast<uptr>(ts.start), ts.arg_words});
+				reinterpret_cast<uptr>(self->stack_mirror), self->stack_sz, reinterpret_cast<uptr>(ts.start),
+				ts.arg_words});
 		}
 		return ts.start(ts.arg);
 	}
@@ -66,15 +68,22 @@ namespace
 			   (info.perm & Perm_R) && addr + sizeof(ThreadStart::arg_words) <= info.addr + info.size;
 	}
 
-	bool StackStillBorrowed(uptr stack_mem)
+	// A thread's stack is mirrored with svcMapMemory: the heap pages under it are inaccessible until the
+	// mirror is unmapped (threadClose). Returns the mapping if the mirror is still there.
+	bool MirrorStillMapped(uptr mirror, MemoryInfo& info)
 	{
-		MemoryInfo info{};
 		u32 page_info;
-		return R_SUCCEEDED(svcQueryMemory(&info, &page_info, stack_mem)) && info.attr != 0;
+		return mirror != 0 && R_SUCCEEDED(svcQueryMemory(&info, &page_info, mirror)) &&
+			   (info.type & 0xff) == MemType_MappedMemory && info.addr == mirror;
+	}
+
+	bool ThreadHasExited(Handle handle)
+	{
+		return R_SUCCEEDED(svcWaitSynchronizationSingle(handle, 0));
 	}
 } // namespace
 
-void HorizonThreadWrap::AuditUnjoinedThreads(const char* when)
+int HorizonThreadWrap::ReleaseLiveThreads(const char* when, bool stop_running)
 {
 	MemoryInfo text{};
 	u32 page_info;
@@ -85,30 +94,68 @@ void HorizonThreadWrap::AuditUnjoinedThreads(const char* when)
 	std::array<Horizon::Profiling::ThreadInfo, Horizon::Profiling::MAX_THREADS> names;
 	const size_t name_count = Horizon::Profiling::SnapshotThreads(names);
 
-	std::lock_guard lock(s_live_mutex);
-	char line[512];
-	u32 listed = 0;
-	for (const LiveThread& t : s_live_threads)
+	std::vector<LiveThread> threads;
 	{
-		if (!StackStillBorrowed(t.stack_mem))
-			continue;
+		std::lock_guard lock(s_live_mutex);
+		threads = s_live_threads;
+	}
+
+	char line[512];
+	if (stop_running)
+	{
+		// Threads still running get a moment to end by themselves.
+		for (int waited = 0; waited < 1000; waited += 10)
+		{
+			bool any_running = false;
+			for (const LiveThread& t : threads)
+				any_running |= !ThreadHasExited(t.handle);
+			if (!any_running)
+				break;
+			svcSleepThread(10'000'000ULL);
+		}
+	}
+
+	u32 listed = 0, running = 0, released = 0;
+	for (const LiveThread& t : threads)
+	{
+		const bool exited = ThreadHasExited(t.handle);
 		const char* name = "?";
 		for (size_t i = 0; i < name_count; i++)
 		{
 			if (names[i].handle == t.handle)
 				name = names[i].name.data();
 		}
-		const bool exited = R_SUCCEEDED(svcWaitSynchronizationSingle(t.handle, 0));
+
+		MemoryInfo info{};
+		const bool mapped = MirrorStillMapped(t.stack_mirror, info);
+		if (exited && !mapped)
+			continue;
+
+		listed++;
+		if (!exited)
+			running++;
 		std::snprintf(line, sizeof(line),
-			"unjoined thread (%s): '%s' %s, stack %#lx-%#lx (%#lx), module base %#lx, start +%#lx, "
+			"unjoined thread (%s): '%s' %s, mirror %s, stack %#lx (%#lx), module base %#lx, start +%#lx, "
 			"arg words %#lx %#lx %#lx %#lx",
-			when, name, exited ? "exited" : "running", t.stack_mem, t.stack_mem + t.stack_sz, t.stack_sz, base,
+			when, name, exited ? "exited" : "RUNNING", mapped ? "mapped" : "gone", t.stack_mem, t.stack_sz, base,
 			t.start - base, t.arg_words[0], t.arg_words[1], t.arg_words[2], t.arg_words[3]);
 		Horizon::ExitTrace(line);
-		listed++;
+
+		if (!stop_running)
+			continue;
+
+		// A thread left running keeps executing this program's code after it has exited (the next program
+		// runs in this same process), and its stack keeps heap pages locked. Pause it for good, as Kaizhar does.
+		if (!exited && R_FAILED(svcSetThreadActivity(t.handle, ThreadActivity_Paused)))
+			continue;
+		if (mapped && R_SUCCEEDED(svcUnmapMemory(reinterpret_cast<void*>(t.stack_mirror),
+							   reinterpret_cast<void*>(t.stack_mem), info.size)))
+			released++;
 	}
-	std::snprintf(line, sizeof(line), "unjoined thread (%s): %u listed", when, listed);
+	std::snprintf(line, sizeof(line), "unjoined thread (%s): %u listed, %u running, %u stacks released", when, listed,
+		running, released);
 	Horizon::ExitTrace(line);
+	return static_cast<int>(running);
 }
 
 extern "C" int __wrap_pthread_create(pthread_t* thread, const pthread_attr_t* attr, void* (*start)(void*), void* arg)

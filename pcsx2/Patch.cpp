@@ -341,7 +341,6 @@ bool Patch::OpenPatchesZip()
 		return false;
 	}
 
-	std::atexit([]() { zip_close(s_patches_zip); });
 	return true;
 }
 
@@ -1051,6 +1050,11 @@ void Patch::UnloadPatches()
 	decltype(s_cheat_patches)().swap(s_cheat_patches);
 	decltype(s_game_patches)().swap(s_game_patches);
 	decltype(s_gamedb_patches)().swap(s_gamedb_patches);
+	if (s_patches_zip)
+	{
+		zip_close(s_patches_zip);
+		s_patches_zip = nullptr;
+	}
 }
 
 // PatchFunc Functions.

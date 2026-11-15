@@ -2902,7 +2902,7 @@ void FullscreenUI::DrawGraphicsSettingsPage(SettingsInterface* bsi, bool show_ad
 #if defined(ENABLE_VULKAN) && !defined(__APPLE__)
 		FSUI_NSTR("Vulkan"),
 #endif
-#ifdef __SWITCH__
+#if defined(__SWITCH__) && !defined(__SWITCH2__)
 		FSUI_NSTR("Deko3D"),
 #endif
 #ifdef __APPLE__
@@ -2923,7 +2923,7 @@ void FullscreenUI::DrawGraphicsSettingsPage(SettingsInterface* bsi, bool show_ad
 #if defined(ENABLE_VULKAN) && !defined(__APPLE__)
 		"14", //GSRendererType::VK,
 #endif
-#ifdef __SWITCH__
+#if defined(__SWITCH__) && !defined(__SWITCH2__)
 		"18", //GSRendererType::DK3D,
 #endif
 #ifdef __APPLE__

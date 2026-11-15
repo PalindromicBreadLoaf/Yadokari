@@ -3199,10 +3199,9 @@ void GSDeviceVK::Destroy()
 
 	EndRenderPass();
 	if (GetCurrentCommandBuffer() != VK_NULL_HANDLE)
-	{
 		ExecuteCommandBuffer(false);
+	if (m_device != VK_NULL_HANDLE)
 		WaitForGPUIdle();
-	}
 
 #ifdef __ANDROID__
 	// The GPU is idle, so remote play's buffers can go at once, ahead of the allocator.
@@ -7499,7 +7498,17 @@ void GSDeviceVK::DestroyResources()
 	m_render_pass_cache.clear();
 
 	if (m_allocator != VK_NULL_HANDLE)
+	{
+		VmaTotalStatistics stats = {};
+		vmaCalculateStatistics(m_allocator, &stats);
+		if (stats.total.statistics.allocationCount > 0 || stats.total.statistics.blockCount > 0)
+		{
+			WARNING_LOG("GSDeviceVK::DestroyResources: VMA still has {} allocations ({} bytes) in {} blocks ({} bytes)",
+				stats.total.statistics.allocationCount, stats.total.statistics.allocationBytes,
+				stats.total.statistics.blockCount, stats.total.statistics.blockBytes);
+		}
 		vmaDestroyAllocator(m_allocator);
+	}
 }
 
 VkShaderModule GSDeviceVK::GetTFXVertexShader(GSHWDrawConfig::VSSelector sel)

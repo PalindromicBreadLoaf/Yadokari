@@ -112,8 +112,9 @@ __libnx_exception_entry:
 
     mov  x0, x2
     bl   __libnx_exception_handler
+    cbz  w0, .Lunhandled_exception
 
-    // The handler returned => the fault was resolved. Copy the (possibly
+    // The handler returned true => the fault was resolved. Copy the (possibly
     // modified) dump back into the kernel frame and resume.
     ldr  x2, [sp]
     add  sp, sp, #16
@@ -183,5 +184,23 @@ __libnx_exception_entry:
 
     mov  w0, wzr
     svc  #0x28              // svcReturnFromException(0)
+    brk  #0
+
+.Lunhandled_exception:
+    // Exit kernel exception mode via svcReturnFromException(0) before running
+    // crash reporting or cleanup, since Horizon forbids svcSendSyncRequest
+    // (filesystem/service IPC) while the thread is still in exception mode.
+    ldr  x2, [sp]
+    add  sp, sp, #16
+    mov   x4, sp
+    ldr  x1, [x2, #SLOT_FRAME]
+    str  x2, [x1, #0x00]          // x0 = ThreadExceptionDump* (ExceptionSlot*)
+    str  x4, [x1, #FRAME_SP]      // sp = top of this slot's exception stack
+    adrp x4, __horizon_unhandled_exception
+    add  x4, x4, :lo12:__horizon_unhandled_exception
+    str  x4, [x1, #FRAME_PC]      // elr_el1 = __horizon_unhandled_exception
+    str  wzr, [x1, #FRAME_PSTATE] // clean AArch64 EL0 pstate
+    mov  w0, wzr
+    svc  #0x28                    // svcReturnFromException(0)
     brk  #0
 .size __libnx_exception_entry, . - __libnx_exception_entry
