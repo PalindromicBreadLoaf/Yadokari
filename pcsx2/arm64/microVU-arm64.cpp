@@ -2737,6 +2737,11 @@ static void mVUmacroEmitEpilogue()
 		armMoveAddressToReg(RSCRATCHADDR, &vtlb_private::vtlbdata.fastmem_base);
 		armAsm->Ldr(RFASTMEMBASE, a64::MemOperand(RSCRATCHADDR));
 	}
+	else
+	{
+		armMoveAddressToReg(RSCRATCHADDR, &vtlb_private::vtlbdata.vmap);
+		armAsm->Ldr(RFASTMEMBASE, a64::MemOperand(RSCRATCHADDR));
+	}
 }
 
 // mayEmitCCall: memory-class ops route addresses through mVUaddrFix, whose

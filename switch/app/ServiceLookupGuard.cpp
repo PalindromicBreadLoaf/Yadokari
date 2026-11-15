@@ -223,10 +223,10 @@ namespace
 				*out_rc = SM_RESULT_NOT_ALLOWED;
 				return true;
 			case ProbeOutcome::Refused:
-				if (!after_startup || s_allow_unverified)
+				if (!after_startup || s_allow_unverified || std::strcmp(text, "clkrst") == 0)
 				{
 					Log("sm: %s: not allowed for this process; asking HEN (%s)", text,
-						after_startup ? "sm-allow-unverified" : "start-up service");
+						!after_startup ? "start-up service" : (s_allow_unverified ? "sm-allow-unverified" : "whitelisted"));
 					return false;
 				}
 				Log("sm: %s: not allowed for this process and unverified; refused", text);

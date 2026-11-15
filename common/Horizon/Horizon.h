@@ -13,8 +13,13 @@
 namespace Horizon
 {
 	u64 GetProcessCoreMask();
+	u32 GetProcessCoreCount();
 	void ReserveCore3ForCallingThread();
 	bool PinCallingThreadToCore3();
+
+	void InitializeClocks();
+	void RefreshCpuBoost();
+	void ShutdownClocks();
 
 	// Lazily brings up the BSD socket
 	bool EnsureNetworkInitialized();

@@ -429,11 +429,16 @@ static const void* _DynGen_EnterRecompiledCode()
 	armAsm->Mov(RXSCRATCH, kEeFprUnscaleBits);
 	armAsm->Fmov(a64::VRegister(NEON_RESERVED_EEFPU_UNSCALE, 64), RXSCRATCH);
 
-	// Load fastmem base into x19 if enabled
+	// Load fastmem base into x19 if enabled; otherwise pin vtlbdata.vmap into
+	// x19 so every softmem load/store can index vmap in 1 instruction instead of 4.
 	if (CHECK_FASTMEM)
 	{
 		armMoveAddressToReg(RSCRATCHADDR, &vtlb_private::vtlbdata.fastmem_base);
 		armAsm->Ldr(RFASTMEMBASE, a64::MemOperand(RSCRATCHADDR));
+	}
+	else
+	{
+		armMoveAddressToReg(RFASTMEMBASE, vtlb_private::vtlbdata.vmap);
 	}
 
 	// Load &cpuRegs into RSTATE. Callee-saved, never modified by C, so this

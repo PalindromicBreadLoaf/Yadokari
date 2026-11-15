@@ -1776,7 +1776,9 @@ void GSTextureReplacements::StartUpscaleWorkers()
 		return;
 
 	// One thread on a four core (or smaller, or unknown) machine, so the game keeps its cores.
-	const u32 cores = std::thread::hardware_concurrency();
+	u32 cores = std::thread::hardware_concurrency();
+	if (cores == 0)
+		cores = GetCPUInfo().num_threads;
 	const u32 count = (cores <= 4) ? 1 : 2;
 
 	s_upscale_stop = false;

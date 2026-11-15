@@ -54,11 +54,17 @@ static void vtlbSoftmemRead(int addr_wreg, u32 bits, bool sign)
 	// Page index: w8 = addr >> VTLB_PAGE_BITS
 	armAsm->Lsr(a64::w8, a64::w9, VTLB_PAGE_BITS);
 
-	// Load vmap base address into x17
-	armMoveAddressToReg(RSCRATCHADDR, vtlbdata.vmap);
-
-	// Load vmap entry: x8 = vmap[page_index] (each entry is 8 bytes = sptr)
-	armAsm->Ldr(a64::x8, a64::MemOperand(RSCRATCHADDR, a64::x8, a64::LSL, 3));
+	// Load vmap entry: x8 = vmap[page_index] (each entry is 8 bytes = sptr).
+	// When fastmem is disabled, RFASTMEMBASE (x19) is pinned to vtlbdata.vmap.
+	if (CHECK_FASTMEM)
+	{
+		armMoveAddressToReg(RSCRATCHADDR, vtlbdata.vmap);
+		armAsm->Ldr(a64::x8, a64::MemOperand(RSCRATCHADDR, a64::x8, a64::LSL, 3));
+	}
+	else
+	{
+		armAsm->Ldr(a64::x8, a64::MemOperand(RFASTMEMBASE, a64::x8, a64::LSL, 3));
+	}
 
 	// Compute ppf: x0 = addr + vmv (use 64-bit add, addr zero-extended from w9).
 	// ADDS sets N from bit 63 of the result, so B.mi handles the slow-path
@@ -144,8 +150,15 @@ static void vtlbSoftmemWrite(int addr_wreg, int value_reg, u32 bits)
 	}
 
 	armAsm->Lsr(a64::w8, a64::w9, VTLB_PAGE_BITS);
-	armMoveAddressToReg(RSCRATCHADDR, vtlbdata.vmap);
-	armAsm->Ldr(a64::x8, a64::MemOperand(RSCRATCHADDR, a64::x8, a64::LSL, 3));
+	if (CHECK_FASTMEM)
+	{
+		armMoveAddressToReg(RSCRATCHADDR, vtlbdata.vmap);
+		armAsm->Ldr(a64::x8, a64::MemOperand(RSCRATCHADDR, a64::x8, a64::LSL, 3));
+	}
+	else
+	{
+		armAsm->Ldr(a64::x8, a64::MemOperand(RFASTMEMBASE, a64::x8, a64::LSL, 3));
+	}
 	// ADDS sets N from bit 63 of ppf; B.mi (=N) branches on the sign bit
 	// without the separate Tbnz, saving one instruction per softmem op.
 	armAsm->Adds(a64::x0, a64::x8, a64::Operand(a64::w9, a64::UXTW));
@@ -859,8 +872,15 @@ static void vtlbSoftmemRead128(int addr_wreg)
 		armAsm->Mov(a64::w9, armWRegister(addr_wreg));
 
 	armAsm->Lsr(a64::w8, a64::w9, VTLB_PAGE_BITS);
-	armMoveAddressToReg(RSCRATCHADDR, vtlbdata.vmap);
-	armAsm->Ldr(a64::x8, a64::MemOperand(RSCRATCHADDR, a64::x8, a64::LSL, 3));
+	if (CHECK_FASTMEM)
+	{
+		armMoveAddressToReg(RSCRATCHADDR, vtlbdata.vmap);
+		armAsm->Ldr(a64::x8, a64::MemOperand(RSCRATCHADDR, a64::x8, a64::LSL, 3));
+	}
+	else
+	{
+		armAsm->Ldr(a64::x8, a64::MemOperand(RFASTMEMBASE, a64::x8, a64::LSL, 3));
+	}
 	// ADDS sets N from bit 63 of ppf; B.mi (=N) branches on the sign bit
 	// without the separate Tbnz, saving one instruction per softmem op.
 	armAsm->Adds(a64::x0, a64::x8, a64::Operand(a64::w9, a64::UXTW));
@@ -892,8 +912,15 @@ static void vtlbSoftmemWrite128(int addr_wreg)
 		armAsm->Mov(a64::w9, armWRegister(addr_wreg));
 
 	armAsm->Lsr(a64::w8, a64::w9, VTLB_PAGE_BITS);
-	armMoveAddressToReg(RSCRATCHADDR, vtlbdata.vmap);
-	armAsm->Ldr(a64::x8, a64::MemOperand(RSCRATCHADDR, a64::x8, a64::LSL, 3));
+	if (CHECK_FASTMEM)
+	{
+		armMoveAddressToReg(RSCRATCHADDR, vtlbdata.vmap);
+		armAsm->Ldr(a64::x8, a64::MemOperand(RSCRATCHADDR, a64::x8, a64::LSL, 3));
+	}
+	else
+	{
+		armAsm->Ldr(a64::x8, a64::MemOperand(RFASTMEMBASE, a64::x8, a64::LSL, 3));
+	}
 	// ADDS sets N from bit 63 of ppf; B.mi (=N) branches on the sign bit
 	// without the separate Tbnz, saving one instruction per softmem op.
 	armAsm->Adds(a64::x0, a64::x8, a64::Operand(a64::w9, a64::UXTW));

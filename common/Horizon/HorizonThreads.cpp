@@ -10,6 +10,8 @@
 #include "common/Console.h"
 #include "common/Threading.h"
 
+#include <algorithm>
+#include <bit>
 #include <future>
 #include <memory>
 #include <mutex>
@@ -64,11 +66,22 @@ u64 Horizon::GetProcessCoreMask()
 	return R_SUCCEEDED(svcGetInfo(&mask, InfoType_CoreMask, CUR_PROCESS_HANDLE, 0)) ? mask : 0;
 }
 
+u32 Horizon::GetProcessCoreCount()
+{
+	const u64 mask = GetProcessCoreMask();
+	const u32 count = static_cast<u32>(std::popcount(mask));
+	return count ? count : 4u;
+}
+
 void Horizon::ReserveCore3ForCallingThread()
 {
 #ifdef __SWITCH2__
-	const u64 mask = GetProcessCoreMask();
-	if (mask && R_FAILED(svcSetThreadCoreMask(CUR_THREAD_HANDLE, -1, mask)))
+	const u64 allowed = GetProcessCoreMask();
+	// Keep general worker threads off the primary EE/VU1/GS cores (0, 1, 2) when upper cores exist,
+	// preferring the highest core (Core 5 on Switch 2). Emulation threads override this via SetAffinity.
+	const u64 worker_mask = (allowed & ~0x7ULL) ? (allowed & ~0x7ULL) : allowed;
+	const s32 ideal_core = worker_mask ? (63 - __builtin_clzll(worker_mask)) : -1;
+	if (worker_mask && R_FAILED(svcSetThreadCoreMask(CUR_THREAD_HANDLE, ideal_core, static_cast<u32>(worker_mask))))
 #else
 	const u64 mask = GetProcessCoreMask() & 0x7;
 	if (mask && R_FAILED(svcSetThreadCoreMask(CUR_THREAD_HANDLE, __builtin_ctzll(mask), mask)))
@@ -78,7 +91,152 @@ void Horizon::ReserveCore3ForCallingThread()
 
 bool Horizon::PinCallingThreadToCore3()
 {
+#ifdef __SWITCH2__
+	const u64 allowed = GetProcessCoreMask();
+	if (allowed == 0)
+		return false;
+	const s32 highest_core = 63 - __builtin_clzll(allowed);
+	return R_SUCCEEDED(svcSetThreadCoreMask(CUR_THREAD_HANDLE, highest_core, static_cast<u32>(1ULL << highest_core)));
+#else
 	return (GetProcessCoreMask() & 8) && R_SUCCEEDED(svcSetThreadCoreMask(CUR_THREAD_HANDLE, 3, 8));
+#endif
+}
+
+namespace
+{
+	std::mutex s_clk_mutex;
+	ClkrstSession s_clk_cpu{};
+	ClkrstSession s_clk_gpu{};
+	bool s_clk_ready = false;
+	bool s_clk_gpu_ready = false;
+	u32 s_clk_cpu_start = 0;
+	u32 s_clk_cpu_set = 0;
+	u32 s_clk_cpu_max = 0;
+
+	bool EnsureClockSessionLocked()
+	{
+		if (s_clk_ready)
+			return true;
+
+		Result rc = clkrstInitialize();
+		if (R_FAILED(rc))
+		{
+			Console.Warning("Switch: clkrstInitialize failed (0x%08x)", rc);
+			return false;
+		}
+
+		rc = clkrstOpenSession(&s_clk_cpu, PcvModuleId_CpuBus, 3);
+		if (R_FAILED(rc))
+		{
+			Console.Warning("Switch: clkrstOpenSession(CpuBus) failed (0x%08x)", rc);
+			clkrstExit();
+			return false;
+		}
+
+		s_clk_gpu_ready = R_SUCCEEDED(clkrstOpenSession(&s_clk_gpu, PcvModuleId_GPU, 3));
+		s_clk_ready = true;
+		return true;
+	}
+} // namespace
+
+void Horizon::InitializeClocks()
+{
+	std::lock_guard lock(s_clk_mutex);
+	if (!EnsureClockSessionLocked())
+	{
+		const Result rc_boost = appletSetCpuBoostMode(ApmCpuBoostMode_FastLoad);
+		Console.WriteLn("Switch: clkrst unavailable, requested appletSetCpuBoostMode(FastLoad) (rc=0x%08x)", rc_boost);
+		return;
+	}
+
+	u32 now = 0;
+	u32 rates[32] = {};
+	PcvClockRatesListType type = PcvClockRatesListType_Invalid;
+	s32 count = 0;
+
+	const Result rc_now = clkrstGetClockRate(&s_clk_cpu, &now);
+	const Result rc_rates = clkrstGetPossibleClockRates(&s_clk_cpu, rates, 32, &type, &count);
+	if (R_FAILED(rc_now) || R_FAILED(rc_rates) || count <= 0)
+	{
+		Console.Warning("Switch: failed to query CPU clock rates (now=0x%08x, rates=0x%08x, count=%d)",
+			rc_now, rc_rates, count);
+		return;
+	}
+
+	u32 max_hz = 0;
+	if (type == PcvClockRatesListType_Range && count >= 2)
+		max_hz = rates[1];
+	else
+		max_hz = *std::max_element(rates, rates + std::min<s32>(count, 32));
+
+	if (s_clk_cpu_start == 0)
+		s_clk_cpu_start = now;
+	s_clk_cpu_max = max_hz;
+
+	u32 gpu_hz = 0;
+	if (s_clk_gpu_ready)
+		clkrstGetClockRate(&s_clk_gpu, &gpu_hz);
+
+	if (max_hz > now)
+	{
+		const Result rc_set = clkrstSetClockRate(&s_clk_cpu, max_hz);
+		u32 after = 0;
+		clkrstGetClockRate(&s_clk_cpu, &after);
+		if (R_SUCCEEDED(rc_set))
+			s_clk_cpu_set = max_hz;
+
+		Console.WriteLn(Color_StrongGreen,
+			"Switch: CPU clock boosted %u.%01u MHz -> %u.%01u MHz (target %u.%01u MHz, rc=0x%08x, GPU %u.%01u MHz)",
+			now / 1000000, (now / 100000) % 10,
+			after / 1000000, (after / 100000) % 10,
+			max_hz / 1000000, (max_hz / 100000) % 10,
+			rc_set, gpu_hz / 1000000, (gpu_hz / 100000) % 10);
+	}
+	else
+	{
+		Console.WriteLn("Switch: CPU clock at %u.%01u MHz (max %u.%01u MHz, GPU %u.%01u MHz)",
+			now / 1000000, (now / 100000) % 10,
+			max_hz / 1000000, (max_hz / 100000) % 10,
+			gpu_hz / 1000000, (gpu_hz / 100000) % 10);
+	}
+}
+
+void Horizon::RefreshCpuBoost()
+{
+	std::lock_guard lock(s_clk_mutex);
+	if (!s_clk_ready || s_clk_cpu_max == 0)
+		return;
+
+	u32 now = 0;
+	if (R_SUCCEEDED(clkrstGetClockRate(&s_clk_cpu, &now)) && now < s_clk_cpu_max)
+	{
+		if (R_SUCCEEDED(clkrstSetClockRate(&s_clk_cpu, s_clk_cpu_max)))
+			s_clk_cpu_set = s_clk_cpu_max;
+	}
+}
+
+void Horizon::ShutdownClocks()
+{
+	std::lock_guard lock(s_clk_mutex);
+	if (!s_clk_ready)
+	{
+		appletCancelCpuBoostMode();
+		return;
+	}
+
+	if (s_clk_cpu_set != 0 && s_clk_cpu_start != 0)
+	{
+		clkrstSetClockRate(&s_clk_cpu, s_clk_cpu_start);
+		s_clk_cpu_set = 0;
+	}
+	clkrstCloseSession(&s_clk_cpu);
+	if (s_clk_gpu_ready)
+	{
+		clkrstCloseSession(&s_clk_gpu);
+		s_clk_gpu_ready = false;
+	}
+	clkrstExit();
+	s_clk_ready = false;
 }
 
 __forceinline void Threading::Timeslice()

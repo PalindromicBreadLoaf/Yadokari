@@ -71,14 +71,14 @@ namespace
 	std::mutex s_area_mutex;
 	std::map<u8*, HorizonAreaState> s_areas;
 
-	const HorizonCodeMapping* FindCodeMapping(const void* ptr)
+	HorizonCodeMapping* FindCodeMapping(const void* ptr)
 	{
 		auto it = s_code_mappings.upper_bound(const_cast<u8*>(static_cast<const u8*>(ptr)));
 		if (it == s_code_mappings.begin())
 			return nullptr;
 
 		--it;
-		const HorizonCodeMapping& mapping = it->second;
+		HorizonCodeMapping& mapping = it->second;
 		const u8* const address = static_cast<const u8*>(ptr);
 		return (address >= mapping.rx && address < (mapping.rx + mapping.size)) ? &mapping : nullptr;
 	}
@@ -270,31 +270,23 @@ void HostSys::FlushInstructionCache(void* address, u32 size)
 	char* const rx = static_cast<char*>(address);
 	char* rw = rx;
 #ifdef __SWITCH2__
-	Jit jit{};
-	bool found = false;
-	size_t offset = 0;
 	{
 		std::lock_guard lock(s_code_mutex);
-		if (const HorizonCodeMapping* mapping = FindCodeMapping(address))
+		if (HorizonCodeMapping* mapping = FindCodeMapping(address))
 		{
-			jit = mapping->jit;
-			offset = static_cast<const u8*>(address) - mapping->rx;
-			found = true;
-		}
-	}
-	if (found)
-	{
-		if (size > 0)
-		{
-			const KaihenJitRange range{offset, size};
-			const Result rc = kaihenJitPublishRanges(&jit, &range, 1);
-			if (R_FAILED(rc))
+			if (size > 0)
 			{
-				Console.Error("HostSys::FlushInstructionCache: kaihenJitPublishRanges(0x%zx, 0x%x) failed: 0x%08x",
-					offset, size, static_cast<u32>(rc));
+				const size_t offset = static_cast<const u8*>(address) - mapping->rx;
+				const KaihenJitRange range{offset, size};
+				const Result rc = kaihenJitPublishRanges(&mapping->jit, &range, 1);
+				if (R_FAILED(rc))
+				{
+					Console.Error("HostSys::FlushInstructionCache: kaihenJitPublishRanges(0x%zx, 0x%x) failed: 0x%08x",
+						offset, size, static_cast<u32>(rc));
+				}
 			}
+			return;
 		}
-		return;
 	}
 #else
 	{
@@ -323,16 +315,15 @@ void HostSys::FlushInstructionCacheRanges(const std::pair<void*, u32>* ranges, s
 	size_t i = 0;
 	while (i < count)
 	{
-		Jit jit{};
-		const u8* rx_base = nullptr;
-		std::vector<KaihenJitRange> batch;
+		bool handled = false;
 		{
 			std::lock_guard lock(s_code_mutex);
-			const HorizonCodeMapping* mapping = FindCodeMapping(ranges[i].first);
+			HorizonCodeMapping* mapping = FindCodeMapping(ranges[i].first);
 			if (mapping)
 			{
-				jit = mapping->jit;
-				rx_base = mapping->rx;
+				handled = true;
+				const u8* const rx_base = mapping->rx;
+				std::vector<KaihenJitRange> batch;
 				while (i < count)
 				{
 					const auto& [addr, sz] = ranges[i];
@@ -342,21 +333,18 @@ void HostSys::FlushInstructionCacheRanges(const std::pair<void*, u32>* ranges, s
 						batch.push_back(KaihenJitRange{static_cast<size_t>(static_cast<const u8*>(addr) - rx_base), sz});
 					i++;
 				}
-			}
-		}
-		if (rx_base)
-		{
-			if (!batch.empty())
-			{
-				const Result rc = kaihenJitPublishRanges(&jit, batch.data(), batch.size());
-				if (R_FAILED(rc))
+				if (!batch.empty())
 				{
-					Console.Error("HostSys::FlushInstructionCacheRanges: kaihenJitPublishRanges(%zu ranges) failed: 0x%08x",
-						batch.size(), static_cast<u32>(rc));
+					const Result rc = kaihenJitPublishRanges(&mapping->jit, batch.data(), batch.size());
+					if (R_FAILED(rc))
+					{
+						Console.Error("HostSys::FlushInstructionCacheRanges: kaihenJitPublishRanges(%zu ranges) failed: 0x%08x",
+							batch.size(), static_cast<u32>(rc));
+					}
 				}
 			}
 		}
-		else
+		if (!handled)
 		{
 			char* const rx = static_cast<char*>(ranges[i].first);
 			__builtin___clear_cache(rx, rx + ranges[i].second);

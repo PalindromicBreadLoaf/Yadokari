@@ -15,6 +15,7 @@
 #endif
 
 #if defined(__SWITCH__)
+#include "common/Horizon/Horizon.h"
 #include <thread>
 #endif
 
@@ -292,7 +293,9 @@ static CPUInfo CalcCPUInfo()
 #if defined(__SWITCH__)
 	if (!cpuinfo_initialize())
 	{
-		const unsigned hc = std::thread::hardware_concurrency();
+		unsigned hc = std::thread::hardware_concurrency();
+		if (hc == 0)
+			hc = Horizon::GetProcessCoreCount();
 #ifdef __SWITCH2__
 		out.name = "NVIDIA Tegra T239";
 #else

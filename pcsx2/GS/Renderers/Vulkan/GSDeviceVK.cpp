@@ -8142,7 +8142,10 @@ void GSDeviceVK::SetGameIdentity(const std::string& serial, u32 crc)
 
 	// Half the cores less one, at most four: enough to stay ahead of a game's first frames without
 	// taking the cores the EE, GS and VU threads run on.
-	const u32 hw = std::max(std::thread::hardware_concurrency(), 2u);
+	u32 hw = std::thread::hardware_concurrency();
+	if (hw == 0)
+		hw = GetCPUInfo().num_threads;
+	hw = std::max(hw, 2u);
 	const u32 num_workers = std::min<u32>(std::clamp(hw / 2 - 1, 1u, 4u), static_cast<u32>(m_precompile_queue.size()));
 	m_precompile_active = true;
 	m_precompile_start = Common::Timer::GetCurrentValue();

@@ -78,6 +78,7 @@ namespace
 
 		HorizonUsbStorage::Shutdown();
 		Horizon::ShutdownNetwork();
+		Horizon::ShutdownClocks();
 		if (s_romfs_available)
 		{
 			romfsExit();
@@ -119,6 +120,10 @@ namespace
 				s_applet_resumed.store(true, std::memory_order_release);
 				break;
 
+			case AppletHookType_OnOperationMode:
+				Horizon::RefreshCpuBoost();
+				break;
+
 			default:
 				break;
 		}
@@ -135,11 +140,15 @@ namespace
 			}
 		}
 
-		if (s_applet_resumed.exchange(false, std::memory_order_acq_rel) && s_paused_for_applet)
+		if (s_applet_resumed.exchange(false, std::memory_order_acq_rel))
 		{
-			if (VMManager::GetState() == VMState::Paused)
-				VMManager::SetPaused(false);
-			s_paused_for_applet = false;
+			Horizon::RefreshCpuBoost();
+			if (s_paused_for_applet)
+			{
+				if (VMManager::GetState() == VMState::Paused)
+					VMManager::SetPaused(false);
+				s_paused_for_applet = false;
+			}
 		}
 	}
 
@@ -156,6 +165,16 @@ namespace
 			s_settings_interface->AddToStringList("GameList", "RecursivePaths", GAMES_DIR);
 			s_settings_interface->SetStringValue("Pad2", "Type", "DualShock2");
 		}
+
+#ifdef __SWITCH2__
+		if (!s_settings_interface->GetBoolValue("Horizon", "Switch2MultiCoreDefaultsV2", false))
+		{
+			s_settings_interface->SetBoolValue("EmuCore/Speedhacks", "iopThread", false);
+			if (Horizon::GetProcessCoreCount() >= 6)
+				s_settings_interface->SetIntValue("EmuCore/GS", "extrathreads", 3);
+			s_settings_interface->SetBoolValue("Horizon", "Switch2MultiCoreDefaultsV2", true);
+		}
+#endif
 
 		Error error;
 		if (!s_settings_interface->Save(&error))
@@ -580,6 +599,11 @@ int main(int argc, char* argv[])
 {
 	HorizonException::Breadcrumb("main entered");
 	Horizon::ReserveCore3ForCallingThread();
+#ifdef __SWITCH2__
+	// Allow the main/UI thread to run across all 6 cores when idle/in UI;
+	// VMManager::SetEmuThreadAffinities() pins it to Core 0 while a VM is active.
+	Threading::ThreadHandle::GetForCallingThread().SetAffinity(Horizon::GetProcessCoreMask());
+#endif
 	appletLockExit();
 	s_exit_locked = true;
 
@@ -588,6 +612,9 @@ int main(int argc, char* argv[])
 
 	Log::SetTimestampsEnabled(true);
 	VMManager::Internal::SetFileLogPath(Path::Combine(LOGS_DIR, "emulog.txt"));
+
+	Horizon::InitializeClocks();
+	HorizonException::Breadcrumb("clocks initialized");
 
 	if (HorizonFastmem::IsSupported())
 		INFO_LOG("Horizon fastmem available: {}", HorizonFastmem::GetSupportReason());

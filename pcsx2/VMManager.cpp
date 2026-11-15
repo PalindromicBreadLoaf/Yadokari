@@ -4616,7 +4616,7 @@ void VMManager::WarnAboutUnsafeSettings()
 		append(ICON_FA_CIRCLE_EXCLAMATION,
 			TRANSLATE_SV("VMManager", "INTC Spin Detection is not enabled, this may reduce performance."));
 	}
-	if (!EmuConfig.Cpu.Recompiler.EnableFastmem)
+	if (!EmuConfig.Cpu.Recompiler.EnableFastmem && !vtlb_FastmemAreaUnavailable())
 		append(ICON_FA_CIRCLE_EXCLAMATION, TRANSLATE_SV("VMManager", "Fastmem is not enabled, this will reduce performance."));
 	if (!EmuConfig.Speedhacks.vu1Instant)
 	{
@@ -5023,9 +5023,43 @@ void VMManager::SetHardwareDependentDefaultSettings(SettingsInterface& si)
 
 #elif defined(__SWITCH__)
 
+static u64 ChooseGSBackThreadAffinity(u64 gs_mask, u64 occupied, bool* shares_busy_core = nullptr)
+{
+	if (shares_busy_core)
+		*shares_busy_core = false;
+	if (gs_mask == 0)
+		return 0;
+
+#ifdef __SWITCH2__
+	const u64 tier = Horizon::GetProcessCoreMask();
+#else
+	const u64 tier = Horizon::GetProcessCoreMask() & 0x7ULL;
+#endif
+	const u64 fast_cluster = tier & ~gs_mask;
+	const GSBackThreadPlacement placement = GSPlaceBackThread(fast_cluster, fast_cluster, fast_cluster, occupied);
+	if (shares_busy_core)
+		*shares_busy_core = placement.shares_busy_core;
+#ifdef __SWITCH2__
+	// When pinning is active and multiple free cores remain (e.g. Cores 4 and 5),
+	// pin GS back thread to the lowest free core (Core 4) so Core 5 stays free for housekeeping.
+	if (occupied != 0 && !placement.shares_busy_core && std::popcount(placement.mask) > 1)
+		return placement.mask & (~placement.mask + 1ULL);
+#endif
+	return placement.mask;
+}
+
 static void InitializeProcessorList()
 {
 	const u64 allowed_cores = Horizon::GetProcessCoreMask();
+#ifdef __SWITCH2__
+	for (u32 core = 0; core < 64; core++)
+	{
+		if (allowed_cores & (u64{1} << core))
+			s_processor_list.push_back(core);
+	}
+	INFO_LOG("Switch 2: process core mask 0x{:x}, {} application cores exposed.",
+		allowed_cores, s_processor_list.size());
+#else
 	for (u32 core = 0; core < 3; core++)
 	{
 		if (allowed_cores & (u64{1} << core))
@@ -5033,12 +5067,17 @@ static void InitializeProcessorList()
 	}
 	INFO_LOG("Switch: process core mask 0x{:x}, {} application cores. core 3 {}",
 		allowed_cores, s_processor_list.size(), (allowed_cores & 8) ? "available for explicit assignment" : "unavailable");
+#endif
 }
 
 void VMManager::SetHardwareDependentDefaultSettings(SettingsInterface& si)
 {
 	si.SetBoolValue("EmuCore/Speedhacks", "vuThread", true);
 	si.SetBoolValue("EmuCore", "EnableThreadPinning", true);
+#ifdef __SWITCH2__
+	si.SetBoolValue("EmuCore/Speedhacks", "iopThread", false);
+	si.SetIntValue("EmuCore/GS", "extrathreads", 3);
+#endif
 }
 
 #else
@@ -5081,6 +5120,10 @@ bool VMManager::Internal::CanSplitGS()
 	const u32 needed = 4 + (EmuConfig.Speedhacks.iopThread ? 1 : 0);
 	const u32 tier = GetPerformanceCoreCount();
 	return tier >= needed && tier < cpuinfo_get_processors_count();
+#elif defined(__SWITCH__)
+	EnsureCPUInfoInitialized();
+	const u32 needed = 4 + (EmuConfig.Speedhacks.iopThread ? 1 : 0);
+	return Horizon::GetProcessCoreCount() >= needed;
 #else
 	return false;
 #endif
@@ -5100,7 +5143,7 @@ void VMManager::EnsureCPUInfoInitialized()
 static std::mutex s_gs_back_thread_mutex;
 static Threading::ThreadHandle s_gs_back_thread_handle;
 static u64 s_gs_back_thread_affinity = 0; // 0 = any processor
-#ifdef __SWITCH__
+#if defined(__SWITCH__) && !defined(__SWITCH2__)
 static u64 s_gs_front_home_affinity = 0;
 #endif
 
@@ -5108,7 +5151,7 @@ static u64 s_gs_front_home_affinity = 0;
 static u64 ApplyGSBackThreadPlacementLocked()
 {
 	u64 back_mask = s_gs_back_thread_affinity;
-#ifdef __SWITCH__
+#if defined(__SWITCH__) && !defined(__SWITCH2__)
 	const Threading::ThreadHandle& gs = MTGS::GetThreadHandle();
 	if (gs)
 	{
@@ -5170,7 +5213,7 @@ u64 VMManager::Internal::PlaceGSBackThreadNearGSThread()
 	EnsureCPUInfoInitialized();
 	u64 gs_mask, occupied;
 	GetGSBackThreadPlacementInputs(&gs_mask, &occupied);
-#if defined(__linux__) || defined(_WIN32)
+#if defined(__linux__) || defined(_WIN32) || defined(__SWITCH2__)
 	const u64 mask = ChooseGSBackThreadAffinity(gs_mask, occupied);
 #else
 	const u64 mask = 0; // No topology here (Darwin cannot pin threads anyway).
@@ -5182,7 +5225,7 @@ u64 VMManager::Internal::PlaceGSBackThreadNearGSThread()
 bool VMManager::Internal::GSBackThreadWouldShareBusyCore()
 {
 	EnsureCPUInfoInitialized();
-#if defined(__linux__) || defined(_WIN32)
+#if defined(__linux__) || defined(_WIN32) || defined(__SWITCH2__)
 	u64 gs_mask, occupied;
 	GetGSBackThreadPlacementInputs(&gs_mask, &occupied);
 	bool shares = false;
@@ -5583,7 +5626,7 @@ void VMManager::SetEmuThreadAffinities()
 	SetIopThreadAffinity(iop_affinity);
 
 	const u64 occupied = ee_affinity | gs_affinity | iop_affinity | (mtvu ? (static_cast<u64>(1) << vu_index) : 0);
-#if defined(__linux__) || defined(_WIN32)
+#if defined(__linux__) || defined(_WIN32) || defined(__SWITCH2__)
 	const u64 gs_back_affinity = ChooseGSBackThreadAffinity(gs_affinity, occupied);
 #else
 	const u64 gs_back_affinity = 0; // No topology here (Darwin cannot pin threads anyway).
@@ -5592,9 +5635,11 @@ void VMManager::SetEmuThreadAffinities()
 	SetGSBackThreadAffinityLocked(gs_back_affinity);
 
 #ifdef __SWITCH__
-	INFO_LOG("Switch: actual thread masks EE=0x{:x}, VU=0x{:x}, GS=0x{:x}",
+	INFO_LOG("Switch: actual thread masks EE=0x{:x}, VU=0x{:x}, GS=0x{:x}, IOP=0x{:x}, GSB=0x{:x}",
 		s_vm_thread_handle.GetAffinity(), mtvu ? vu1Thread.GetThreadHandle().GetAffinity() : 0,
-		MTGS::GetThreadHandle().GetAffinity());
+		MTGS::GetThreadHandle().GetAffinity(),
+		IopThread::g_thread.IsRunning() ? IopThread::g_thread.GetThreadHandle().GetAffinity() : 0,
+		s_gs_back_thread_affinity);
 #endif
 
 #ifdef __ANDROID__
@@ -5607,7 +5652,13 @@ void VMManager::SetEmuThreadAffinities()
 	MTGS::GetThreadHandle().SetNicePriority(-1);
 #endif
 
-#if !defined(__SWITCH__)
+#if defined(__SWITCH2__)
+	// All 6 Switch 2 application cores share the same DynamIQ Cortex-A78C cluster;
+	// expose remaining cores to software rendering workers.
+	s_software_renderer_processor_list.clear();
+	for (size_t i = plan.first_software_thread; i < s_processor_list.size(); i++)
+		s_software_renderer_processor_list.push_back(s_processor_list[i]);
+#elif !defined(__SWITCH__)
 	// Try to find some threads for the software renderer.
 	// They should be in the same cluster as the main GS thread. If they're not, for example,
 	// we had 4 P cores and 6 E cores, let the OS schedule them instead.

@@ -28,6 +28,10 @@
 #include <TargetConditionals.h>
 #endif
 
+#ifdef __SWITCH__
+#include "common/Horizon/HorizonFastmem.h"
+#endif
+
 #include "common/BitUtils.h"
 #include "common/Error.h"
 
@@ -1392,6 +1396,15 @@ bool vtlb_Core_Alloc()
 		EmuConfig.Cpu.Recompiler.EnableFastmem = false;
 		Console.WriteLn("Fastmem disabled: executable code memory is unavailable");
 	}
+#ifdef __SWITCH__
+	else if (!HorizonFastmem::IsSupported())
+	{
+		vtlbdata.fastmem_base = 0;
+		EmuConfig.Cpu.Recompiler.EnableFastmem = false;
+		s_fastmem_area_unavailable = true;
+		Console.WriteLn("Fastmem disabled: %s", HorizonFastmem::GetSupportReason());
+	}
+#endif
 	else
 	{
 		s_fastmem_area = SharedMemoryMappingArea::Create(FASTMEM_AREA_SIZE);
